@@ -1,0 +1,25 @@
+[project]
+name = "stock-content"
+version = "0.1.0"
+description = "Financial content intelligence service"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111",
+  "httpx>=0.27",
+  "pydantic>=2.7",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.2"]
+media = [
+  "faster-whisper>=1.1",
+  "opencc-python-reimplemented>=0.1.7",
+  "paddleocr>=3.3.1",
+  "pyannote.audio>=3.1",
+  "yt-dlp>=2025.1.26",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
