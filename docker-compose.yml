@@ -1,0 +1,6 @@
+services:
+  stock-content:
+    build: .
+    env_file: .env
+    ports:
+      - "8100:8100"
