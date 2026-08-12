@@ -1,0 +1,29 @@
+from fastapi.testclient import TestClient
+
+from stock_content.api.dependencies import build_application
+from stock_content.api.main import create_app
+
+
+def test_api_vertical_slice(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    response = client.post(
+        "/api/v1/videos/bilibili/ingest",
+        json={
+            "bv_id": "BV1api",
+            "options": {
+                "metadata": {"title": "API fixture"},
+                "transcript": "股票600000的利润增长是利好。",
+            },
+        },
+    )
+    assert response.status_code == 200
+    task_id = response.json()["task_id"]
+
+    application.process_next("api-test")
+    task = client.get(f"/api/v1/tasks/{task_id}")
+    search = client.post("/api/v1/knowledge/search", json={"query": "利润", "limit": 5})
+
+    assert task.json()["status"] == "SUCCEEDED"
+    assert search.json()["items"][0]["ticker"] == "600000"
+    assert search.json()["contract_version"] == "content.v1"

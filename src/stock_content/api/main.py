@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from stock_content.api.dependencies import build_application
 from stock_content.application.service import ContentApplication
-
-app = FastAPI(title="stock_content", version="1.0.0")
-service = ContentApplication()
 
 
 class IngestRequest(BaseModel):
@@ -25,45 +25,65 @@ class KnowledgeSearchRequest(BaseModel):
 
 class ContentSignalRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
-    start: str
-    end: str
+    start: datetime
+    end: datetime
     minimum_support_status: str = "SOURCE_SUPPORTED"
 
 
-@app.get("/healthz")
-def health() -> dict:
-    return {"status": "ok", "service": "stock_content", "contract_version": "content.v1"}
+def create_app(service: ContentApplication | None = None) -> FastAPI:
+    app = FastAPI(title="stock_content", version="1.0.0")
+    application = service or build_application()
+
+    @app.get("/healthz")
+    def health() -> dict:
+        return {"status": "ok", "service": "stock_content", "contract_version": "content.v1"}
+
+    @app.post("/api/v1/videos/bilibili/ingest")
+    def ingest_bilibili(request: IngestRequest) -> dict:
+        source_ref = request.url or request.bv_id
+        if not source_ref:
+            raise HTTPException(status_code=422, detail="url or bv_id is required")
+        return application.enqueue("bilibili", source_ref, request.options)
+
+    @app.post("/api/v1/videos/xiaoe/ingest")
+    def ingest_xiaoe(request: IngestRequest) -> dict:
+        if not request.m3u8_url:
+            raise HTTPException(status_code=422, detail="m3u8_url is required")
+        return application.enqueue("xiaoe_hls", request.m3u8_url, request.options)
+
+    @app.get("/api/v1/tasks/{task_id}")
+    def get_task(task_id: str) -> dict:
+        payload = application.get_task(task_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return payload
+
+    @app.get("/api/v1/videos/{video_id}")
+    def get_video(video_id: str) -> dict:
+        payload = application.get_video(video_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.post("/api/v1/knowledge/search")
+    def search_knowledge(request: KnowledgeSearchRequest) -> dict:
+        items = application.search_knowledge(request.query, request.filters, request.limit)
+        return {
+            "contract_version": "content.v1",
+            "items": items,
+            "limit": request.limit,
+            "intent": request.intent or "research",
+            "filters": request.filters,
+        }
+
+    @app.post("/internal/v1/factor-signals")
+    def factor_signals(request: ContentSignalRequest) -> dict:
+        start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
+        end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
+        items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
+        return {"contract_version": "content-factor-signal.v1", "items": items}
+
+    return app
 
 
-@app.post("/api/v1/videos/bilibili/ingest")
-def ingest_bilibili(request: IngestRequest) -> dict:
-    source_ref = request.url or request.bv_id
-    if not source_ref:
-        raise HTTPException(status_code=422, detail="url or bv_id is required")
-    return service.enqueue("bilibili", source_ref, request.options)
-
-
-@app.post("/api/v1/videos/xiaoe/ingest")
-def ingest_xiaoe(request: IngestRequest) -> dict:
-    if not request.m3u8_url:
-        raise HTTPException(status_code=422, detail="m3u8_url is required")
-    return service.enqueue("xiaoe_hls", request.m3u8_url, request.options)
-
-
-@app.get("/api/v1/tasks/{task_id}")
-def get_task(task_id: str) -> dict:
-    payload = service.get_task(task_id)
-    if payload is None:
-        raise HTTPException(status_code=404, detail="task not found")
-    return payload
-
-
-@app.post("/api/v1/knowledge/search")
-def search_knowledge(request: KnowledgeSearchRequest) -> dict:
-    # The persisted knowledge adapter is added together with the database copy.
-    return {"items": [], "limit": request.limit, "intent": request.intent or "research", "filters": request.filters}
-
-
-@app.post("/internal/v1/factor-signals")
-def factor_signals(request: ContentSignalRequest) -> dict:
-    return {"contract_version": "content-factor-signal.v1", "items": []}
+app = create_app()
