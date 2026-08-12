@@ -23,7 +23,20 @@ def test_api_vertical_slice(tmp_path):
     application.process_next("api-test")
     task = client.get(f"/api/v1/tasks/{task_id}")
     search = client.post("/api/v1/knowledge/search", json={"query": "利润", "limit": 5})
+    video_id = task.json()["result"]["video_id"]
+    videos = client.get("/api/v1/videos")
+    segments = client.get(f"/api/v1/videos/{video_id}/segments")
+    chapters = client.get(f"/api/v1/videos/{video_id}/chapters")
+    summary = client.get(f"/api/v1/videos/{video_id}/summary")
+    knowledge = client.get(f"/api/v1/videos/{video_id}/knowledge")
+    unit = client.get(f"/api/v1/knowledge/{search.json()['items'][0]['knowledge_uid']}")
 
     assert task.json()["status"] == "SUCCEEDED"
     assert search.json()["items"][0]["ticker"] == "600000"
     assert search.json()["contract_version"] == "content.v1"
+    assert videos.json()["items"][0]["video_id"] == video_id
+    assert segments.json()["items"]
+    assert chapters.json()["items"]
+    assert summary.json()["data"]["video_id"] == video_id
+    assert knowledge.json()["items"][0]["video_id"] == video_id
+    assert unit.json()["data"]["knowledge_uid"] == search.json()["items"][0]["knowledge_uid"]

@@ -9,9 +9,11 @@ from stock_content.application.pipeline import ContentPipeline, PipelineContext
 from stock_content.application.stages import cleanup_work_directory
 from stock_content.domain.models import ContentTask
 from stock_content.ports.repositories import (
+    ChapterRepository,
     ContentTaskRepository,
     KnowledgeIndex,
     KnowledgeRepository,
+    SummaryRepository,
     VideoRepository,
 )
 
@@ -26,12 +28,16 @@ class ContentApplication:
         knowledge_repository: KnowledgeRepository,
         knowledge_index: KnowledgeIndex,
         pipeline: ContentPipeline,
+        chapter_repository: ChapterRepository | None = None,
+        summary_repository: SummaryRepository | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
         self._knowledge = knowledge_repository
         self._index = knowledge_index
         self._pipeline = pipeline
+        self._chapters = chapter_repository
+        self._summaries = summary_repository
 
     def enqueue(self, source_type: str, source_ref: str, options: dict | None = None) -> dict:
         task = ContentTask(
@@ -102,3 +108,26 @@ class ContentApplication:
 
     def get_video(self, video_id: str) -> dict[str, Any] | None:
         return self._videos.get(video_id)
+
+    def list_videos(self, limit: int) -> list[dict]:
+        return self._videos.list(limit)
+
+    def get_segments(self, video_id: str) -> list[dict] | None:
+        video = self._videos.get(video_id)
+        return video.get("segments", []) if video else None
+
+    def get_chapters(self, video_id: str) -> list[dict] | None:
+        if self._videos.get(video_id) is None:
+            return None
+        return self._chapters.list_for_video(video_id) if self._chapters else []
+
+    def get_summary(self, video_id: str) -> dict | None:
+        return self._summaries.get(video_id) if self._summaries else None
+
+    def list_video_knowledge(self, video_id: str, limit: int) -> list[dict] | None:
+        if self._videos.get(video_id) is None:
+            return None
+        return self._knowledge.list_for_video(video_id, limit)
+
+    def get_knowledge(self, knowledge_uid: str) -> dict | None:
+        return self._knowledge.get(knowledge_uid)

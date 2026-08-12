@@ -56,6 +56,21 @@ class PostgresKnowledgeRepository:
                     )
                 )
 
+    def get(self, knowledge_uid: str) -> dict | None:
+        with self._sessions() as session:
+            row = session.get(KnowledgeUnitRow, knowledge_uid)
+            return self._payload(row) if row else None
+
+    def list_for_video(self, video_id: str, limit: int) -> list[dict]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(KnowledgeUnitRow)
+                .where(KnowledgeUnitRow.video_id == video_id)
+                .order_by(KnowledgeUnitRow.available_from, KnowledgeUnitRow.knowledge_uid)
+                .limit(limit)
+            ).all()
+            return [self._payload(row) for row in rows]
+
     def search(self, query: str, filters: dict, limit: int) -> list[dict]:
         with self._sessions() as session:
             statement = select(KnowledgeUnitRow).where(

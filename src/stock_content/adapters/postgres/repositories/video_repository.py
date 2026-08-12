@@ -54,3 +54,19 @@ class PostgresVideoRepository:
                     for item in segments
                 ],
             }
+
+    def list(self, limit: int) -> list[dict]:
+        with self._sessions() as session:
+            rows = session.scalars(select(VideoAssetRow).order_by(VideoAssetRow.created_at.desc()).limit(limit)).all()
+            return [
+                {
+                    "video_id": row.video_id,
+                    "source_type": row.source_type,
+                    "source_ref": row.source_ref,
+                    "title": row.title,
+                    "author": row.author,
+                    "duration_seconds": row.duration_seconds,
+                    "source_hash": row.source_hash,
+                }
+                for row in rows
+            ]

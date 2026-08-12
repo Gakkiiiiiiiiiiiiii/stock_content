@@ -59,4 +59,4 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
             IndexStage(index),
         ]
     )
-    return ContentApplication(tasks, videos, knowledge, index, pipeline)
+    return ContentApplication(tasks, videos, knowledge, index, pipeline, chapters, summaries)

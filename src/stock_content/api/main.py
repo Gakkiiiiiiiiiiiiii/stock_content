@@ -65,6 +65,46 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "data": payload}
 
+    @app.get("/api/v1/videos")
+    def list_videos(limit: int = 50) -> dict:
+        safe_limit = max(1, min(limit, 200))
+        return {"contract_version": "content.v1", "items": application.list_videos(safe_limit)}
+
+    @app.get("/api/v1/videos/{video_id}/segments")
+    def get_video_segments(video_id: str) -> dict:
+        items = application.get_segments(video_id)
+        if items is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        return {"contract_version": "content.v1", "video_id": video_id, "items": items}
+
+    @app.get("/api/v1/videos/{video_id}/chapters")
+    def get_video_chapters(video_id: str) -> dict:
+        items = application.get_chapters(video_id)
+        if items is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        return {"contract_version": "content.v1", "video_id": video_id, "items": items}
+
+    @app.get("/api/v1/videos/{video_id}/summary")
+    def get_video_summary(video_id: str) -> dict:
+        payload = application.get_summary(video_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="summary not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.get("/api/v1/videos/{video_id}/knowledge")
+    def list_video_knowledge(video_id: str, limit: int = 100) -> dict:
+        items = application.list_video_knowledge(video_id, max(1, min(limit, 500)))
+        if items is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        return {"contract_version": "content.v1", "video_id": video_id, "items": items}
+
+    @app.get("/api/v1/knowledge/{knowledge_uid}")
+    def get_knowledge(knowledge_uid: str) -> dict:
+        payload = application.get_knowledge(knowledge_uid)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="knowledge unit not found")
+        return {"contract_version": "content.v1", "data": payload}
+
     @app.post("/api/v1/knowledge/search")
     def search_knowledge(request: KnowledgeSearchRequest) -> dict:
         items = application.search_knowledge(request.query, request.filters, request.limit)
