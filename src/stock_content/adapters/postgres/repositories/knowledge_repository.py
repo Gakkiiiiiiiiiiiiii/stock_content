@@ -111,18 +111,53 @@ class PostgresKnowledgeRepository:
                 statement = statement.where(KnowledgeUnitRow.ticker.in_(symbols))
             rows = session.scalars(statement.order_by(KnowledgeUnitRow.available_from)).all()
             minimum = _SUPPORT_RANK.get(minimum_support_status, 1)
-            return [
-                {
-                    "signal_id": row.knowledge_uid,
-                    "symbol": row.ticker,
-                    "subject": row.subject,
-                    "kind": row.kind,
-                    "sentiment": row.sentiment,
-                    "confidence": row.confidence,
-                    "support_status": row.support_status,
-                    "available_from": row.available_from.isoformat(),
-                    "source_video_id": row.video_id,
-                }
-                for row in rows
-                if _SUPPORT_RANK.get(row.support_status, 0) >= minimum
-            ]
+            eligible = [row for row in rows if _SUPPORT_RANK.get(row.support_status, 0) >= minimum]
+            by_subject: dict[str, list[KnowledgeUnitRow]] = {}
+            for row in eligible:
+                subject_key = row.ticker or (row.subject or "").strip().casefold()
+                if subject_key:
+                    by_subject.setdefault(subject_key, []).append(row)
+
+            items = []
+            for row in eligible:
+                subject_key = row.ticker or (row.subject or "").strip().casefold()
+                peers = by_subject.get(subject_key, [row])
+                comparable = [peer for peer in peers if peer.sentiment != "NEUTRAL"]
+                same_sentiment = sum(peer.sentiment == row.sentiment for peer in comparable)
+                consensus = same_sentiment / len(comparable) if comparable else 0.0
+                items.append(
+                    {
+                        "signal_id": row.knowledge_uid,
+                        "knowledge_uid": row.knowledge_uid,
+                        "symbol": row.ticker,
+                        "subject": row.subject,
+                        "subject_key": subject_key,
+                        "kind": row.kind,
+                        "knowledge_kind": _knowledge_kind(row.kind),
+                        "sentiment": row.sentiment,
+                        "confidence": row.confidence,
+                        "support_status": row.support_status,
+                        "truth_status": "NOT_CHECKED",
+                        "review_status": _review_status(row.review_status),
+                        "as_of": row.as_of.isoformat(),
+                        "as_of_time": row.as_of.isoformat(),
+                        "available_from": row.available_from.isoformat(),
+                        "source_video_id": row.video_id,
+                        "author_attention_score": 1.0,
+                        "cross_video_consensus": consensus,
+                        "cross_video_disagreement": 1.0 - consensus if comparable else 0.0,
+                    }
+                )
+            return items
+
+
+def _knowledge_kind(kind: str) -> str:
+    return {
+        "CATALYST": "CAUSAL_THESIS",
+        "RISK": "RISK_CONDITION",
+        "EARNINGS": "FINANCIAL_METRIC",
+    }.get(kind, kind if kind in {"VALUATION", "FACT", "POLICY_FACT", "STATE"} else "STATE")
+
+
+def _review_status(status: str) -> str:
+    return "UNREVIEWED" if status == "PENDING" else status

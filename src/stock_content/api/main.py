@@ -121,7 +121,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
-        return {"contract_version": "content-factor-signal.v1", "items": items}
+        return {"contract_version": "content-factor-signal.v2", "items": items}
 
     return app
 

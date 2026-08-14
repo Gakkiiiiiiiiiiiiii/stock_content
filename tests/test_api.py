@@ -30,6 +30,10 @@ def test_api_vertical_slice(tmp_path):
     summary = client.get(f"/api/v1/videos/{video_id}/summary")
     knowledge = client.get(f"/api/v1/videos/{video_id}/knowledge")
     unit = client.get(f"/api/v1/knowledge/{search.json()['items'][0]['knowledge_uid']}")
+    signals = client.post(
+        "/internal/v1/factor-signals",
+        json={"symbols": ["600000"], "start": "2026-01-01T00:00:00Z", "end": "2026-12-31T00:00:00Z"},
+    )
 
     assert task.json()["status"] == "SUCCEEDED"
     assert search.json()["items"][0]["ticker"] == "600000"
@@ -40,3 +44,7 @@ def test_api_vertical_slice(tmp_path):
     assert summary.json()["data"]["video_id"] == video_id
     assert knowledge.json()["items"][0]["video_id"] == video_id
     assert unit.json()["data"]["knowledge_uid"] == search.json()["items"][0]["knowledge_uid"]
+    assert signals.json()["contract_version"] == "content-factor-signal.v2"
+    assert signals.json()["items"][0]["knowledge_uid"] == search.json()["items"][0]["knowledge_uid"]
+    assert signals.json()["items"][0]["truth_status"] == "NOT_CHECKED"
+    assert signals.json()["items"][0]["available_from"]
