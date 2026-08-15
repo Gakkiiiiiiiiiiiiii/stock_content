@@ -5,6 +5,7 @@ from stock_content.adapters.postgres.repositories.financial_repository import Po
 from stock_content.adapters.postgres.repositories.knowledge_repository import PostgresKnowledgeRepository
 from stock_content.adapters.postgres.repositories.multimodal_repository import PostgresMultimodalRepository
 from stock_content.adapters.postgres.repositories.summary_repository import PostgresSummaryRepository
+from stock_content.adapters.postgres.repositories.verification_repository import PostgresVerificationRepository
 from stock_content.adapters.postgres.repositories.video_repository import PostgresVideoRepository
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "PostgresMultimodalRepository",
     "PostgresSummaryRepository",
     "PostgresVideoRepository",
+    "PostgresVerificationRepository",
 ]

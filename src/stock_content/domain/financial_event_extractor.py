@@ -47,6 +47,25 @@ class FinancialEventExtractor:
                     "numeric_refs": list(unit.get("numeric_ids") or []),
                     "evidence_refs": list(unit.get("evidence_ids") or []),
                     "confidence": unit.get("confidence"),
+                    # Preserve the machine-readable claim in the event row so
+                    # downstream analysis does not need to parse the original
+                    # transcript again.  The source evidence remains linked by
+                    # immutable evidence_refs, never by rewritten text.
+                    "objects": [
+                        {
+                            "statement": statement,
+                            "claim_type": unit.get("knowledge_kind") or "STATE",
+                            "condition": unit.get("condition_text"),
+                            "invalidation": unit.get("invalidation_text"),
+                            "subject_key": unit.get("subject_key") or unit.get("ticker"),
+                            "numeric_refs": list(unit.get("numeric_ids") or []),
+                            "available_from": _isoformat(unit.get("available_from")),
+                        }
+                    ],
                 }
             )
         return events
+
+
+def _isoformat(value: object) -> object:
+    return value.isoformat() if hasattr(value, "isoformat") else value

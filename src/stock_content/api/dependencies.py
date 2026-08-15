@@ -20,6 +20,7 @@ from stock_content.adapters.postgres.repositories import (
     PostgresKnowledgeRepository,
     PostgresMultimodalRepository,
     PostgresSummaryRepository,
+    PostgresVerificationRepository,
     PostgresVideoRepository,
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
@@ -65,6 +66,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     multimodal = PostgresMultimodalRepository(database.session_factory)
     financial = PostgresFinancialRepository(database.session_factory)
     entities = PostgresFinancialEntityRepository(database.session_factory)
+    verifications = PostgresVerificationRepository(database.session_factory)
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
     index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
@@ -93,7 +95,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
             VerificationStage(),
             FinancialEnrichmentStage(),
             SummaryStage(SummaryGenerator()),
-            PersistStage(videos, chapters, knowledge, summaries, multimodal, financial, entities),
+            PersistStage(videos, chapters, knowledge, summaries, multimodal, financial, entities, verifications),
             IndexStage(index),
         ]
     )

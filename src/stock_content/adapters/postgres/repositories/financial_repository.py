@@ -61,7 +61,7 @@ class PostgresFinancialRepository:
                         knowledge_uid=item.get("knowledge_uid"),
                         event_type=str(item["event_type"]),
                         subject_key=item.get("subject_key"),
-                        objects=[],
+                        objects=list(item.get("objects") or []),
                         event_time=self._timestamp(item.get("event_time")),
                         effective_time=self._timestamp(item.get("effective_time")),
                         available_from=self._timestamp(item.get("available_from")) or datetime.now(UTC),

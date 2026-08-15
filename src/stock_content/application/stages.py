@@ -568,6 +568,7 @@ class PersistStage:
         multimodal: MultimodalRepository | None = None,
         financial=None,
         entities=None,
+        verifications=None,
     ) -> None:
         self._videos = videos
         self._chapters = chapters
@@ -576,12 +577,15 @@ class PersistStage:
         self._multimodal = multimodal
         self._financial = financial
         self._entities = entities
+        self._verifications = verifications
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         video = context.data["video"]
         self._videos.upsert(video, context.data["segments"])
         self._chapters.replace_for_video(video.video_id, context.data["chapters"])
         self._knowledge.replace_for_video(video.video_id, context.data["knowledge"])
+        if self._verifications:
+            self._verifications.append(context.data["knowledge"], context.task_id)
         if self._multimodal:
             self._multimodal.replace(
                 video.video_id,
