@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+
 def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -105,9 +106,7 @@ COMPANY_NAME_LEADING_FILLERS = (
     "提到",
 )
 
-COMPANY_NAME_PATTERN = re.compile(
-    rf"([\u4e00-\u9fff]{{2,4}}(?:{'|'.join(COMPANY_NAME_SUFFIXES)}))"
-)
+COMPANY_NAME_PATTERN = re.compile(rf"([\u4e00-\u9fff]{{2,4}}(?:{'|'.join(COMPANY_NAME_SUFFIXES)}))")
 
 CODE_NAME_PATTERNS = (
     re.compile(r"(?:[A-Z]{0,3})?(\d{6})\s*([\u4e00-\u9fff]{2,8})"),
@@ -326,7 +325,7 @@ class FinancialEntityNormalizer:
             changed = False
             for filler in COMPANY_NAME_LEADING_FILLERS:
                 if name.startswith(filler) and len(name) > len(filler) + 1:
-                    name = name[len(filler):].strip()
+                    name = name[len(filler) :].strip()
                     changed = True
         return name
 
@@ -358,4 +357,3 @@ class FinancialEntityNormalizer:
             "normalized_time_start": start.date().isoformat(),
             "normalized_time_end": end.date().isoformat(),
         }
-

@@ -7,20 +7,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from stock_content.application.pipeline import PipelineContext
 from stock_content.adapters.http.model_client import ContentModelClient
+from stock_content.application.pipeline import PipelineContext
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
-from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
 from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
 from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoAsset
 from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
 from stock_content.domain.summary import SummaryGenerator
+from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
 from stock_content.ports.media import AudioExtractor, SourceAdapter, SpeechRecognizer
 from stock_content.ports.repositories import (
     ChapterRepository,
@@ -55,9 +56,7 @@ class DownloadStage:
             return context
         directory = Path(tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-", dir=self._work_root))
         context.data["work_dir"] = directory
-        context.data["video_path"] = self._adapters[context.source["type"]].download(
-            context.source["ref"], directory
-        )
+        context.data["video_path"] = self._adapters[context.source["type"]].download(context.source["ref"], directory)
         return context
 
 
@@ -75,9 +74,23 @@ class AudioStage:
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         if "video_path" in context.data:
-            context.data["audio_path"] = self._extractor.extract(
-                context.data["video_path"], context.data["work_dir"]
-            )
+            context.data["audio_path"] = self._extractor.extract(context.data["video_path"], context.data["work_dir"])
+        return context
+
+
+class FrameExtractionStage:
+    name = "frame"
+
+    def __init__(self, extractor) -> None:
+        self._extractor = extractor
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        if context.options.get("frames") is not None:
+            context.data["frames"] = list(context.options["frames"])
+        elif "video_path" in context.data:
+            context.data["frames"] = self._extractor.extract(context.data["video_path"], context.data["work_dir"])
+        else:
+            context.data["frames"] = []
         return context
 
 
@@ -113,6 +126,127 @@ class ASRStage:
             raise ValueError("ASR returned no transcript segments")
         context.data["segments"] = segments
         context.data["transcript"] = " ".join(segment.text for segment in segments)
+        return context
+
+
+class SpeakerDiarizationStage:
+    name = "diarization"
+
+    def __init__(self, diarizer) -> None:
+        self._diarizer = diarizer
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        context.data["segments"] = self._diarizer.annotate(
+            str(context.data.get("audio_path") or "") or None, context.data["segments"]
+        )
+        return context
+
+
+class TranscriptPostprocessStage:
+    name = "transcript_postprocess"
+
+    def __init__(self, postprocessor: TranscriptPostprocessor) -> None:
+        self._postprocessor = postprocessor
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        context.data["segments"] = self._postprocessor.process(context.data["segments"])
+        context.data["transcript"] = " ".join(segment.text for segment in context.data["segments"])
+        return context
+
+
+class OCRStage:
+    name = "ocr"
+
+    def __init__(self, engine) -> None:
+        self._engine = engine
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        supplied = context.options.get("ocr_evidence")
+        evidence = list(supplied) if supplied is not None else []
+        if supplied is None:
+            for frame in context.data.get("frames", []):
+                result = self._engine.recognize(str(frame["image_path"]))
+                blocks = list(result.get("blocks") or [])
+                item = {
+                    **frame,
+                    "ocr_text": str(result.get("text") or ""),
+                    "ocr_evidence": {"blocks": blocks},
+                    "ocr_engine": result.get("engine"),
+                    "ocr_engine_version": result.get("engine_version"),
+                }
+                context.data.setdefault("frame_insights", []).append(item)
+                evidence.extend(
+                    [
+                        {
+                            **block,
+                            "frame_id": frame["frame_id"],
+                            "timestamp_ms": frame["timestamp_ms"],
+                            "source_type": "OCR",
+                            "confidence_score": block.get("score"),
+                            "evidence_text": block.get("text"),
+                        }
+                        for block in blocks
+                    ]
+                )
+        context.data["ocr_evidence"] = evidence
+        return context
+
+
+class VisionStage:
+    name = "vision"
+
+    def __init__(self, analyzer) -> None:
+        self._analyzer = analyzer
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        insights = list(context.data.get("frame_insights") or [])
+        if context.options.get("frame_insights") is not None:
+            insights.extend(context.options["frame_insights"])
+        elif context.data.get("frames"):
+            for frame in context.data["frames"]:
+                result = self._analyzer.analyze(str(frame["image_path"]), context.data["transcript"])
+                insights.append({**frame, **result, "model": getattr(self._analyzer, "_model", None)})
+        context.data["frame_insights"] = insights
+        return context
+
+
+class MultimodalContextStage:
+    name = "multimodal_context"
+
+    def __init__(self, builder) -> None:
+        self._builder = builder
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = {
+            "segments": [
+                {"text": item.text, "start_ms": int(item.start_seconds * 1000), "end_ms": int(item.end_seconds * 1000)}
+                for item in context.data["segments"]
+            ]
+        }
+        context.data["multimodal_context"] = self._builder.build(transcript, context.data.get("frame_insights") or [])
+        return context
+
+
+class TemporalWindowStage:
+    name = "temporal_window"
+
+    def __init__(self, builder) -> None:
+        self._builder = builder
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = {
+            "segments": [
+                {
+                    "text": item.text,
+                    "start_ms": int(item.start_seconds * 1000),
+                    "end_ms": int(item.end_seconds * 1000),
+                    "speaker_id": item.speaker_id,
+                    "confidence_score": item.confidence,
+                }
+                for item in context.data["segments"]
+            ]
+        }
+        context.data["temporal_windows"] = self._builder.build(transcript, context.data.get("frame_insights") or [])
         return context
 
 
@@ -189,7 +323,13 @@ class KnowledgeExtractionStage:
                     "title": chapter.title,
                     "chapter_type": chapter.chapter_type,
                     "primary_domain": "GENERAL",
-                    "windows": [window],
+                    "windows": [
+                        item
+                        for item in context.data.get("temporal_windows", [])
+                        if int(item.get("start_ms") or 0) < int(chapter.end_seconds * 1000)
+                        and int(chapter.start_seconds * 1000) < int(item.get("end_ms") or 0)
+                    ]
+                    or [window],
                     "entities": [],
                 }
             )
@@ -250,7 +390,9 @@ class KnowledgeExtractionStage:
     def _fixture_records(self, context: PipelineContext, timestamp: datetime) -> list[dict]:
         """Offline fixtures are explicit and never a production fallback."""
         records: list[dict] = []
-        for unit in self._fixture_extractor.extract(context.data["video"].video_id, context.data["chapters"], timestamp):
+        for unit in self._fixture_extractor.extract(
+            context.data["video"].video_id, context.data["chapters"], timestamp
+        ):
             chapter = next((item for item in context.data["chapters"] if item.chapter_id == unit.chapter_id), None)
             start_ms = int((chapter.start_seconds if chapter else 0) * 1000)
             end_ms = int((chapter.end_seconds if chapter else 0) * 1000)
@@ -270,7 +412,16 @@ class KnowledgeExtractionStage:
                     "lifecycle_status": "ACTIVE",
                     "support_score": 0.75,
                     "as_of_time": timestamp,
-                    "evidence": [{"source_type": "ASR", "evidence_text": unit.statement, "start_ms": start_ms, "end_ms": end_ms, "confidence_score": 1.0, "is_primary": True}],
+                    "evidence": [
+                        {
+                            "source_type": "ASR",
+                            "evidence_text": unit.statement,
+                            "start_ms": start_ms,
+                            "end_ms": end_ms,
+                            "confidence_score": 1.0,
+                            "is_primary": True,
+                        }
+                    ],
                     "attributes": {"offline_fixture": True},
                 }
             )
@@ -359,7 +510,7 @@ class BuildVideoStage:
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         metadata = context.data["metadata"]
-        source_key = f'{context.source["type"]}:{context.source["ref"]}'
+        source_key = f"{context.source['type']}:{context.source['ref']}"
         video_id = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:32]
         transcript = context.data["transcript"]
         context.data["video"] = VideoAsset(

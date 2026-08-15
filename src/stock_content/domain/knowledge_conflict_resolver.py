@@ -25,7 +25,9 @@ class KnowledgeConflictResolver:
             group_id = "kcg_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
             for unit in group:
                 unit["conflict_group_id"] = group_id
-            ordered = sorted(group, key=lambda item: (item.get("as_of_time") is not None, item.get("as_of_time")), reverse=True)
+            ordered = sorted(
+                group, key=lambda item: (item.get("as_of_time") is not None, item.get("as_of_time")), reverse=True
+            )
             latest = ordered[0]
             for older in ordered[1:]:
                 if self._contradicts(latest, older):
@@ -61,7 +63,9 @@ class KnowledgeConflictResolver:
     def _contradicts(cls, left: dict, right: dict) -> bool:
         left_sentiment = str(left.get("sentiment") or "")
         right_sentiment = str(right.get("sentiment") or "")
-        return (left_sentiment in cls.POSITIVE and right_sentiment in cls.NEGATIVE) or (left_sentiment in cls.NEGATIVE and right_sentiment in cls.POSITIVE)
+        return (left_sentiment in cls.POSITIVE and right_sentiment in cls.NEGATIVE) or (
+            left_sentiment in cls.NEGATIVE and right_sentiment in cls.POSITIVE
+        )
 
     @classmethod
     def _relation_for_contradiction(cls, latest: dict, older: dict) -> str:
@@ -86,11 +90,17 @@ class KnowledgeConflictResolver:
     @classmethod
     def _resolution_attributes(cls, latest: dict, older: dict, *, relation_type: str) -> dict:
         kind = str(latest.get("knowledge_kind") or older.get("knowledge_kind") or "STATE")
-        reason = "same_conflict_key_same_direction" if relation_type == "REINFORCES" else "same_conflict_key_newer_opposite_sentiment"
+        reason = (
+            "same_conflict_key_same_direction"
+            if relation_type == "REINFORCES"
+            else "same_conflict_key_newer_opposite_sentiment"
+        )
         if kind == "STATE":
             recommended_action = "keep_latest_as_current"
         elif kind == "ACTION":
-            recommended_action = "retire_stale_action" if relation_type == "SUPERSEDES" else "review_or_retire_stale_action"
+            recommended_action = (
+                "retire_stale_action" if relation_type == "SUPERSEDES" else "review_or_retire_stale_action"
+            )
         elif kind == "FORECAST":
             recommended_action = "keep_forecast_history"
         elif kind in {"METHOD", "CONCEPT"}:
@@ -103,7 +113,8 @@ class KnowledgeConflictResolver:
             "reason": reason,
             "conflict_resolution_reason": reason,
             "recommended_action": recommended_action,
-            "conflict_scope": "same_video" if latest.get("source_video_id") == older.get("source_video_id") else "cross_video_or_unknown",
+            "conflict_scope": "same_video"
+            if latest.get("source_video_id") == older.get("source_video_id")
+            else "cross_video_or_unknown",
             "knowledge_kind": kind,
         }
-

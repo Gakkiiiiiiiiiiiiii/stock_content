@@ -230,4 +230,3 @@ HIGH_RISK_KINDS: set[str] = {
     KnowledgeKind.PRICE_LEVEL.value,
     KnowledgeKind.POLICY_FACT.value,
 }
-

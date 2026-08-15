@@ -31,8 +31,17 @@ class FinancialNumericValue:
 
 
 _CN_DIGIT = {
-    "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
-    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
 }
 _CN_SMALL_UNIT = {"十": 10, "百": 100, "千": 1000}
 _CN_BIG_UNIT = {"万": 10_000, "亿": 100_000_000}
@@ -87,9 +96,9 @@ _CN_NUM_NO_BIG = "零一二两三四五六七八九十百千"
 # 各模式按优先级依次套用，已占用区间不再重复匹配。
 _RE_PERCENT_CN = re.compile(rf"百分之([{_CN_NUM}]+)")
 # 十来倍 / 二十来倍 / 十几（个）亿
-_RE_RANGE_LAI_JI = re.compile(rf"([零一二两三四五六七八九]{{0,2}}十)[来几](?:个)?(倍|亿|万|点|元|成)?")
+_RE_RANGE_LAI_JI = re.compile(r"([零一二两三四五六七八九]{0,2}十)[来几](?:个)?(倍|亿|万|点|元|成)?")
 # 二十多（个）点 / 一百五十多倍
-_RE_RANGE_DUO = re.compile(rf"([零一二两三四五六七八九十百]+?)多(?:个)?(倍|亿|万|点|元|成)?")
+_RE_RANGE_DUO = re.compile(r"([零一二两三四五六七八九十百]+?)多(?:个)?(倍|亿|万|点|元|成)?")
 # 一百五十亿 / 一万五千亿
 _RE_CN_YI = re.compile(rf"([{_CN_NUM}]+)亿")
 # 三千四百万（万后不跟亿）
@@ -173,7 +182,7 @@ def parse_financial_numerics(text: str) -> list[FinancialNumericValue]:
         return all(end <= occ_start or start >= occ_end for occ_start, occ_end in occupied)
 
     def register(match: re.Match[str], value: FinancialNumericValue) -> None:
-        start, end = match.start(), match.end()
+        start = match.start()
         comparator, prefix = _prefix_comparator(text, start)
         if comparator:
             value.comparator = comparator
@@ -213,7 +222,10 @@ def parse_financial_numerics(text: str) -> list[FinancialNumericValue]:
             unit=unit,
         )
 
-    scan(_RE_PERCENT_CN, lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="PERCENT"))
+    scan(
+        _RE_PERCENT_CN,
+        lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="PERCENT"),
+    )
     scan(_RE_RANGE_LAI_JI, lambda m: range_value(_parse_cn_number(m.group(1)) or 0.0, 10.0, m.group(2)))
     scan(
         _RE_RANGE_DUO,
@@ -223,10 +235,20 @@ def parse_financial_numerics(text: str) -> list[FinancialNumericValue]:
             m.group(2),
         ),
     )
-    scan(_RE_CN_YI, lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="CNY_YI"))
-    scan(_RE_CN_WAN, lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="CNY_WAN"))
+    scan(
+        _RE_CN_YI, lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="CNY_YI")
+    )
+    scan(
+        _RE_CN_WAN,
+        lambda m: FinancialNumericValue(raw_expression="", value=_parse_cn_number(m.group(1)), unit="CNY_WAN"),
+    )
     scan(_RE_CN_UNIT, lambda m: cn_point(_parse_cn_number(m.group(1)) or 0.0, m.group(2)))
-    scan(_RE_ARABIC, lambda m: FinancialNumericValue(raw_expression="", value=float(m.group(1)), unit=_UNIT_BY_SUFFIX.get(m.group(2) or "")))
+    scan(
+        _RE_ARABIC,
+        lambda m: FinancialNumericValue(
+            raw_expression="", value=float(m.group(1)), unit=_UNIT_BY_SUFFIX.get(m.group(2) or "")
+        ),
+    )
 
     found.sort(key=lambda item: item[0])
     return [value for _, value in found]
@@ -285,4 +307,3 @@ def numeric_values_match(claim_val: FinancialNumericValue, source_val: Financial
     if claim_interval is None or source_interval is None:
         return False
     return claim_interval[0] <= source_interval[1] and source_interval[0] <= claim_interval[1]
-

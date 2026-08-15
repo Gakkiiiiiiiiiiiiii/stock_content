@@ -92,10 +92,7 @@ class ClaimEvidenceVerifier:
         primary = next((item for item in evidence if item.get("is_primary")), evidence[0] if evidence else None)
         if not primary or primary.get("start_ms") is None or primary.get("end_ms") is None:
             return self._result("UNSUPPORTED", 0.0, ["EVIDENCE_NOT_LOCATED"], {})
-        source = " ".join(
-            str(primary.get(key) or "")
-            for key in ("raw_text", "normalized_text", "evidence_text")
-        )
+        source = " ".join(str(primary.get(key) or "") for key in ("raw_text", "normalized_text", "evidence_text"))
         claim = str(unit.get("statement") or "")
         if not source.strip() or not claim:
             return self._result("UNSUPPORTED", 0.0, ["EMPTY_CLAIM_OR_EVIDENCE"], {})
@@ -218,7 +215,9 @@ class ClaimEvidenceVerifier:
     @classmethod
     def _subject_names(cls, unit: dict[str, Any]) -> list[str]:
         names = [str(unit.get(key) or "").strip() for key in ("subject_name", "subject_key")]
-        names.extend(str(item.get("entity_name") or item.get("ticker") or "").strip() for item in unit.get("entities") or [])
+        names.extend(
+            str(item.get("entity_name") or item.get("ticker") or "").strip() for item in unit.get("entities") or []
+        )
         seen: list[str] = []
         for name in names:
             compacted = cls._compact(name)
@@ -237,7 +236,9 @@ class ClaimEvidenceVerifier:
         return "。".join(scoped) if scoped else source
 
     @classmethod
-    def _number_match(cls, claim_numbers: list[FinancialNumericValue], scope_numbers: list[FinancialNumericValue]) -> bool:
+    def _number_match(
+        cls, claim_numbers: list[FinancialNumericValue], scope_numbers: list[FinancialNumericValue]
+    ) -> bool:
         for claim_num in claim_numbers:
             if not any(
                 numeric_values_match(claim_num, source_num) and cls._metric_compatible(claim_num, source_num)
@@ -282,12 +283,10 @@ class ClaimEvidenceVerifier:
         """§12 对称化：claim 与 source 对同一谓语的否定状态必须一致。"""
 
         claim_negated = cls._has_negation(claim)
-        predicate_checked = False
         for predicate in cls.PREDICATES:
             if predicate not in claim:
                 continue
             for match in re.finditer(re.escape(predicate), source):
-                predicate_checked = True
                 near = source[max(0, match.start() - 4) : match.start()]
                 source_negated = cls._has_negation(near)
                 if claim_negated != source_negated:
@@ -351,4 +350,3 @@ class ClaimEvidenceVerifier:
             "reason_codes": reasons,
             "checks": checks,
         }
-

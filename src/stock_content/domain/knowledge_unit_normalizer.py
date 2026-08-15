@@ -4,11 +4,11 @@ import hashlib
 import re
 from datetime import UTC, datetime
 
-from stock_content.domain.financial_entity_normalizer import FinancialEntityNormalizer
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
+from stock_content.domain.financial_entity_normalizer import FinancialEntityNormalizer
 from stock_content.domain.knowledge_enums import (
-    EvidenceQualityStatus,
     LEGACY_TRUTH_ALIASES,
+    EvidenceQualityStatus,
     ReviewStatus,
     SupportStatus,
     TruthStatus,
@@ -30,7 +30,9 @@ _NON_LLM_RESOLUTION_METHODS = {"entity_dictionary", "ticker", "nearby_ocr"}
 
 
 class KnowledgeUnitNormalizer:
-    def __init__(self, entity_normalizer: FinancialEntityNormalizer | None = None, verifier: ClaimEvidenceVerifier | None = None) -> None:
+    def __init__(
+        self, entity_normalizer: FinancialEntityNormalizer | None = None, verifier: ClaimEvidenceVerifier | None = None
+    ) -> None:
         self.entity_normalizer = entity_normalizer or FinancialEntityNormalizer()
         self.verifier = verifier or ClaimEvidenceVerifier()
 
@@ -65,7 +67,9 @@ class KnowledgeUnitNormalizer:
             )
             content_hash = hashlib.sha256(content_basis.encode("utf-8")).hexdigest()
             semantic_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-            uid_prefix = str(metadata.get("bvid") or metadata.get("platform_video_id") or metadata.get("platform") or "video")
+            uid_prefix = str(
+                metadata.get("bvid") or metadata.get("platform_video_id") or metadata.get("platform") or "video"
+            )
             item = dict(unit)
             legacy_status = unit.get("verification_status") or "SOURCE_LOCATED"
             # P0-5（§19）：实体规范化与主体推断之后，verifier 必须看到规范化后的候选单元。
@@ -120,10 +124,13 @@ class KnowledgeUnitNormalizer:
             attributes = (unit.get("attributes") or {}) | {"verification": verification}
             if entity_resolution is not None:
                 attributes = attributes | {"entity_resolution": entity_resolution}
-            truth_status = LEGACY_TRUTH_ALIASES.get(
-                str(unit.get("truth_status") or "").strip().upper(),
-                str(unit.get("truth_status") or "").strip().upper(),
-            ) or TruthStatus.NOT_CHECKED.value
+            truth_status = (
+                LEGACY_TRUTH_ALIASES.get(
+                    str(unit.get("truth_status") or "").strip().upper(),
+                    str(unit.get("truth_status") or "").strip().upper(),
+                )
+                or TruthStatus.NOT_CHECKED.value
+            )
             item.update(
                 {
                     "knowledge_uid": f"ku_{uid_prefix}_{index:04d}_{content_hash[:10]}",
@@ -217,8 +224,7 @@ class KnowledgeUnitNormalizer:
         if not isinstance(corrections, list) or not corrections:
             return None
         entity_type_by_name = {
-            str(entity.get("entity_name") or ""): str(entity.get("entity_type") or "")
-            for entity in entities
+            str(entity.get("entity_name") or ""): str(entity.get("entity_type") or "") for entity in entities
         }
         items: list[dict] = []
         unverified = False
@@ -344,4 +350,3 @@ class KnowledgeUnitNormalizer:
                 str(unit.get("timeframe") or ""),
             ]
         )
-

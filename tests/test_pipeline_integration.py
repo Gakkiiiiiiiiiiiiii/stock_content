@@ -44,7 +44,9 @@ def test_ingest_worker_persists_searchable_knowledge_and_factor_signal(tmp_path)
 def test_task_is_persistent_across_application_instances(tmp_path):
     database_url = f"sqlite:///{tmp_path / 'content.db'}"
     first = build_application(database_url, enable_qdrant=False)
-    task = first.enqueue("bilibili", "BV1persistent", {"transcript": "这是一段足够长的测试文本。", "offline_fixture": True})
+    task = first.enqueue(
+        "bilibili", "BV1persistent", {"transcript": "这是一段足够长的测试文本。", "offline_fixture": True}
+    )
 
     second = build_application(database_url, enable_qdrant=False)
 

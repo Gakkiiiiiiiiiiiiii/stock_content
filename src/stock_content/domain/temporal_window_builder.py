@@ -12,9 +12,15 @@ class TemporalWindowBuilder:
         max_duration_seconds: int | None = None,
         overlap_seconds: int | None = None,
     ) -> None:
-        self.target_duration_ms = int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_TARGET_SECONDS", str(target_duration_seconds or 90))) * 1000
-        self.min_duration_ms = int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_MIN_SECONDS", str(min_duration_seconds or 25))) * 1000
-        self.max_duration_ms = int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_MAX_SECONDS", str(max_duration_seconds or 150))) * 1000
+        self.target_duration_ms = (
+            int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_TARGET_SECONDS", str(target_duration_seconds or 90))) * 1000
+        )
+        self.min_duration_ms = (
+            int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_MIN_SECONDS", str(min_duration_seconds or 25))) * 1000
+        )
+        self.max_duration_ms = (
+            int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_MAX_SECONDS", str(max_duration_seconds or 150))) * 1000
+        )
         self.overlap_ms = int(os.getenv("VIDEO_KNOWLEDGE_WINDOW_OVERLAP_SECONDS", str(overlap_seconds or 8))) * 1000
 
     def build(self, transcript: dict, frame_insights: list[dict] | None = None) -> list[dict]:
@@ -70,10 +76,16 @@ class TemporalWindowBuilder:
 
     def _build_window(self, index: int, segments: list[dict], start_ms: int, end_ms: int, frames: list[dict]) -> dict:
         window_frames = [frame for frame in frames if start_ms <= int(frame.get("timestamp_ms") or 0) <= end_ms]
-        transcript_text = " ".join(str(segment.get("text") or "").strip() for segment in segments if str(segment.get("text") or "").strip())
+        transcript_text = " ".join(
+            str(segment.get("text") or "").strip() for segment in segments if str(segment.get("text") or "").strip()
+        )
         ocr_lines = self._dedup_lines(str(frame.get("ocr_text") or "") for frame in window_frames)
         ocr_blocks = [block for frame in window_frames for block in (frame.get("ocr_evidence") or {}).get("blocks", [])]
-        visual_parts = [str(frame.get("visual_summary") or "").strip() for frame in window_frames if str(frame.get("visual_summary") or "").strip()]
+        visual_parts = [
+            str(frame.get("visual_summary") or "").strip()
+            for frame in window_frames
+            if str(frame.get("visual_summary") or "").strip()
+        ]
         entities = sorted({entity for frame in window_frames for entity in self._frame_entities(frame)})
         return {
             "window_index": index,
@@ -87,7 +99,13 @@ class TemporalWindowBuilder:
             "visual_summary": " | ".join(visual_parts[:6]),
             "frame_refs": window_frames,
             "entities": entities,
-            "speaker_labels": sorted({str(segment.get("speaker_label") or segment.get("speaker") or "") for segment in segments if segment.get("speaker_label") or segment.get("speaker")}),
+            "speaker_labels": sorted(
+                {
+                    str(segment.get("speaker_label") or segment.get("speaker") or "")
+                    for segment in segments
+                    if segment.get("speaker_label") or segment.get("speaker")
+                }
+            ),
             "confidence_score": self._confidence(segments),
             "vision_confidence_score": self._confidence(window_frames),
         }
@@ -106,7 +124,10 @@ class TemporalWindowBuilder:
     @staticmethod
     def _looks_like_boundary(text: str) -> bool:
         normalized = re.sub(r"\s+", "", text)
-        return any(marker in normalized for marker in ("接下来", "下面", "再看", "然后看", "最后", "总结一下", "第二个", "第三个"))
+        return any(
+            marker in normalized
+            for marker in ("接下来", "下面", "再看", "然后看", "最后", "总结一下", "第二个", "第三个")
+        )
 
     @staticmethod
     def _dedup_lines(values) -> list[str]:
@@ -128,7 +149,9 @@ class TemporalWindowBuilder:
         # 帧实体只取模型甄别的 symbols 和主画面描述里的代码；
         # 不对原始 OCR 做数字正则——其中行情软件侧边栏公告等内容与口播无关。
         entities = [str(item).strip() for item in frame.get("symbols") or [] if str(item).strip()]
-        entities.extend(re.findall(r"\b\d{6}\b|\b\d{4}\.HK\b", str(frame.get("visual_summary") or ""), flags=re.IGNORECASE))
+        entities.extend(
+            re.findall(r"\b\d{6}\b|\b\d{4}\.HK\b", str(frame.get("visual_summary") or ""), flags=re.IGNORECASE)
+        )
         return entities
 
     @staticmethod
@@ -148,4 +171,3 @@ class TemporalWindowBuilder:
             except (TypeError, ValueError):
                 continue
         return round(sum(scores) / len(scores), 4) if scores else None
-

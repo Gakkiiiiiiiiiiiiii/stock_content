@@ -5,7 +5,6 @@ from typing import Any
 
 from stock_content.domain.knowledge_enums import KnowledgeKind
 
-
 REQUIRED_FIELDS = {
     "primary_domain",
     "knowledge_kind",
@@ -101,12 +100,10 @@ class KnowledgeUnitSchemaValidator:
             confidence = evidence_item.get("confidence_score")
             if confidence is None:
                 confidence = evidence_item.get("confidence")
-            normalized = {
-                key: evidence_item.get(key)
-                for key in EVIDENCE_FIELDS
-                if key in evidence_item
-            }
-            normalized["source_type"] = str(evidence_item.get("source_type") or evidence_item.get("evidence_type") or "ASR")
+            normalized = {key: evidence_item.get(key) for key in EVIDENCE_FIELDS if key in evidence_item}
+            normalized["source_type"] = str(
+                evidence_item.get("source_type") or evidence_item.get("evidence_type") or "ASR"
+            )
             normalized["evidence_text"] = text
             normalized["confidence_score"] = confidence
             normalized["is_primary"] = bool(evidence_item.get("is_primary", len(normalized_evidence) == 0))
@@ -117,7 +114,9 @@ class KnowledgeUnitSchemaValidator:
         if not item.get("entities") and (chapter or {}).get("entities"):
             item["entities"] = [
                 {
-                    "entity_type": "SECURITY" if any(char.isdigit() for char in str(entity)) else str((chapter or {}).get("primary_domain") or "GENERAL"),
+                    "entity_type": "SECURITY"
+                    if any(char.isdigit() for char in str(entity))
+                    else str((chapter or {}).get("primary_domain") or "GENERAL"),
                     "entity_key": str(entity),
                     "entity_name": str(entity),
                     "relation_role": "SUBJECT",
@@ -170,9 +169,10 @@ class KnowledgeUnitSchemaValidator:
 
     @staticmethod
     def _allow_domain_level(unit: dict, chapter: dict | None) -> bool:
-        return str(unit.get("knowledge_kind") or "") in DOMAIN_LEVEL_KINDS and bool((chapter or {}).get("primary_domain") or unit.get("primary_domain"))
+        return str(unit.get("knowledge_kind") or "") in DOMAIN_LEVEL_KINDS and bool(
+            (chapter or {}).get("primary_domain") or unit.get("primary_domain")
+        )
 
     @staticmethod
     def _reject(unit: dict, reason: str) -> dict:
         return {"accepted": False, "unit": unit, "repaired": False, "repairs": [], "reason": reason}
-

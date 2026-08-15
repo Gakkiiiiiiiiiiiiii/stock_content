@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import os
 
-from stock_content.adapters.media import FasterWhisperRecognizer, FfmpegAudioExtractor
 from stock_content.adapters.http import HttpExternalFactProvider
+from stock_content.adapters.media import (
+    FasterWhisperRecognizer,
+    FfmpegAudioExtractor,
+    FfmpegFrameExtractor,
+    HttpVisionAnalyzer,
+    PaddleOcrEngine,
+    PyannoteDiarizer,
+)
 from stock_content.adapters.postgres import Database
 from stock_content.adapters.postgres.repositories import (
     PostgresChapterRepository,
@@ -22,16 +29,26 @@ from stock_content.application.stages import (
     BuildVideoStage,
     ChapterStage,
     DownloadStage,
+    FrameExtractionStage,
     IndexStage,
     KnowledgeExtractionStage,
+    MultimodalContextStage,
+    OCRStage,
     PersistStage,
     ResolveSourceStage,
+    SpeakerDiarizationStage,
     SummaryStage,
+    TemporalWindowStage,
+    TranscriptPostprocessStage,
     VerificationStage,
+    VisionStage,
 )
-from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.chapter import ChapterSegmenter
+from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.summary import SummaryGenerator
+from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
+from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
 
 
 def build_application(database_url: str | None = None, enable_qdrant: bool | None = None) -> ContentApplication:
@@ -50,10 +67,17 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         [
             ResolveSourceStage(sources),
             DownloadStage(sources),
+            FrameExtractionStage(FfmpegFrameExtractor()),
             AudioStage(FfmpegAudioExtractor()),
             ASRStage(FasterWhisperRecognizer()),
+            SpeakerDiarizationStage(PyannoteDiarizer()),
+            TranscriptPostprocessStage(TranscriptPostprocessor()),
+            OCRStage(PaddleOcrEngine()),
+            VisionStage(HttpVisionAnalyzer()),
+            MultimodalContextStage(MultimodalContextBuilder()),
             BuildVideoStage(),
             ChapterStage(ChapterSegmenter()),
+            TemporalWindowStage(TemporalWindowBuilder()),
             KnowledgeExtractionStage(
                 external_verifier=ExternalFactVerifier(
                     provider=external_provider if external_provider.configured() else None

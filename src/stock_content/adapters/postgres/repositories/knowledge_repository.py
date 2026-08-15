@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 import re
 from collections import defaultdict
+from datetime import datetime
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import sessionmaker
@@ -73,13 +72,17 @@ class PostgresKnowledgeRepository:
                 else:
                     for name, value in values.items():
                         setattr(row, name, value)
-                session.execute(delete(KnowledgeEvidenceRow).where(KnowledgeEvidenceRow.knowledge_uid == unit.knowledge_uid))
+                session.execute(
+                    delete(KnowledgeEvidenceRow).where(KnowledgeEvidenceRow.knowledge_uid == unit.knowledge_uid)
+                )
                 evidence_items = list((unit.attributes or {}).get("evidence") or [])
                 for evidence in evidence_items:
                     session.add(
                         KnowledgeEvidenceRow(
                             knowledge_uid=unit.knowledge_uid,
-                            evidence_type=str(evidence.get("evidence_type") or evidence.get("source_type") or "TRANSCRIPT"),
+                            evidence_type=str(
+                                evidence.get("evidence_type") or evidence.get("source_type") or "TRANSCRIPT"
+                            ),
                             source_id=str(evidence.get("source_id") or "") or None,
                             video_id=video_id,
                             frame_id=str(evidence.get("frame_id") or "") or None,
@@ -192,42 +195,48 @@ class PostgresKnowledgeRepository:
             minimum = _SUPPORT_RANK.get(minimum_support_status, 1)
             requested_codes = {_ticker_code(symbol) for symbol in symbols if _ticker_code(symbol)}
             eligible = [
-                row for row in rows
+                row
+                for row in rows
                 if _SUPPORT_RANK.get(row.support_status, 0) >= minimum
                 and (not requested_codes or _ticker_code(row.ticker or row.subject_key or "") in requested_codes)
             ]
             items = []
             for row in eligible:
                 cross = session.get(KnowledgeCrossVideoRow, row.knowledge_uid)
-                evidence_ids = [str(value) for value in session.scalars(
-                    select(KnowledgeEvidenceRow.id).where(KnowledgeEvidenceRow.knowledge_uid == row.knowledge_uid)
-                ).all()]
-                items.append({
-                    "signal_id": row.knowledge_uid,
-                    "knowledge_uid": row.knowledge_uid,
-                    "knowledge_version": row.knowledge_version,
-                    "symbol": row.subject_key or row.ticker,
-                    "subject": row.subject,
-                    "subject_key": row.subject_key or row.ticker or row.subject,
-                    "kind": row.kind,
-                    "knowledge_kind": row.knowledge_kind,
-                    "event_type": (row.attributes or {}).get("event_type"),
-                    "sentiment": row.sentiment,
-                    "confidence": row.confidence,
-                    "support_status": row.support_status,
-                    "truth_status": row.truth_status,
-                    "review_status": row.review_status,
-                    "lifecycle_status": row.lifecycle_status,
-                    "as_of_time": row.as_of.isoformat(),
-                    "available_from": row.available_from.isoformat(),
-                    "author_attention_score": cross.author_attention_score if cross else 0.0,
-                    "event_strength": (row.attributes or {}).get("event_strength", row.confidence),
-                    "cross_video_consensus": cross.consensus_score if cross else 0.0,
-                    "cross_video_disagreement": cross.disagreement_score if cross else 0.0,
-                    "source_video_id": row.video_id,
-                    "evidence_ids": evidence_ids,
-                    "provenance": dict(row.provenance or {}),
-                })
+                evidence_ids = [
+                    str(value)
+                    for value in session.scalars(
+                        select(KnowledgeEvidenceRow.id).where(KnowledgeEvidenceRow.knowledge_uid == row.knowledge_uid)
+                    ).all()
+                ]
+                items.append(
+                    {
+                        "signal_id": row.knowledge_uid,
+                        "knowledge_uid": row.knowledge_uid,
+                        "knowledge_version": row.knowledge_version,
+                        "symbol": row.subject_key or row.ticker,
+                        "subject": row.subject,
+                        "subject_key": row.subject_key or row.ticker or row.subject,
+                        "kind": row.kind,
+                        "knowledge_kind": row.knowledge_kind,
+                        "event_type": (row.attributes or {}).get("event_type"),
+                        "sentiment": row.sentiment,
+                        "confidence": row.confidence,
+                        "support_status": row.support_status,
+                        "truth_status": row.truth_status,
+                        "review_status": row.review_status,
+                        "lifecycle_status": row.lifecycle_status,
+                        "as_of_time": row.as_of.isoformat(),
+                        "available_from": row.available_from.isoformat(),
+                        "author_attention_score": cross.author_attention_score if cross else 0.0,
+                        "event_strength": (row.attributes or {}).get("event_strength", row.confidence),
+                        "cross_video_consensus": cross.consensus_score if cross else 0.0,
+                        "cross_video_disagreement": cross.disagreement_score if cross else 0.0,
+                        "source_video_id": row.video_id,
+                        "evidence_ids": evidence_ids,
+                        "provenance": dict(row.provenance or {}),
+                    }
+                )
             return items
 
 

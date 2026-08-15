@@ -146,9 +146,7 @@ class KnowledgeEvidenceRow(Base):
 class VideoSummaryRow(Base):
     __tablename__ = "video_summary"
 
-    video_id: Mapped[str] = mapped_column(
-        ForeignKey("video_asset.video_id", ondelete="CASCADE"), primary_key=True
-    )
+    video_id: Mapped[str] = mapped_column(ForeignKey("video_asset.video_id", ondelete="CASCADE"), primary_key=True)
     core_summary: Mapped[str] = mapped_column(Text)
     markdown: Mapped[str] = mapped_column(Text)
     confidence: Mapped[float] = mapped_column(Float)
@@ -252,7 +250,9 @@ class FinancialEventRow(Base):
 class KnowledgeVerificationRow(Base):
     __tablename__ = "knowledge_verification"
     verification_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    knowledge_uid: Mapped[str] = mapped_column(ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True)
+    knowledge_uid: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True
+    )
     verifier_type: Mapped[str] = mapped_column(String(40), index=True)
     decision: Mapped[str] = mapped_column(String(40), index=True)
     confidence: Mapped[float | None] = mapped_column(Float)
@@ -266,7 +266,9 @@ class KnowledgeVerificationRow(Base):
 
 class KnowledgeCrossVideoRow(Base):
     __tablename__ = "knowledge_cross_video"
-    knowledge_uid: Mapped[str] = mapped_column(ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), primary_key=True)
+    knowledge_uid: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), primary_key=True
+    )
     corroborating_video_count: Mapped[int] = mapped_column(Integer, default=0)
     contradicting_video_count: Mapped[int] = mapped_column(Integer, default=0)
     independent_source_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -280,7 +282,9 @@ class KnowledgeCrossVideoRow(Base):
 class KnowledgeConflictRow(Base):
     __tablename__ = "knowledge_conflict"
     conflict_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    knowledge_uid: Mapped[str] = mapped_column(ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True)
+    knowledge_uid: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True
+    )
     related_knowledge_uid: Mapped[str] = mapped_column(String(64), index=True)
     conflict_type: Mapped[str] = mapped_column(String(40), index=True)
     resolution: Mapped[str] = mapped_column(String(40))
@@ -291,7 +295,9 @@ class KnowledgeConflictRow(Base):
 class KnowledgeLifecycleEventRow(Base):
     __tablename__ = "knowledge_lifecycle_event"
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    knowledge_uid: Mapped[str] = mapped_column(ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True)
+    knowledge_uid: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True
+    )
     knowledge_version: Mapped[int] = mapped_column(Integer)
     from_status: Mapped[str | None] = mapped_column(String(40))
     to_status: Mapped[str] = mapped_column(String(40))

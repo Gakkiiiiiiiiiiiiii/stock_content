@@ -1,4 +1,5 @@
 """The composable ingestion pipeline boundary for migrated content stages."""
+
 from __future__ import annotations
 
 from collections.abc import Callable

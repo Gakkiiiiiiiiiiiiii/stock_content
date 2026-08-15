@@ -6,7 +6,9 @@ from pathlib import Path
 
 class MultimodalContextBuilder:
     def __init__(self, transcript_window_seconds: int | None = None, max_items: int | None = None) -> None:
-        self.transcript_window_seconds = int(os.getenv("VIDEO_VISUAL_TRANSCRIPT_WINDOW_SECONDS", str(transcript_window_seconds or 12)))
+        self.transcript_window_seconds = int(
+            os.getenv("VIDEO_VISUAL_TRANSCRIPT_WINDOW_SECONDS", str(transcript_window_seconds or 12))
+        )
         self.max_items = int(os.getenv("VIDEO_VISUAL_MAX_CONTEXT_ITEMS", str(max_items or 10)))
 
     def build(self, transcript: dict, frame_insights: list[dict]) -> dict:
@@ -18,7 +20,9 @@ class MultimodalContextBuilder:
         for insight in frame_insights[: self.max_items]:
             timestamp_ms = int(insight.get("timestamp_ms") or 0)
             related_segments = self._collect_related_segments(segments=segments, timestamp_ms=timestamp_ms)
-            related_text = " ".join(segment.get("text", "") for segment in related_segments if str(segment.get("text") or "").strip()).strip()
+            related_text = " ".join(
+                segment.get("text", "") for segment in related_segments if str(segment.get("text") or "").strip()
+            ).strip()
             item = {
                 "timestamp_ms": timestamp_ms,
                 "image_path": insight.get("image_path"),
@@ -70,4 +74,3 @@ class MultimodalContextBuilder:
             if start_ms - window_ms <= timestamp_ms <= end_ms + window_ms:
                 related.append(segment)
         return related[:4]
-

@@ -17,7 +17,9 @@ class KnowledgeDeduplicator:
             for evidence in unit.get("evidence") or []:
                 if evidence not in existing_evidence:
                     existing_evidence.append(evidence)
-            existing["extraction_confidence"] = max(float(existing.get("extraction_confidence") or 0), float(unit.get("extraction_confidence") or 0))
+            existing["extraction_confidence"] = max(
+                float(existing.get("extraction_confidence") or 0), float(unit.get("extraction_confidence") or 0)
+            )
         selected: list[dict] = []
         for unit in seen.values():
             duplicate = next((existing for existing in selected if self._same_claim(existing, unit)), None)
@@ -48,4 +50,3 @@ class KnowledgeDeduplicator:
             return True
         same_kind = str(left.get("knowledge_kind") or "") == str(right.get("knowledge_kind") or "")
         return same_kind and SequenceMatcher(a=left_text, b=right_text).ratio() >= 0.84
-

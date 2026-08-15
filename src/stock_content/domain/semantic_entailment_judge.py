@@ -48,7 +48,8 @@ SYSTEM_PROMPT = """你是金融 Claim-Evidence 语义一致性裁判。
 不得根据常识、金融知识或外部信息补充 Evidence 中不存在的信息。
 
 只输出一个严格的 JSON 对象，不要输出任何其他文字：
-{"label": "SUPPORTED|CONTRADICTED|NOT_ENOUGH_EVIDENCE", "score": 0.0到1.0之间的小数, "reason_codes": ["可选的原因码"]}"""
+{"label": "SUPPORTED|CONTRADICTED|NOT_ENOUGH_EVIDENCE",
+ "score": 0.0到1.0之间的小数, "reason_codes": ["可选的原因码"]}"""
 
 
 class SemanticEntailmentJudge:
@@ -139,4 +140,3 @@ class SemanticEntailmentJudge:
             "model": model,
             "version": self.VERSION,
         }
-

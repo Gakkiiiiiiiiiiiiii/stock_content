@@ -30,7 +30,9 @@ class KnowledgeTemporalPolicy:
         for unit in units:
             kind = str(unit.get("knowledge_kind") or "STATE")
             domain = str(unit.get("primary_domain") or "GENERAL")
-            temporal_class, valid_days, half_life = self.DOMAIN_OVERRIDES.get((domain, kind), self.DEFAULTS.get(kind, ("SNAPSHOT", 14, 5.0)))
+            temporal_class, valid_days, half_life = self.DOMAIN_OVERRIDES.get(
+                (domain, kind), self.DEFAULTS.get(kind, ("SNAPSHOT", 14, 5.0))
+            )
             enriched = dict(unit)
             enriched["temporal_class"] = enriched.get("temporal_class") or temporal_class
             if kind in {"FACT", "STATE", "FORECAST", "TECHNICAL_SIGNAL", "ACTION", "RISK_CONDITION", "MODEL_INFERENCE"}:
@@ -44,4 +46,3 @@ class KnowledgeTemporalPolicy:
                 enriched["lifecycle_status"] = "EXPIRED"
             results.append(enriched)
         return results
-

@@ -18,7 +18,6 @@ unit.attributes["cross_modal_verification"]（repository 按 CROSS_MODAL 入账�
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from stock_content.domain.knowledge_enums import SupportStatus
 
@@ -77,7 +76,8 @@ class CrossModalEvidenceVerifier:
                 return item | {
                     "support_status": "NEEDS_REVIEW",
                     "verification_status": "NEEDS_REVIEW",
-                    "attributes": (item.get("attributes") or {}) | {
+                    "attributes": (item.get("attributes") or {})
+                    | {
                         "cross_modal_verification": {
                             "status": "CROSS_MODAL_CONFLICT",
                             "asr_support_score": asr_score,
@@ -108,7 +108,8 @@ class CrossModalEvidenceVerifier:
             return item | {
                 "support_status": SupportStatus.CROSS_MODAL_SUPPORTED.value,
                 "verification_status": SupportStatus.CROSS_MODAL_SUPPORTED.value,
-                "attributes": (item.get("attributes") or {}) | {
+                "attributes": (item.get("attributes") or {})
+                | {
                     "cross_modal_verification": {
                         "status": SupportStatus.CROSS_MODAL_SUPPORTED.value,
                         "asr_support_score": asr_score,
@@ -209,11 +210,7 @@ class CrossModalEvidenceVerifier:
         for claim in claim_values:
             matched = False
             for ocr in ocr_values:
-                if (
-                    claim.metric
-                    and ocr.metric
-                    and claim.metric != ocr.metric
-                ):
+                if claim.metric and ocr.metric and claim.metric != ocr.metric:
                     continue
                 if numeric_values_match(claim, ocr):
                     matched = True
