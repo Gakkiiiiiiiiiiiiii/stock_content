@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import re
+from collections import defaultdict
+
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import sessionmaker
 
-from stock_content.adapters.postgres.models import KnowledgeEvidenceRow, KnowledgeUnitRow
+from stock_content.adapters.postgres.models import KnowledgeCrossVideoRow, KnowledgeEvidenceRow, KnowledgeUnitRow
 from stock_content.domain.models import KnowledgeUnit
 
 _SUPPORT_RANK = {"UNSUPPORTED": 0, "SOURCE_SUPPORTED": 1, "CROSS_VERIFIED": 2, "FACT_VERIFIED": 3}
@@ -23,14 +26,24 @@ class PostgresKnowledgeRepository:
             "chapter_id": row.chapter_id,
             "statement": row.statement,
             "kind": row.kind,
+            "knowledge_kind": row.knowledge_kind,
+            "knowledge_version": row.knowledge_version,
             "subject": row.subject,
+            "subject_key": row.subject_key,
+            "predicate_key": row.predicate_key,
             "ticker": row.ticker,
             "sentiment": row.sentiment,
             "support_status": row.support_status,
+            "truth_status": row.truth_status,
             "review_status": row.review_status,
+            "lifecycle_status": row.lifecycle_status,
             "confidence": row.confidence,
             "as_of": row.as_of.isoformat(),
+            "as_of_time": row.as_of.isoformat(),
             "available_from": row.available_from.isoformat(),
+            "valid_from": row.valid_from.isoformat() if row.valid_from else None,
+            "valid_to": row.valid_to.isoformat() if row.valid_to else None,
+            "provenance": dict(row.provenance or {}),
         }
 
     @staticmethod
@@ -43,18 +56,85 @@ class PostgresKnowledgeRepository:
 
     def replace_for_video(self, video_id: str, units: list[KnowledgeUnit]) -> None:
         with self._sessions.begin() as session:
-            existing = select(KnowledgeUnitRow.knowledge_uid).where(KnowledgeUnitRow.video_id == video_id)
-            session.execute(delete(KnowledgeEvidenceRow).where(KnowledgeEvidenceRow.knowledge_uid.in_(existing)))
-            session.execute(delete(KnowledgeUnitRow).where(KnowledgeUnitRow.video_id == video_id))
+            existing = {
+                row.knowledge_uid: row
+                for row in session.scalars(select(KnowledgeUnitRow).where(KnowledgeUnitRow.video_id == video_id))
+            }
+            incoming = {unit.knowledge_uid for unit in units}
+            for knowledge_uid, row in existing.items():
+                if knowledge_uid not in incoming:
+                    row.lifecycle_status = "SUPERSEDED"
             for unit in units:
-                session.add(KnowledgeUnitRow(**vars(unit)))
-                session.add(
-                    KnowledgeEvidenceRow(
-                        knowledge_uid=unit.knowledge_uid,
-                        evidence_type="TRANSCRIPT",
-                        evidence_text=unit.statement,
+                values = vars(unit)
+                row = existing.get(unit.knowledge_uid)
+                if row is None:
+                    row = KnowledgeUnitRow(**values)
+                    session.add(row)
+                else:
+                    for name, value in values.items():
+                        setattr(row, name, value)
+                session.execute(delete(KnowledgeEvidenceRow).where(KnowledgeEvidenceRow.knowledge_uid == unit.knowledge_uid))
+                evidence_items = list((unit.attributes or {}).get("evidence") or [])
+                for evidence in evidence_items:
+                    session.add(
+                        KnowledgeEvidenceRow(
+                            knowledge_uid=unit.knowledge_uid,
+                            evidence_type=str(evidence.get("evidence_type") or evidence.get("source_type") or "TRANSCRIPT"),
+                            source_id=str(evidence.get("source_id") or "") or None,
+                            video_id=video_id,
+                            frame_id=str(evidence.get("frame_id") or "") or None,
+                            evidence_text=str(evidence.get("text") or evidence.get("evidence_text") or ""),
+                            start_seconds=evidence.get("start_seconds"),
+                            end_seconds=evidence.get("end_seconds"),
+                            structured_payload=dict(evidence.get("structured_payload") or {}),
+                            confidence=evidence.get("confidence") or evidence.get("confidence_score"),
+                            source_reliability=evidence.get("source_reliability"),
+                        )
                     )
+            self._refresh_cross_video(session, units)
+
+    @staticmethod
+    def _refresh_cross_video(session, units: list[KnowledgeUnit]) -> None:
+        """Persist corroboration once at write time; read APIs never invent it."""
+        keys = {(unit.subject_key or unit.ticker or "", unit.predicate_key or unit.knowledge_kind) for unit in units}
+        for subject_key, predicate_key in keys:
+            if not subject_key:
+                continue
+            rows = session.scalars(
+                select(KnowledgeUnitRow).where(
+                    KnowledgeUnitRow.subject_key == subject_key,
+                    KnowledgeUnitRow.predicate_key == predicate_key,
+                    KnowledgeUnitRow.lifecycle_status == "ACTIVE",
                 )
+            ).all()
+            by_video: dict[str, set[str]] = defaultdict(set)
+            for row in rows:
+                if _SUPPORT_RANK.get(row.support_status, 0) >= _SUPPORT_RANK["SOURCE_SUPPORTED"]:
+                    by_video[row.video_id].add(row.sentiment)
+            directional = [directions for directions in by_video.values() if directions & {"BULLISH", "BEARISH"}]
+            bullish = sum(directions == {"BULLISH"} for directions in directional)
+            bearish = sum(directions == {"BEARISH"} for directions in directional)
+            mixed = sum(len(directions & {"BULLISH", "BEARISH"}) > 1 for directions in directional)
+            total = max(len(directional), 1)
+            consensus = (bullish - bearish) / total
+            disagreement = mixed / total
+            attention = len(rows) / max(len(by_video), 1)
+            for row in rows:
+                state = session.get(KnowledgeCrossVideoRow, row.knowledge_uid)
+                values = {
+                    "corroborating_video_count": max(bullish, bearish),
+                    "contradicting_video_count": mixed + min(bullish, bearish),
+                    "independent_source_count": len(by_video),
+                    "author_attention_score": attention,
+                    "consensus_score": consensus,
+                    "disagreement_score": disagreement,
+                    "evidence_ids": [],
+                }
+                if state is None:
+                    session.add(KnowledgeCrossVideoRow(knowledge_uid=row.knowledge_uid, **values))
+                else:
+                    for name, value in values.items():
+                        setattr(state, name, value)
 
     def get(self, knowledge_uid: str) -> dict | None:
         with self._sessions() as session:
@@ -106,58 +186,51 @@ class PostgresKnowledgeRepository:
                 KnowledgeUnitRow.available_from >= start,
                 KnowledgeUnitRow.available_from <= end,
                 KnowledgeUnitRow.review_status != "REJECTED",
+                KnowledgeUnitRow.lifecycle_status == "ACTIVE",
             )
-            if symbols:
-                statement = statement.where(KnowledgeUnitRow.ticker.in_(symbols))
             rows = session.scalars(statement.order_by(KnowledgeUnitRow.available_from)).all()
             minimum = _SUPPORT_RANK.get(minimum_support_status, 1)
-            eligible = [row for row in rows if _SUPPORT_RANK.get(row.support_status, 0) >= minimum]
-            by_subject: dict[str, list[KnowledgeUnitRow]] = {}
-            for row in eligible:
-                subject_key = row.ticker or (row.subject or "").strip().casefold()
-                if subject_key:
-                    by_subject.setdefault(subject_key, []).append(row)
-
+            requested_codes = {_ticker_code(symbol) for symbol in symbols if _ticker_code(symbol)}
+            eligible = [
+                row for row in rows
+                if _SUPPORT_RANK.get(row.support_status, 0) >= minimum
+                and (not requested_codes or _ticker_code(row.ticker or row.subject_key or "") in requested_codes)
+            ]
             items = []
             for row in eligible:
-                subject_key = row.ticker or (row.subject or "").strip().casefold()
-                peers = by_subject.get(subject_key, [row])
-                comparable = [peer for peer in peers if peer.sentiment != "NEUTRAL"]
-                same_sentiment = sum(peer.sentiment == row.sentiment for peer in comparable)
-                consensus = same_sentiment / len(comparable) if comparable else 0.0
-                items.append(
-                    {
-                        "signal_id": row.knowledge_uid,
-                        "knowledge_uid": row.knowledge_uid,
-                        "symbol": row.ticker,
-                        "subject": row.subject,
-                        "subject_key": subject_key,
-                        "kind": row.kind,
-                        "knowledge_kind": _knowledge_kind(row.kind),
-                        "sentiment": row.sentiment,
-                        "confidence": row.confidence,
-                        "support_status": row.support_status,
-                        "truth_status": "NOT_CHECKED",
-                        "review_status": _review_status(row.review_status),
-                        "as_of": row.as_of.isoformat(),
-                        "as_of_time": row.as_of.isoformat(),
-                        "available_from": row.available_from.isoformat(),
-                        "source_video_id": row.video_id,
-                        "author_attention_score": 1.0,
-                        "cross_video_consensus": consensus,
-                        "cross_video_disagreement": 1.0 - consensus if comparable else 0.0,
-                    }
-                )
+                cross = session.get(KnowledgeCrossVideoRow, row.knowledge_uid)
+                evidence_ids = [str(value) for value in session.scalars(
+                    select(KnowledgeEvidenceRow.id).where(KnowledgeEvidenceRow.knowledge_uid == row.knowledge_uid)
+                ).all()]
+                items.append({
+                    "signal_id": row.knowledge_uid,
+                    "knowledge_uid": row.knowledge_uid,
+                    "knowledge_version": row.knowledge_version,
+                    "symbol": row.subject_key or row.ticker,
+                    "subject": row.subject,
+                    "subject_key": row.subject_key or row.ticker or row.subject,
+                    "kind": row.kind,
+                    "knowledge_kind": row.knowledge_kind,
+                    "event_type": (row.attributes or {}).get("event_type"),
+                    "sentiment": row.sentiment,
+                    "confidence": row.confidence,
+                    "support_status": row.support_status,
+                    "truth_status": row.truth_status,
+                    "review_status": row.review_status,
+                    "lifecycle_status": row.lifecycle_status,
+                    "as_of_time": row.as_of.isoformat(),
+                    "available_from": row.available_from.isoformat(),
+                    "author_attention_score": cross.author_attention_score if cross else 0.0,
+                    "event_strength": (row.attributes or {}).get("event_strength", row.confidence),
+                    "cross_video_consensus": cross.consensus_score if cross else 0.0,
+                    "cross_video_disagreement": cross.disagreement_score if cross else 0.0,
+                    "source_video_id": row.video_id,
+                    "evidence_ids": evidence_ids,
+                    "provenance": dict(row.provenance or {}),
+                })
             return items
 
 
-def _knowledge_kind(kind: str) -> str:
-    return {
-        "CATALYST": "CAUSAL_THESIS",
-        "RISK": "RISK_CONDITION",
-        "EARNINGS": "FINANCIAL_METRIC",
-    }.get(kind, kind if kind in {"VALUATION", "FACT", "POLICY_FACT", "STATE"} else "STATE")
-
-
-def _review_status(status: str) -> str:
-    return "UNREVIEWED" if status == "PENDING" else status
+def _ticker_code(value: str) -> str | None:
+    match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value))
+    return match.group(1) if match else None

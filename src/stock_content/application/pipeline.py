@@ -29,6 +29,7 @@ class ContentPipeline:
         self,
         context: PipelineContext,
         on_progress: Callable[[str, int], None] | None = None,
+        on_checkpoint: Callable[[str, dict[str, Any], int], None] | None = None,
     ) -> PipelineContext:
         total = max(len(self._stages), 1)
         for index, stage in enumerate(self._stages):
@@ -36,6 +37,12 @@ class ContentPipeline:
             if on_progress:
                 on_progress(stage.name, int(index * 100 / total))
             context = stage.execute(context)
+            if on_checkpoint:
+                on_checkpoint(
+                    stage.name,
+                    {"completed": True, "output_keys": sorted(context.data.keys())},
+                    int((index + 1) * 100 / total),
+                )
         context.current_stage = "completed"
         if on_progress:
             on_progress("completed", 100)

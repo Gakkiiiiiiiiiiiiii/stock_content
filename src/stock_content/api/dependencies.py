@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from stock_content.adapters.media import FasterWhisperRecognizer, FfmpegAudioExtractor
+from stock_content.adapters.http import HttpExternalFactProvider
 from stock_content.adapters.postgres import Database
 from stock_content.adapters.postgres.repositories import (
     PostgresChapterRepository,
@@ -28,8 +29,8 @@ from stock_content.application.stages import (
     SummaryStage,
     VerificationStage,
 )
+from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.chapter import ChapterSegmenter
-from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.summary import SummaryGenerator
 
 
@@ -43,6 +44,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
     index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
+    external_provider = HttpExternalFactProvider()
     sources = {"bilibili": BilibiliSourceAdapter(), "xiaoe_hls": XiaoeHlsSourceAdapter()}
     pipeline = ContentPipeline(
         [
@@ -52,7 +54,11 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
             ASRStage(FasterWhisperRecognizer()),
             BuildVideoStage(),
             ChapterStage(ChapterSegmenter()),
-            KnowledgeExtractionStage(KnowledgeExtractor()),
+            KnowledgeExtractionStage(
+                external_verifier=ExternalFactVerifier(
+                    provider=external_provider if external_provider.configured() else None
+                )
+            ),
             VerificationStage(),
             SummaryStage(SummaryGenerator()),
             PersistStage(videos, chapters, knowledge, summaries),

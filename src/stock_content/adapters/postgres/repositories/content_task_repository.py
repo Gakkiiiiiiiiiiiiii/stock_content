@@ -28,10 +28,20 @@ class PostgresContentTaskRepository:
             error=row.error,
             options=dict(row.options or {}),
             result=dict(row.result or {}),
+            checkpoint=dict(row.checkpoint or {}),
+            input_hash=row.input_hash,
+            idempotency_key=row.idempotency_key,
+            trace_id=row.trace_id,
         )
 
     def create(self, task: ContentTask) -> ContentTask:
         with self._sessions.begin() as session:
+            if task.idempotency_key:
+                existing = session.scalar(
+                    select(ContentTaskRow).where(ContentTaskRow.idempotency_key == task.idempotency_key)
+                )
+                if existing is not None:
+                    return self._domain(existing)
             session.add(ContentTaskRow(**task.to_dict()))
         return task
 
@@ -73,6 +83,15 @@ class PostgresContentTaskRepository:
                 row.stage = stage
                 row.progress = max(0, min(progress, 100))
 
+    def checkpoint(self, task_id: str, stage: str, checkpoint: dict, progress: int | None = None) -> None:
+        with self._sessions.begin() as session:
+            row = session.get(ContentTaskRow, task_id)
+            if row:
+                row.stage = stage
+                row.checkpoint = {**(row.checkpoint or {}), stage: checkpoint}
+                if progress is not None:
+                    row.progress = max(0, min(progress, 100))
+
     def succeed(self, task_id: str, result: dict[str, Any]) -> None:
         with self._sessions.begin() as session:
             row = session.get(ContentTaskRow, task_id)
@@ -81,6 +100,7 @@ class PostgresContentTaskRepository:
                 row.stage = "completed"
                 row.progress = 100
                 row.result = result
+                row.checkpoint = {**(row.checkpoint or {}), "completed": {"at": datetime.now(UTC).isoformat()}}
                 row.error = None
                 row.lease_owner = None
                 row.lease_expires_at = None

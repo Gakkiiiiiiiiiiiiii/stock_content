@@ -14,6 +14,7 @@ def test_api_vertical_slice(tmp_path):
             "options": {
                 "metadata": {"title": "API fixture"},
                 "transcript": "股票600000的利润增长是利好。",
+                "offline_fixture": True,
             },
         },
     )

@@ -1,0 +1,10 @@
+# Deterministic entity aliases used before model-assisted normalization.
+aliases:
+  宁德时代: {entity_type: EQUITY, ticker: "300750"}
+  贵州茅台: {entity_type: EQUITY, ticker: "600519"}
+  比亚迪: {entity_type: EQUITY, ticker: "002594"}
+  沪深300: {entity_type: INDEX, ticker: "000300.SH"}
+  中证500: {entity_type: INDEX, ticker: "000905.SH"}
+  科创50: {entity_type: INDEX, ticker: "000688.SH"}
+  新能源: {entity_type: INDUSTRY, ticker: NEWENERGY}
+  人工智能: {entity_type: THEME, ticker: AI}

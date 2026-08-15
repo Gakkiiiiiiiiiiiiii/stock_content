@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -40,14 +41,19 @@ class ContentApplication:
         self._summaries = summary_repository
 
     def enqueue(self, source_type: str, source_ref: str, options: dict | None = None) -> dict:
+        options = options or {}
+        normalized_source = f"{source_type}:{source_ref}".encode("utf-8")
         task = ContentTask(
             task_id=uuid4().hex,
             source_type=source_type,
             source_ref=source_ref,
-            options=options or {},
+            options=options,
+            input_hash=hashlib.sha256(normalized_source).hexdigest(),
+            idempotency_key=str(options.get("idempotency_key") or "") or None,
+            trace_id=str(options.get("trace_id") or "") or None,
         )
-        self._tasks.create(task)
-        return {"task_id": task.task_id, "status": task.status, "stage": task.stage}
+        created = self._tasks.create(task)
+        return {"task_id": created.task_id, "status": created.status, "stage": created.stage}
 
     def get_task(self, task_id: str) -> dict | None:
         task = self._tasks.get(task_id)
@@ -66,6 +72,7 @@ class ContentApplication:
             result = self._pipeline.process(
                 context,
                 lambda stage, progress: self._tasks.update_progress(task.task_id, stage, progress),
+                lambda stage, checkpoint, progress: self._tasks.checkpoint(task.task_id, stage, checkpoint, progress),
             )
             payload = {
                 "video_id": result.data["video"].video_id,

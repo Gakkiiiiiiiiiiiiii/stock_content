@@ -14,7 +14,8 @@ class PostgresVideoRepository:
     def upsert(self, video: VideoAsset, segments: list[TranscriptSegment]) -> None:
         with self._sessions.begin() as session:
             row = session.get(VideoAssetRow, video.video_id)
-            values = vars(video)
+            values = vars(video).copy()
+            values["source_metadata"] = values.pop("metadata")
             if row is None:
                 row = VideoAssetRow(**values)
                 session.add(row)
@@ -43,13 +44,23 @@ class PostgresVideoRepository:
                 "duration_seconds": row.duration_seconds,
                 "transcript_text": row.transcript_text,
                 "source_hash": row.source_hash,
+                "canonical_url": row.canonical_url,
+                "published_at": row.published_at,
+                "source_version": row.source_version,
+                "metadata": row.source_metadata,
+                "resolved_at": row.resolved_at,
                 "segments": [
                     {
                         "segment_index": item.segment_index,
                         "start_seconds": item.start_seconds,
                         "end_seconds": item.end_seconds,
                         "text": item.text,
+                        "raw_text": item.raw_text,
+                        "normalized_text": item.normalized_text,
                         "confidence": item.confidence,
+                        "speaker_id": item.speaker_id,
+                        "speaker_confidence": item.speaker_confidence,
+                        "correction_records": item.correction_records,
                     }
                     for item in segments
                 ],
@@ -67,6 +78,8 @@ class PostgresVideoRepository:
                     "author": row.author,
                     "duration_seconds": row.duration_seconds,
                     "source_hash": row.source_hash,
+                    "canonical_url": row.canonical_url,
+                    "published_at": row.published_at,
                 }
                 for row in rows
             ]

@@ -8,9 +8,18 @@ from pathlib import Path
 from typing import Any
 
 from stock_content.application.pipeline import PipelineContext
+from stock_content.adapters.http.model_client import ContentModelClient
 from stock_content.domain.chapter import ChapterSegmenter
+from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
+from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
+from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
+from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge import KnowledgeExtractor
-from stock_content.domain.models import TranscriptSegment, VideoAsset
+from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
+from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
+from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoAsset
+from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.ports.media import AudioExtractor, SourceAdapter, SpeechRecognizer
 from stock_content.ports.repositories import (
@@ -121,18 +130,168 @@ class ChapterStage:
 class KnowledgeExtractionStage:
     name = "knowledge"
 
-    def __init__(self, extractor: KnowledgeExtractor) -> None:
-        self._extractor = extractor
+    def __init__(
+        self,
+        model_client: ContentModelClient | None = None,
+        fixture_extractor: KnowledgeExtractor | None = None,
+        external_verifier: ExternalFactVerifier | None = None,
+    ) -> None:
+        self._model_client = model_client or ContentModelClient()
+        self._structured_extractor = KnowledgeUnitExtractor(self._model_client)
+        self._normalizer = KnowledgeUnitNormalizer(
+            verifier=ClaimEvidenceVerifier(judge=SemanticEntailmentJudge(self._model_client))
+        )
+        self._cross_modal = CrossModalEvidenceVerifier()
+        self._temporal = KnowledgeTemporalPolicy()
+        self._deduplicator = KnowledgeDeduplicator()
+        self._external = external_verifier or ExternalFactVerifier()
+        self._fixture_extractor = fixture_extractor or KnowledgeExtractor()
+
+    @staticmethod
+    def _timestamp(value: object) -> datetime:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        return datetime.now(UTC)
+
+    @staticmethod
+    def _chapter_payload(context: PipelineContext) -> list[dict]:
+        payload = []
+        for chapter in context.data["chapters"]:
+            segments = [
+                segment
+                for segment in context.data["segments"]
+                if segment.start_seconds < chapter.end_seconds and chapter.start_seconds < segment.end_seconds
+            ]
+            window = {
+                "start_ms": int(chapter.start_seconds * 1000),
+                "end_ms": int(chapter.end_seconds * 1000),
+                "transcript_text": " ".join(segment.text for segment in segments),
+                "segments": [
+                    {
+                        "text": segment.normalized_text or segment.text,
+                        "raw_text": segment.raw_text or segment.text,
+                        "start_ms": int(segment.start_seconds * 1000),
+                        "end_ms": int(segment.end_seconds * 1000),
+                        "confidence_score": segment.confidence,
+                        "speaker_id": segment.speaker_id,
+                    }
+                    for segment in segments
+                ],
+                "ocr_blocks": list(context.data.get("ocr_evidence") or []),
+                "frame_refs": list(context.data.get("frame_insights") or []),
+            }
+            payload.append(
+                {
+                    "chapter_index": chapter.chapter_index,
+                    "title": chapter.title,
+                    "chapter_type": chapter.chapter_type,
+                    "primary_domain": "GENERAL",
+                    "windows": [window],
+                    "entities": [],
+                }
+            )
+        return payload
+
+    @staticmethod
+    def _to_domain(video_id: str, records: list[dict], available_from: datetime) -> list[KnowledgeUnit]:
+        units = []
+        for record in records:
+            as_of = record.get("as_of_time") or available_from
+            if isinstance(as_of, str):
+                as_of = KnowledgeExtractionStage._timestamp(as_of)
+            valid_from = record.get("valid_from")
+            valid_to = record.get("valid_to")
+            if isinstance(valid_from, str):
+                valid_from = KnowledgeExtractionStage._timestamp(valid_from)
+            if isinstance(valid_to, str):
+                valid_to = KnowledgeExtractionStage._timestamp(valid_to)
+            subject = record.get("subject_name") or record.get("subject_key")
+            attributes = dict(record.get("attributes") or {})
+            attributes["evidence"] = list(record.get("evidence") or [])
+            attributes["event_type"] = record.get("event_type")
+            units.append(
+                KnowledgeUnit(
+                    knowledge_uid=str(record["knowledge_uid"]),
+                    video_id=video_id,
+                    chapter_id=record.get("chapter_id"),
+                    statement=str(record["statement"]),
+                    kind=str(record.get("knowledge_kind") or "STATE"),
+                    knowledge_kind=str(record.get("knowledge_kind") or "STATE"),
+                    knowledge_version=int(record.get("knowledge_version") or 1),
+                    subject=subject,
+                    subject_key=record.get("subject_key"),
+                    predicate_key=record.get("predicate_key"),
+                    ticker=record.get("ticker") or record.get("subject_key"),
+                    sentiment=str(record.get("sentiment") or "NEUTRAL"),
+                    support_status=str(record.get("support_status") or "UNSUPPORTED"),
+                    truth_status=str(record.get("truth_status") or "NOT_CHECKED"),
+                    review_status=str(record.get("review_status") or "UNREVIEWED"),
+                    lifecycle_status=str(record.get("lifecycle_status") or "EXTRACTED"),
+                    confidence=float(record.get("support_score") or record.get("extraction_confidence") or 0.0),
+                    as_of=as_of,
+                    available_from=available_from,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    source_statement_hash=record.get("semantic_hash"),
+                    content_hash=record.get("content_hash"),
+                    attributes=attributes,
+                    provenance={
+                        "extractor_version": record.get("extractor_version"),
+                        "schema_version": record.get("schema_version"),
+                        "model": (record.get("attributes") or {}).get("model"),
+                    },
+                )
+            )
+        return units
+
+    def _fixture_records(self, context: PipelineContext, timestamp: datetime) -> list[dict]:
+        """Offline fixtures are explicit and never a production fallback."""
+        records: list[dict] = []
+        for unit in self._fixture_extractor.extract(context.data["video"].video_id, context.data["chapters"], timestamp):
+            chapter = next((item for item in context.data["chapters"] if item.chapter_id == unit.chapter_id), None)
+            start_ms = int((chapter.start_seconds if chapter else 0) * 1000)
+            end_ms = int((chapter.end_seconds if chapter else 0) * 1000)
+            records.append(
+                {
+                    "knowledge_uid": unit.knowledge_uid,
+                    "statement": unit.statement,
+                    "knowledge_kind": "STATE",
+                    "subject_key": unit.ticker or unit.subject,
+                    "subject_name": unit.subject,
+                    "predicate_key": unit.kind.lower(),
+                    "ticker": unit.ticker,
+                    "sentiment": unit.sentiment,
+                    "support_status": "SOURCE_SUPPORTED",
+                    "truth_status": "NOT_CHECKED",
+                    "review_status": "UNREVIEWED",
+                    "lifecycle_status": "ACTIVE",
+                    "support_score": 0.75,
+                    "as_of_time": timestamp,
+                    "evidence": [{"source_type": "ASR", "evidence_text": unit.statement, "start_ms": start_ms, "end_ms": end_ms, "confidence_score": 1.0, "is_primary": True}],
+                    "attributes": {"offline_fixture": True},
+                }
+            )
+        return records
 
     def execute(self, context: PipelineContext) -> PipelineContext:
-        as_of = context.options.get("as_of")
-        if isinstance(as_of, str):
-            as_of = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
-        context.data["knowledge"] = self._extractor.extract(
-            context.data["video"].video_id,
-            context.data["chapters"],
-            as_of or datetime.now(UTC),
-        )
+        available_from = self._timestamp(context.options.get("available_from") or context.options.get("as_of"))
+        if context.options.get("offline_fixture") is True:
+            records = self._fixture_records(context, available_from)
+        else:
+            metadata = dict(context.data["metadata"])
+            metadata.setdefault("platform", context.source["type"])
+            metadata.setdefault("platform_video_id", context.source["ref"])
+            metadata.setdefault("publish_time", available_from.isoformat())
+            records = self._structured_extractor.extract(metadata, self._chapter_payload(context))
+            records = self._normalizer.normalize(records, metadata)
+            records = self._cross_modal.verify_many(records, list(context.data.get("ocr_evidence") or []))
+            records = self._external.verify_many(records)
+            records = self._temporal.apply(records, available_from)
+            records = self._deduplicator.deduplicate(records)
+        context.data["knowledge"] = self._to_domain(context.data["video"].video_id, records, available_from)
         return context
 
 
@@ -140,10 +299,10 @@ class VerificationStage:
     name = "verification"
 
     def execute(self, context: PipelineContext) -> PipelineContext:
-        transcript = context.data["transcript"]
-        for unit in context.data["knowledge"]:
-            unit.support_status = "SOURCE_SUPPORTED" if unit.statement in transcript else "UNSUPPORTED"
-            unit.confidence = 0.75 if unit.support_status == "SOURCE_SUPPORTED" else 0.3
+        # Source, semantic and cross-modal verification are performed before
+        # conversion to the persistence model.  This stage is retained as a
+        # named checkpoint for worker compatibility and deliberately does not
+        # reintroduce substring-based verification.
         return context
 
 

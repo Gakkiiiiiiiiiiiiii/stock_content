@@ -18,6 +18,10 @@ class ContentTask:
     error: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    input_hash: str | None = None
+    idempotency_key: str | None = None
+    trace_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -33,6 +37,11 @@ class VideoAsset:
     duration_seconds: float | None = None
     transcript_text: str = ""
     source_hash: str | None = None
+    canonical_url: str | None = None
+    published_at: datetime | None = None
+    source_version: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    resolved_at: datetime | None = None
 
 
 @dataclass
@@ -42,6 +51,11 @@ class TranscriptSegment:
     end_seconds: float
     text: str
     confidence: float | None = None
+    raw_text: str | None = None
+    normalized_text: str | None = None
+    speaker_id: str = "UNKNOWN"
+    speaker_confidence: float | None = None
+    correction_records: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -62,14 +76,26 @@ class KnowledgeUnit:
     chapter_id: str | None
     statement: str
     kind: str = "CLAIM"
+    knowledge_kind: str = "STATE"
+    knowledge_version: int = 1
     subject: str | None = None
+    subject_key: str | None = None
+    predicate_key: str | None = None
     ticker: str | None = None
     sentiment: str = "NEUTRAL"
     support_status: str = "SOURCE_SUPPORTED"
-    review_status: str = "PENDING"
+    truth_status: str = "NOT_CHECKED"
+    review_status: str = "UNREVIEWED"
+    lifecycle_status: str = "ACTIVE"
     confidence: float = 0.6
     as_of: datetime = field(default_factory=lambda: datetime.now(UTC))
     available_from: datetime = field(default_factory=lambda: datetime.now(UTC))
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    source_statement_hash: str | None = None
+    content_hash: str | None = None
+    attributes: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
