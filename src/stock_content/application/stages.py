@@ -477,7 +477,31 @@ class FinancialEnrichmentStage:
         records: list[dict] = []
         numeric_facts: list[dict] = []
         for unit in context.data["knowledge"]:
+            # A numeric fact is observable only when the knowledge item is
+            # observable.  Do not let a re-parser silently drop the temporal
+            # boundary that protects downstream research from look-ahead.
             numerics = [asdict(item) for item in parse_financial_numerics(unit.statement)]
+            evidence = list((unit.attributes or {}).get("evidence") or [])
+            evidence_refs = [
+                str(item.get("source_id") or item.get("frame_id") or "")
+                for item in evidence
+                if item.get("source_id") or item.get("frame_id")
+            ]
+            numeric_ids: list[str] = []
+            for index, item in enumerate(numerics):
+                digest = hashlib.sha256(
+                    f"{unit.video_id}:{unit.knowledge_uid}:{index}:{item.get('raw_expression', '')}".encode()
+                ).hexdigest()[:32]
+                numeric_id = f"num_{digest}"
+                numeric_ids.append(numeric_id)
+                item.update(
+                    {
+                        "numeric_id": numeric_id,
+                        "as_of_time": unit.as_of.isoformat(),
+                        "available_from": unit.available_from.isoformat(),
+                        "evidence_ref": evidence_refs[0] if evidence_refs else None,
+                    }
+                )
             attributes = dict(unit.attributes or {})
             attributes["financial_numerics"] = numerics
             unit.attributes = attributes
@@ -492,8 +516,8 @@ class FinancialEnrichmentStage:
                     "as_of": unit.as_of,
                     "valid_from": unit.valid_from,
                     "available_from": unit.available_from,
-                    "numeric_ids": [],
-                    "evidence_ids": [],
+                    "numeric_ids": numeric_ids,
+                    "evidence_ids": evidence_refs,
                 }
             )
             numeric_facts.extend([{"knowledge_uid": unit.knowledge_uid, **item} for item in numerics])
@@ -526,6 +550,7 @@ class PersistStage:
         summaries: SummaryRepository,
         multimodal: MultimodalRepository | None = None,
         financial=None,
+        entities=None,
     ) -> None:
         self._videos = videos
         self._chapters = chapters
@@ -533,6 +558,7 @@ class PersistStage:
         self._summaries = summaries
         self._multimodal = multimodal
         self._financial = financial
+        self._entities = entities
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         video = context.data["video"]
@@ -553,6 +579,8 @@ class PersistStage:
                 list(context.data.get("financial_numeric_facts") or []),
                 list(context.data.get("financial_events") or []),
             )
+        if self._entities:
+            self._entities.replace(video.video_id, context.data["knowledge"])
         self._summaries.upsert(context.data["summary"])
         return context
 

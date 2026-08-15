@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
-from stock_content.adapters.postgres.models import FinancialEventRow, FinancialNumericFactRow
+from stock_content.adapters.postgres.models import FinancialEventRow, FinancialNumericFactRow, KnowledgeEvidenceRow
 
 
 class PostgresFinancialRepository:
@@ -23,7 +23,7 @@ class PostgresFinancialRepository:
                 ).hexdigest()[:32]
                 session.add(
                     FinancialNumericFactRow(
-                        numeric_id=f"num_{digest}",
+                        numeric_id=str(item.get("numeric_id") or f"num_{digest}"),
                         video_id=video_id,
                         knowledge_uid=item.get("knowledge_uid"),
                         raw_text=item.get("raw_expression"),
@@ -41,6 +41,19 @@ class PostgresFinancialRepository:
                     )
                 )
             for item in events:
+                # Financial facts reference the immutable KnowledgeEvidence
+                # rows, not transient stage-local names.  Source ids are kept
+                # as a fallback for old ingests that pre-date the evidence
+                # table.
+                evidence_rows = session.scalars(
+                    select(KnowledgeEvidenceRow).where(KnowledgeEvidenceRow.knowledge_uid == item.get("knowledge_uid"))
+                ).all()
+                source_ids = set(str(value) for value in item.get("evidence_refs") or [])
+                evidence_refs = [
+                    str(row.id) for row in evidence_rows if not source_ids or str(row.source_id) in source_ids
+                ]
+                if not evidence_refs:
+                    evidence_refs = [str(row.id) for row in evidence_rows]
                 session.add(
                     FinancialEventRow(
                         event_id=str(item["event_id"]),
@@ -55,7 +68,7 @@ class PostgresFinancialRepository:
                         direction=item.get("direction"),
                         strength=item.get("strength"),
                         numeric_refs=list(item.get("numeric_refs") or []),
-                        evidence_refs=list(item.get("evidence_refs") or []),
+                        evidence_refs=evidence_refs,
                         confidence=item.get("confidence"),
                     )
                 )

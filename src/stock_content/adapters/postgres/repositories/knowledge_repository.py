@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import re
-from collections import defaultdict
 from datetime import datetime
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import sessionmaker
 
 from stock_content.adapters.postgres.models import KnowledgeCrossVideoRow, KnowledgeEvidenceRow, KnowledgeUnitRow
+from stock_content.domain.cross_video_corroboration import CrossVideoCorroborationService
 from stock_content.domain.models import KnowledgeUnit
 
 _SUPPORT_RANK = {"UNSUPPORTED": 0, "SOURCE_SUPPORTED": 1, "CROSS_VERIFIED": 2, "FACT_VERIFIED": 3}
@@ -99,45 +99,39 @@ class PostgresKnowledgeRepository:
     @staticmethod
     def _refresh_cross_video(session, units: list[KnowledgeUnit]) -> None:
         """Persist corroboration once at write time; read APIs never invent it."""
-        keys = {(unit.subject_key or unit.ticker or "", unit.predicate_key or unit.knowledge_kind) for unit in units}
-        for subject_key, predicate_key in keys:
-            if not subject_key:
-                continue
-            rows = session.scalars(
-                select(KnowledgeUnitRow).where(
-                    KnowledgeUnitRow.subject_key == subject_key,
-                    KnowledgeUnitRow.predicate_key == predicate_key,
-                    KnowledgeUnitRow.lifecycle_status == "ACTIVE",
-                )
-            ).all()
-            by_video: dict[str, set[str]] = defaultdict(set)
-            for row in rows:
-                if _SUPPORT_RANK.get(row.support_status, 0) >= _SUPPORT_RANK["SOURCE_SUPPORTED"]:
-                    by_video[row.video_id].add(row.sentiment)
-            directional = [directions for directions in by_video.values() if directions & {"BULLISH", "BEARISH"}]
-            bullish = sum(directions == {"BULLISH"} for directions in directional)
-            bearish = sum(directions == {"BEARISH"} for directions in directional)
-            mixed = sum(len(directions & {"BULLISH", "BEARISH"}) > 1 for directions in directional)
-            total = max(len(directional), 1)
-            consensus = (bullish - bearish) / total
-            disagreement = mixed / total
-            attention = len(rows) / max(len(by_video), 1)
-            for row in rows:
-                state = session.get(KnowledgeCrossVideoRow, row.knowledge_uid)
-                values = {
-                    "corroborating_video_count": max(bullish, bearish),
-                    "contradicting_video_count": mixed + min(bullish, bearish),
-                    "independent_source_count": len(by_video),
-                    "author_attention_score": attention,
-                    "consensus_score": consensus,
-                    "disagreement_score": disagreement,
-                    "evidence_ids": [],
-                }
-                if state is None:
-                    session.add(KnowledgeCrossVideoRow(knowledge_uid=row.knowledge_uid, **values))
-                else:
-                    for name, value in values.items():
-                        setattr(state, name, value)
+        affected = {
+            (unit.subject_key or unit.ticker or "", unit.predicate_key or unit.knowledge_kind) for unit in units
+        }
+        rows = session.scalars(select(KnowledgeUnitRow).where(KnowledgeUnitRow.lifecycle_status == "ACTIVE")).all()
+        payload = [
+            {
+                "knowledge_uid": row.knowledge_uid,
+                "video_id": row.video_id,
+                "subject_key": row.subject_key,
+                "predicate_key": row.predicate_key,
+                "sentiment": row.sentiment,
+                "support_status": row.support_status,
+                "lifecycle_status": row.lifecycle_status,
+                "evidence_ids": [
+                    str(value)
+                    for value in session.scalars(
+                        select(KnowledgeEvidenceRow.id).where(KnowledgeEvidenceRow.knowledge_uid == row.knowledge_uid)
+                    ).all()
+                ],
+            }
+            for row in rows
+            if (row.subject_key or row.ticker or "", row.predicate_key or row.knowledge_kind) in affected
+        ]
+        for knowledge_uid, values in CrossVideoCorroborationService().calculate(payload).items():
+            state = session.get(KnowledgeCrossVideoRow, knowledge_uid)
+            # Keep the legacy column as an alias until all clients move to the
+            # unambiguous content_attention_score contract.
+            values["author_attention_score"] = values["content_attention_score"]
+            if state is None:
+                session.add(KnowledgeCrossVideoRow(knowledge_uid=knowledge_uid, **values))
+            else:
+                for name, value in values.items():
+                    setattr(state, name, value)
 
     def get(self, knowledge_uid: str) -> dict | None:
         with self._sessions() as session:
@@ -228,7 +222,8 @@ class PostgresKnowledgeRepository:
                         "lifecycle_status": row.lifecycle_status,
                         "as_of_time": row.as_of.isoformat(),
                         "available_from": row.available_from.isoformat(),
-                        "author_attention_score": cross.author_attention_score if cross else 0.0,
+                        "content_attention_score": cross.content_attention_score if cross else 0.0,
+                        "author_attention_score": cross.content_attention_score if cross else 0.0,
                         "event_strength": (row.attributes or {}).get("event_strength", row.confidence),
                         "cross_video_consensus": cross.consensus_score if cross else 0.0,
                         "cross_video_disagreement": cross.disagreement_score if cross else 0.0,

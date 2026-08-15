@@ -278,6 +278,7 @@ class KnowledgeCrossVideoRow(Base):
     contradicting_video_count: Mapped[int] = mapped_column(Integer, default=0)
     independent_source_count: Mapped[int] = mapped_column(Integer, default=0)
     author_attention_score: Mapped[float] = mapped_column(Float, default=0.0)
+    content_attention_score: Mapped[float] = mapped_column(Float, default=0.0)
     consensus_score: Mapped[float] = mapped_column(Float, default=0.0)
     disagreement_score: Mapped[float] = mapped_column(Float, default=0.0)
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list)

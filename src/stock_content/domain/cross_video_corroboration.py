@@ -36,3 +36,42 @@ class CrossVideoCorroboration:
                 dict(unit) | {"attributes": (unit.get("attributes") or {}) | {"cross_video_corroboration": narrative}}
             )
         return results
+
+
+class CrossVideoCorroborationService:
+    """Pure domain calculation; persistence belongs to the repository."""
+
+    def calculate(self, rows: list[dict]) -> dict[str, dict]:
+        grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        for row in rows:
+            key = (str(row.get("subject_key") or ""), str(row.get("predicate_key") or ""))
+            if key[0] and row.get("lifecycle_status") == "ACTIVE":
+                grouped[key].append(row)
+        result: dict[str, dict] = {}
+        for group in grouped.values():
+            by_video: dict[str, list[dict]] = defaultdict(list)
+            for row in group:
+                if row.get("support_status") != "UNSUPPORTED":
+                    by_video[str(row["video_id"])].append(row)
+            sentiments = [str(row.get("sentiment") or "NEUTRAL") for items in by_video.values() for row in items]
+            bullish, bearish = sentiments.count("BULLISH"), sentiments.count("BEARISH")
+            total = max(len(by_video), 1)
+            evidence = sorted(
+                {
+                    str(evidence)
+                    for items in by_video.values()
+                    for row in items
+                    for evidence in row.get("evidence_ids", [])
+                }
+            )
+            values = {
+                "corroborating_video_count": max(bullish, bearish),
+                "contradicting_video_count": min(bullish, bearish),
+                "independent_source_count": len(by_video),
+                "content_attention_score": len(group) / total,
+                "consensus_score": (bullish - bearish) / max(len(sentiments), 1),
+                "disagreement_score": min(bullish, bearish) / max(len(sentiments), 1),
+                "evidence_ids": evidence,
+            }
+            result.update({str(row["knowledge_uid"]): values for row in group})
+        return result

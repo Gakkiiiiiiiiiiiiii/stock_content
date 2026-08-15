@@ -67,7 +67,7 @@ class Database:
                 "confidence": "FLOAT",
                 "source_reliability": "FLOAT",
             },
-            "knowledge_cross_video": {"author_attention_score": "FLOAT"},
+            "knowledge_cross_video": {"author_attention_score": "FLOAT", "content_attention_score": "FLOAT"},
         }
         with self.engine.begin() as connection:
             inspector = inspect(connection)
