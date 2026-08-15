@@ -30,6 +30,7 @@ from stock_content.ports.repositories import (
     ChapterRepository,
     KnowledgeIndex,
     KnowledgeRepository,
+    MultimodalRepository,
     SummaryRepository,
     VideoRepository,
 )
@@ -142,6 +143,10 @@ class SpeakerDiarizationStage:
         context.data["segments"] = self._diarizer.annotate(
             str(context.data.get("audio_path") or "") or None, context.data["segments"]
         )
+        status = getattr(self._diarizer, "last_status", "UNKNOWN")
+        context.data["diarization_status"] = status
+        if status in {"UNAVAILABLE", "FAILED", "DEGRADED"}:
+            context.data.setdefault("quality_warnings", []).append(f"DIARIZATION_{status}")
         return context
 
 
@@ -519,17 +524,35 @@ class PersistStage:
         chapters: ChapterRepository,
         knowledge: KnowledgeRepository,
         summaries: SummaryRepository,
+        multimodal: MultimodalRepository | None = None,
+        financial=None,
     ) -> None:
         self._videos = videos
         self._chapters = chapters
         self._knowledge = knowledge
         self._summaries = summaries
+        self._multimodal = multimodal
+        self._financial = financial
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         video = context.data["video"]
         self._videos.upsert(video, context.data["segments"])
         self._chapters.replace_for_video(video.video_id, context.data["chapters"])
         self._knowledge.replace_for_video(video.video_id, context.data["knowledge"])
+        if self._multimodal:
+            self._multimodal.replace(
+                video.video_id,
+                list(context.data.get("frames") or []),
+                list(context.data.get("ocr_evidence") or []),
+                list(context.data.get("frame_insights") or []),
+                list(context.data.get("temporal_windows") or []),
+            )
+        if self._financial:
+            self._financial.replace(
+                video.video_id,
+                list(context.data.get("financial_numeric_facts") or []),
+                list(context.data.get("financial_events") or []),
+            )
         self._summaries.upsert(context.data["summary"])
         return context
 

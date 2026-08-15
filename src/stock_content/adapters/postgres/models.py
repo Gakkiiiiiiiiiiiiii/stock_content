@@ -219,6 +219,8 @@ class FinancialNumericFactRow(Base):
     __tablename__ = "financial_numeric_fact"
     numeric_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     video_id: Mapped[str] = mapped_column(ForeignKey("video_asset.video_id", ondelete="CASCADE"), index=True)
+    knowledge_uid: Mapped[str | None] = mapped_column(String(64), index=True)
+    raw_text: Mapped[str | None] = mapped_column(Text)
     metric: Mapped[str | None] = mapped_column(String(80), index=True)
     value: Mapped[float | None] = mapped_column(Float)
     unit: Mapped[str | None] = mapped_column(String(40))
@@ -228,12 +230,15 @@ class FinancialNumericFactRow(Base):
     qualifier: Mapped[str | None] = mapped_column(String(40))
     confidence: Mapped[float | None] = mapped_column(Float)
     evidence_ref: Mapped[str | None] = mapped_column(String(64))
+    as_of_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    available_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class FinancialEventRow(Base):
     __tablename__ = "financial_event"
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     video_id: Mapped[str] = mapped_column(ForeignKey("video_asset.video_id", ondelete="CASCADE"), index=True)
+    knowledge_uid: Mapped[str | None] = mapped_column(String(64), index=True)
     event_type: Mapped[str] = mapped_column(String(60), index=True)
     subject_key: Mapped[str | None] = mapped_column(String(255), index=True)
     objects: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
