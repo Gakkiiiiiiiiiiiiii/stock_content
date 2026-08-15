@@ -8,9 +8,8 @@ from sqlalchemy.orm import sessionmaker
 
 from stock_content.adapters.postgres.models import KnowledgeCrossVideoRow, KnowledgeEvidenceRow, KnowledgeUnitRow
 from stock_content.domain.cross_video_corroboration import CrossVideoCorroborationService
+from stock_content.domain.knowledge_enums import support_rank
 from stock_content.domain.models import KnowledgeUnit
-
-_SUPPORT_RANK = {"UNSUPPORTED": 0, "SOURCE_SUPPORTED": 1, "CROSS_VERIFIED": 2, "FACT_VERIFIED": 3}
 
 
 class PostgresKnowledgeRepository:
@@ -186,12 +185,12 @@ class PostgresKnowledgeRepository:
                 KnowledgeUnitRow.lifecycle_status == "ACTIVE",
             )
             rows = session.scalars(statement.order_by(KnowledgeUnitRow.available_from)).all()
-            minimum = _SUPPORT_RANK.get(minimum_support_status, 1)
+            minimum = support_rank(minimum_support_status)
             requested_codes = {_ticker_code(symbol) for symbol in symbols if _ticker_code(symbol)}
             eligible = [
                 row
                 for row in rows
-                if _SUPPORT_RANK.get(row.support_status, 0) >= minimum
+                if support_rank(row.support_status) >= minimum
                 and (not requested_codes or _ticker_code(row.ticker or row.subject_key or "") in requested_codes)
             ]
             items = []

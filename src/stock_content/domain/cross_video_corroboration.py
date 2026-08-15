@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from stock_content.domain.knowledge_enums import SupportStatus, support_rank
+
 
 class CrossVideoCorroboration:
     """Measures repeated market narratives; it never verifies a fact."""
@@ -51,7 +53,7 @@ class CrossVideoCorroborationService:
         for group in grouped.values():
             by_video: dict[str, list[dict]] = defaultdict(list)
             for row in group:
-                if row.get("support_status") != "UNSUPPORTED":
+                if support_rank(row.get("support_status")) >= support_rank(SupportStatus.SOURCE_SUPPORTED.value):
                     by_video[str(row["video_id"])].append(row)
             sentiments = [str(row.get("sentiment") or "NEUTRAL") for items in by_video.values() for row in items]
             bullish, bearish = sentiments.count("BULLISH"), sentiments.count("BEARISH")
@@ -73,5 +75,5 @@ class CrossVideoCorroborationService:
                 "disagreement_score": min(bullish, bearish) / max(len(sentiments), 1),
                 "evidence_ids": evidence,
             }
-            result.update({str(row["knowledge_uid"]): values for row in group})
+            result.update({str(row["knowledge_uid"]): values for rows in by_video.values() for row in rows})
         return result

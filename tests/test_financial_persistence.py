@@ -24,6 +24,17 @@ def test_financial_facts_keep_visibility_boundary_and_persist_entity_authority(t
         ticker="300750",
         as_of=available_from,
         available_from=available_from,
+        attributes={
+            "entities": [
+                {
+                    "entity_name": "宁德时代",
+                    "entity_key": "300750",
+                    "ticker": "300750",
+                    "entity_type": "EQUITY",
+                    "resolution_source": "fixture",
+                }
+            ]
+        },
     )
     context = PipelineContext(task_id="financial-test", source={}, options={}, data={"knowledge": [unit]})
     FinancialEnrichmentStage().execute(context)

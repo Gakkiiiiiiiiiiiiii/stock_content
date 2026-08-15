@@ -360,6 +360,23 @@ class KnowledgeExtractionStage:
             attributes = dict(record.get("attributes") or {})
             attributes["evidence"] = list(record.get("evidence") or [])
             attributes["event_type"] = record.get("event_type")
+            # Entity resolution (including OCR/LLM correction provenance) is
+            # already produced before persistence. Keep it immutable here so
+            # repositories never repeat heuristic resolution on writes.
+            entities = list(record.get("entities") or [])
+            if not entities and record.get("ticker"):
+                entities.append(
+                    {
+                        "entity_name": record.get("subject_name") or record["ticker"],
+                        "entity_key": record["ticker"],
+                        "ticker": record["ticker"],
+                        "entity_type": "EQUITY",
+                        "resolution_source": "knowledge_subject",
+                    }
+                )
+            attributes["entities"] = entities
+            if record.get("entity_resolution"):
+                attributes["entity_resolution"] = dict(record["entity_resolution"])
             units.append(
                 KnowledgeUnit(
                     knowledge_uid=str(record["knowledge_uid"]),
