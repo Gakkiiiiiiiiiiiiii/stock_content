@@ -29,6 +29,7 @@ from stock_content.application.stages import (
     BuildVideoStage,
     ChapterStage,
     DownloadStage,
+    FinancialEnrichmentStage,
     FrameExtractionStage,
     IndexStage,
     KnowledgeExtractionStage,
@@ -84,6 +85,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
                 )
             ),
             VerificationStage(),
+            FinancialEnrichmentStage(),
             SummaryStage(SummaryGenerator()),
             PersistStage(videos, chapters, knowledge, summaries),
             IndexStage(index),

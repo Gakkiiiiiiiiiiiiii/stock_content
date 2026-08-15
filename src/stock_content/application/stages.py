@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 import tempfile
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,8 @@ from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.financial_event_extractor import FinancialEventExtractor
+from stock_content.domain.financial_numeric import parse_financial_numerics
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
@@ -454,6 +457,43 @@ class VerificationStage:
         # conversion to the persistence model.  This stage is retained as a
         # named checkpoint for worker compatibility and deliberately does not
         # reintroduce substring-based verification.
+        return context
+
+
+class FinancialEnrichmentStage:
+    """Materialise numeric facts and events once for every downstream consumer."""
+
+    name = "financial_enrichment"
+
+    def __init__(self, extractor: FinancialEventExtractor | None = None) -> None:
+        self._extractor = extractor or FinancialEventExtractor()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        records: list[dict] = []
+        numeric_facts: list[dict] = []
+        for unit in context.data["knowledge"]:
+            numerics = [asdict(item) for item in parse_financial_numerics(unit.statement)]
+            attributes = dict(unit.attributes or {})
+            attributes["financial_numerics"] = numerics
+            unit.attributes = attributes
+            records.append(
+                {
+                    "knowledge_uid": unit.knowledge_uid,
+                    "statement": unit.statement,
+                    "subject_key": unit.subject_key,
+                    "ticker": unit.ticker,
+                    "sentiment": unit.sentiment,
+                    "confidence": unit.confidence,
+                    "as_of": unit.as_of,
+                    "valid_from": unit.valid_from,
+                    "available_from": unit.available_from,
+                    "numeric_ids": [],
+                    "evidence_ids": [],
+                }
+            )
+            numeric_facts.extend([{"knowledge_uid": unit.knowledge_uid, **item} for item in numerics])
+        context.data["financial_numeric_facts"] = numeric_facts
+        context.data["financial_events"] = self._extractor.extract(records)
         return context
 
 
