@@ -360,6 +360,8 @@ class KnowledgeExtractionStage:
             attributes = dict(record.get("attributes") or {})
             attributes["evidence"] = list(record.get("evidence") or [])
             attributes["event_type"] = record.get("event_type")
+            # 收尾文档 §63：外部验证状态随 attributes 落库，供 Evidence/Signal 链路传递。
+            attributes["external_verification_status"] = record.get("external_verification_status") or "NOT_RUN"
             # Entity resolution (including OCR/LLM correction provenance) is
             # already produced before persistence. Keep it immutable here so
             # repositories never repeat heuristic resolution on writes.

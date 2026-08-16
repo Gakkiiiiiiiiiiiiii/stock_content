@@ -202,6 +202,10 @@ class PostgresKnowledgeRepository:
                         select(KnowledgeEvidenceRow.id).where(KnowledgeEvidenceRow.knowledge_uid == row.knowledge_uid)
                     ).all()
                 ]
+                # 收尾文档 §63：Quant market_snapshot_id / data_version / available_at
+                # 沿 Evidence/Signal 链路传递（来自 external fact verification 的 PIT 行情锚点）。
+                attributes = row.attributes or {}
+                market_fact = (attributes.get("external_verification") or {}).get("market_fact") or {}
                 items.append(
                     {
                         "signal_id": row.knowledge_uid,
@@ -228,6 +232,10 @@ class PostgresKnowledgeRepository:
                         "cross_video_disagreement": cross.disagreement_score if cross else 0.0,
                         "source_video_id": row.video_id,
                         "evidence_ids": evidence_ids,
+                        "external_verification_status": attributes.get("external_verification_status"),
+                        "market_snapshot_id": market_fact.get("data_snapshot_id"),
+                        "market_data_version": market_fact.get("data_version"),
+                        "market_fact_date": market_fact.get("trading_date"),
                         "provenance": dict(row.provenance or {}),
                     }
                 )

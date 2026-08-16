@@ -29,9 +29,14 @@ response:
       attention_score: number
       cross_video_consensus: number
       cross_video_disagreement: number
+      external_verification_status: { type: string, description: "收尾文档 §63：EXTERNAL_MATCH/EXTERNAL_CONFLICT/VERIFICATION_PENDING/NOT_RUN" }
+      market_snapshot_id: { type: string, description: "收尾文档 §63：Quant 验证时命中的 market-data.v1 快照（mds-xxx）" }
+      market_data_version: { type: string, description: "收尾文档 §63：Quant 快照对应的 data_version" }
+      market_fact_date: { type: string, description: "收尾文档 §63：市场事实锚点交易日（available_at）" }
 rules:
   - Factor 使用 available_from 而不是 event_time（避免内容未来函数）
   - 仅推送达到 minimum_support_status 的信号
+  - 收尾文档 §63：Quant market_snapshot_id/data_version/available_at 沿 Evidence/Signal 链路传递
 dependencies:
   allowed: [stock_factor HTTP consumer]
   forbidden: [stock_agent Python import, quant Python import]
