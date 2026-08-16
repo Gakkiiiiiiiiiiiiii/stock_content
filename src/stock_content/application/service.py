@@ -12,16 +12,7 @@ from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stages import cleanup_work_directory
 from stock_content.application.verification_service import VerificationService, run_verification_pass
-from stock_content.domain.artifacts import (
-    KnowledgeArtifact,
-    SourceArtifact,
-    SummaryArtifact,
-    TranscriptArtifact,
-    TranscriptSegmentItem,
-    make_artifact_id,
-)
 from stock_content.domain.claims import FinancialClaim
-from stock_content.domain.lineage import compute_config_hash
 from stock_content.domain.models import ContentTask
 from stock_content.ports.repositories import (
     ChapterRepository,
@@ -119,9 +110,18 @@ class ContentApplication:
                 "knowledge_count": len(result.data["knowledge"]),
                 "summary": result.data["summary"].core_summary,
             }
-            snapshot_id = self._record_content_snapshot(task, result)
-            if snapshot_id:
-                payload["content_snapshot_id"] = snapshot_id
+            # P0 C-03/C-04：ContentSnapshot 由 SnapshotRecordingStage 在 persist 前基于
+            # pipeline 已生成的 typed Artifact 记录；失败时 pipeline 异常 → task FAILED。
+            snapshot_id = result.data.get("content_snapshot_id")
+            if not snapshot_id:
+                self._tasks.fail(task.task_id, "content_snapshot", "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot")
+                return {
+                    "task_id": task.task_id,
+                    "status": "FAILED",
+                    "stage": "content_snapshot",
+                    "error": "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot",
+                }
+            payload["content_snapshot_id"] = snapshot_id
             self._tasks.succeed(task.task_id, payload)
             return {"task_id": task.task_id, "status": "SUCCEEDED", **payload}
         except Exception as exc:
@@ -134,84 +134,6 @@ class ContentApplication:
             }
         finally:
             cleanup_work_directory(context)
-
-    def _record_content_snapshot(self, task: ContentTask, result: PipelineContext) -> str | None:
-        """§4 P0-2：每次处理结果均存在 ContentSnapshot，绑定 source/model/config/code。"""
-        try:
-            video = result.data["video"]
-            registry = result.artifacts
-            source_content_hash = (
-                str(task.options.get("source_content_hash") or "")
-                or str(video.source_hash or "")
-            )
-            source_payload = {"source_type": task.source_type, "source_ref": task.source_ref}
-            source_artifact = SourceArtifact(
-                artifact_id=make_artifact_id("source", source_payload),
-                artifact_type="source",
-                producer_stage="resolve",
-                source_type=task.source_type,
-                source_ref=task.source_ref,
-                source_content_hash=source_content_hash,
-                source_metadata=dict(result.data.get("metadata") or {}),
-            )
-            segments = [
-                TranscriptSegmentItem(
-                    segment_index=item.segment_index,
-                    start_seconds=item.start_seconds,
-                    end_seconds=item.end_seconds,
-                    text=item.text,
-                    confidence=item.confidence,
-                    speaker_id=item.speaker_id,
-                )
-                for item in result.data.get("segments") or []
-            ]
-            transcript_artifact = TranscriptArtifact(
-                artifact_id=make_artifact_id("transcript", [segment.text for segment in segments]),
-                artifact_type="transcript",
-                producer_stage="asr",
-                media_artifact_id=source_artifact.artifact_id,
-                language=task.options.get("language"),
-                segments=segments,
-                asr_model=str(task.options.get("asr_model") or "unknown"),
-                asr_model_version=str(task.options.get("asr_model_version") or "unknown"),
-            )
-            knowledge_artifact = KnowledgeArtifact(
-                artifact_id=make_artifact_id(
-                    "knowledge", [unit.knowledge_uid for unit in result.data.get("knowledge") or []]
-                ),
-                artifact_type="knowledge",
-                producer_stage="knowledge",
-                knowledge_units=[unit.knowledge_uid for unit in result.data.get("knowledge") or []],
-            )
-            summary_artifact = SummaryArtifact(
-                artifact_id=make_artifact_id("summary", result.data["summary"].core_summary),
-                artifact_type="summary",
-                producer_stage="summary",
-                knowledge_artifact_id=knowledge_artifact.artifact_id,
-                core_summary=result.data["summary"].core_summary,
-            )
-            registry.source = source_artifact
-            registry.transcript = transcript_artifact
-            registry.knowledge = knowledge_artifact
-            registry.summary = summary_artifact
-            snapshot = self._snapshots.record_from_artifacts(
-                source_type=task.source_type,
-                source_ref=task.source_ref,
-                source_content_hash=source_content_hash,
-                artifact_ids=registry.artifact_ids(),
-                model_versions={
-                    "asr_model": task.options.get("asr_model"),
-                    "asr_model_version": task.options.get("asr_model_version"),
-                    "llm_model": task.options.get("llm_model"),
-                    "vision_model": task.options.get("vision_model"),
-                },
-                quant_market_snapshot_ids=list(task.options.get("quant_market_snapshot_ids") or []),
-                config_hash=compute_config_hash(task.options.get("pipeline_config")),
-            )
-            return snapshot.content_snapshot_id
-        except Exception as exc:  # noqa: BLE001 - 快照失败不应推翻已完成的 ingest
-            LOGGER.warning("content snapshot recording failed: %s", exc)
-            return None
 
     def get_content_snapshot(self, content_snapshot_id: str) -> dict | None:
         snapshot = self._snapshots.get(content_snapshot_id)

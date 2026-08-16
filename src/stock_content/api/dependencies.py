@@ -29,6 +29,7 @@ from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSource
 from stock_content.application.pipeline import ContentPipeline
 from stock_content.application.service import ContentApplication
 from stock_content.application.snapshot_service import SnapshotService
+from stock_content.application.stage_runner import wrap_all
 from stock_content.application.stages import (
     ASRStage,
     AudioStage,
@@ -43,6 +44,7 @@ from stock_content.application.stages import (
     OCRStage,
     PersistStage,
     ResolveSourceStage,
+    SnapshotRecordingStage,
     SpeakerDiarizationStage,
     SummaryStage,
     TemporalWindowStage,
@@ -56,6 +58,30 @@ from stock_content.domain.multimodal_context_builder import MultimodalContextBui
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
+
+# P0 C-01：生产 Stage 版本常量（稳定、可追溯，断点恢复依赖版本兼容判定）。
+STAGE_VERSIONS: dict[str, str] = {
+    "resolve": "1.0.0",
+    "download": "1.0.0",
+    "frame": "1.0.0",
+    "audio": "1.0.0",
+    "asr": "1.0.0",
+    "diarization": "1.0.0",
+    "transcript_postprocess": "1.0.0",
+    "ocr": "1.0.0",
+    "vision": "1.0.0",
+    "multimodal_context": "1.0.0",
+    "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
+    "chapter": "1.0.0",
+    "temporal_window": "1.0.0",
+    "knowledge": "1.0.0",
+    "verification": "1.0.0",
+    "financial_enrichment": "1.0.0",
+    "summary": "1.0.0",
+    "content_snapshot": "1.0.0",
+    "persist": "1.0.0",
+    "index": "1.0.0",
+}
 
 
 def build_application(database_url: str | None = None, enable_qdrant: bool | None = None) -> ContentApplication:
@@ -80,33 +106,37 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     else:
         external_provider = HttpExternalFactProvider()
     sources = {"bilibili": BilibiliSourceAdapter(), "xiaoe_hls": XiaoeHlsSourceAdapter()}
-    pipeline = ContentPipeline(
-        [
-            ResolveSourceStage(sources),
-            DownloadStage(sources),
-            FrameExtractionStage(FfmpegFrameExtractor()),
-            AudioStage(FfmpegAudioExtractor()),
-            ASRStage(FasterWhisperRecognizer()),
-            SpeakerDiarizationStage(PyannoteDiarizer()),
-            TranscriptPostprocessStage(TranscriptPostprocessor()),
-            OCRStage(PaddleOcrEngine()),
-            VisionStage(HttpVisionAnalyzer()),
-            MultimodalContextStage(MultimodalContextBuilder()),
-            BuildVideoStage(),
-            ChapterStage(ChapterSegmenter()),
-            TemporalWindowStage(TemporalWindowBuilder()),
-            KnowledgeExtractionStage(
-                external_verifier=ExternalFactVerifier(
-                    provider=external_provider if external_provider.configured() else None
-                )
-            ),
-            VerificationStage(),
-            FinancialEnrichmentStage(),
-            SummaryStage(SummaryGenerator()),
-            PersistStage(videos, chapters, knowledge, summaries, multimodal, financial, entities, verifications),
-            IndexStage(index),
-        ]
-    )
+    # P0 C-03/C-04：快照在 persist 前基于 pipeline 已生成 Artifact 记录；失败即 task 失败。
+    snapshot_service = SnapshotService(SqlSnapshotStore(database.session_factory))
+    stages = [
+        ResolveSourceStage(sources),
+        DownloadStage(sources),
+        FrameExtractionStage(FfmpegFrameExtractor()),
+        AudioStage(FfmpegAudioExtractor()),
+        ASRStage(FasterWhisperRecognizer()),
+        SpeakerDiarizationStage(PyannoteDiarizer()),
+        TranscriptPostprocessStage(TranscriptPostprocessor()),
+        OCRStage(PaddleOcrEngine()),
+        VisionStage(HttpVisionAnalyzer()),
+        MultimodalContextStage(MultimodalContextBuilder()),
+        BuildVideoStage(),
+        ChapterStage(ChapterSegmenter()),
+        TemporalWindowStage(TemporalWindowBuilder()),
+        KnowledgeExtractionStage(
+            external_verifier=ExternalFactVerifier(
+                provider=external_provider if external_provider.configured() else None
+            )
+        ),
+        VerificationStage(),
+        FinancialEnrichmentStage(),
+        SummaryStage(SummaryGenerator()),
+        SnapshotRecordingStage(snapshot_service),
+        PersistStage(videos, chapters, knowledge, summaries, multimodal, financial, entities, verifications),
+        IndexStage(index),
+    ]
+    # P0 C-01：生产主链路全部经 StageRunner，产出 Artifact Checkpoint v2。
+    # 版本号来自稳定常量，不得随机生成。
+    pipeline = ContentPipeline(wrap_all(stages, STAGE_VERSIONS))
     return ContentApplication(
         tasks,
         videos,
@@ -115,5 +145,5 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         pipeline,
         chapters,
         summaries,
-        snapshot_service=SnapshotService(SqlSnapshotStore(database.session_factory)),
+        snapshot_service=snapshot_service,
     )

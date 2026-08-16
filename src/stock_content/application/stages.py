@@ -10,6 +10,15 @@ from typing import Any
 
 from stock_content.adapters.http.model_client import ContentModelClient
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.snapshot_service import SnapshotService
+from stock_content.domain.artifacts import (
+    KnowledgeArtifact,
+    SourceArtifact,
+    SummaryArtifact,
+    TranscriptArtifact,
+    TranscriptSegmentItem,
+    make_artifact_id,
+)
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
@@ -45,6 +54,21 @@ class ResolveSourceStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         fixture = context.options.get("metadata")
         context.data["metadata"] = fixture or self._adapters[context.source["type"]].resolve(context.source["ref"])
+        # P0 C-02：SourceArtifact 在 resolve 完成时立即登记；
+        # source_content_hash 待获得真实内容后由 BuildVideoStage 补齐。
+        metadata = dict(context.data["metadata"] or {})
+        context.artifacts.source = SourceArtifact(
+            artifact_id=make_artifact_id(
+                "source",
+                {"source_type": context.source["type"], "source_ref": context.source["ref"]},
+            ),
+            artifact_type="source",
+            producer_stage="resolve",
+            source_type=context.source["type"],
+            source_ref=context.source["ref"],
+            source_content_hash=str(context.options.get("source_content_hash") or ""),
+            source_metadata=metadata,
+        )
         return context
 
 
@@ -130,7 +154,35 @@ class ASRStage:
             raise ValueError("ASR returned no transcript segments")
         context.data["segments"] = segments
         context.data["transcript"] = " ".join(segment.text for segment in segments)
+        _register_transcript_artifact(context, producer_stage="asr")
         return context
+
+
+def _register_transcript_artifact(context: PipelineContext, *, producer_stage: str) -> None:
+    """P0 C-02：TranscriptArtifact 登记/升级（typed artifact 为权威，data 仅作 adapter）。"""
+    segments = [
+        TranscriptSegmentItem(
+            segment_index=item.segment_index,
+            start_seconds=item.start_seconds,
+            end_seconds=item.end_seconds,
+            text=item.text,
+            confidence=item.confidence,
+            speaker_id=item.speaker_id,
+        )
+        for item in context.data["segments"]
+    ]
+    source = context.artifacts.source
+    context.artifacts.transcript = TranscriptArtifact(
+        artifact_id=make_artifact_id("transcript", [segment.text for segment in segments]),
+        artifact_type="transcript",
+        producer_stage=producer_stage,
+        media_artifact_id=source.artifact_id if source else "",
+        language=context.options.get("language"),
+        segments=segments,
+        # ASR model/version 进入 lineage（默认 faster-whisper，可被 options 覆盖）。
+        asr_model=str(context.options.get("asr_model") or "faster-whisper"),
+        asr_model_version=str(context.options.get("asr_model_version") or "1.0"),
+    )
 
 
 class SpeakerDiarizationStage:
@@ -159,6 +211,8 @@ class TranscriptPostprocessStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         context.data["segments"] = self._postprocessor.process(context.data["segments"])
         context.data["transcript"] = " ".join(segment.text for segment in context.data["segments"])
+        # P0 C-02：后处理后的 transcript 升级为新的权威 TranscriptArtifact。
+        _register_transcript_artifact(context, producer_stage="transcript_postprocess")
         return context
 
 
@@ -470,6 +524,17 @@ class KnowledgeExtractionStage:
             records = self._temporal.apply(records, available_from)
             records = self._deduplicator.deduplicate(records)
         context.data["knowledge"] = self._to_domain(context.data["video"].video_id, records, available_from)
+        # P0 C-02：知识/claim 输出立即登记为 KnowledgeArtifact（claim/evidence ref 进入 lineage，
+        # Fact/Forecast/Opinion 保留在 attributes，不压扁成普通字符串）。
+        knowledge_units = context.data["knowledge"]
+        evidence_artifact = context.artifacts.evidence
+        context.artifacts.knowledge = KnowledgeArtifact(
+            artifact_id=make_artifact_id("knowledge", [unit.knowledge_uid for unit in knowledge_units]),
+            artifact_type="knowledge",
+            producer_stage="knowledge",
+            verification_artifact_id=evidence_artifact.artifact_id if evidence_artifact else "",
+            knowledge_units=[unit.knowledge_uid for unit in knowledge_units],
+        )
         return context
 
 
@@ -555,7 +620,87 @@ class SummaryStage:
         context.data["summary"] = self._generator.generate(
             context.data["video"], context.data["chapters"], context.data["knowledge"]
         )
+        # P0 C-02：SummaryArtifact 登记，knowledge_artifact_id 指向本次已登记的 Knowledge Artifact。
+        knowledge_artifact = context.artifacts.knowledge
+        summary = context.data["summary"]
+        context.artifacts.summary = SummaryArtifact(
+            artifact_id=make_artifact_id("summary", summary.core_summary),
+            artifact_type="summary",
+            producer_stage="summary",
+            knowledge_artifact_id=knowledge_artifact.artifact_id if knowledge_artifact else "",
+            core_summary=summary.core_summary,
+        )
         return context
+
+
+class ContentSnapshotPersistError(RuntimeError):
+    """P0 C-03：ContentSnapshot 创建失败必须使 task 失败，不得静默成功。"""
+
+
+class SnapshotRecordingStage:
+    """P0 C-03/C-04：在 persist 之前基于 pipeline 已生成的 typed Artifact 记录 ContentSnapshot。
+
+    - 直接读取 context.artifacts，不再从 context.data 二次拼装；
+    - mandatory artifact（source/transcript/knowledge/summary）缺失即失败；
+    - 失败抛 ContentSnapshotPersistError → task FAILED（CONTENT_SNAPSHOT_PERSIST_FAILED）；
+    - 成功后 content_snapshot_id 写入 knowledge attributes，signal v3 透传。
+    """
+
+    name = "content_snapshot"
+
+    def __init__(self, snapshot_service: SnapshotService) -> None:
+        self._snapshots = snapshot_service
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        registry = context.artifacts
+        mandatory = {"source": registry.source, "transcript": registry.transcript,
+                     "knowledge": registry.knowledge, "summary": registry.summary}
+        missing = [slot for slot, artifact in mandatory.items() if artifact is None]
+        if missing:
+            raise ContentSnapshotPersistError(
+                f"CONTENT_SNAPSHOT_PERSIST_FAILED: mandatory artifact missing: {sorted(missing)}"
+            )
+        video = context.data.get("video")
+        source_content_hash = (
+            str(context.options.get("source_content_hash") or "")
+            or str(getattr(video, "source_hash", "") or "")
+            or registry.transcript.artifact_id
+        )
+        try:
+            snapshot = self._snapshots.record_from_artifacts(
+                source_type=context.source["type"],
+                source_ref=context.source["ref"],
+                source_content_hash=source_content_hash,
+                artifact_ids=registry.artifact_ids(),
+                model_versions={
+                    "asr_model": registry.transcript.asr_model,
+                    "asr_model_version": registry.transcript.asr_model_version,
+                    "llm_model": context.options.get("llm_model"),
+                    "vision_model": context.options.get("vision_model"),
+                },
+                quant_market_snapshot_ids=list(context.options.get("quant_market_snapshot_ids") or []),
+                config_hash=_config_hash_of(context.options.get("pipeline_config")),
+            )
+        except Exception as exc:  # noqa: BLE001 - 显式失败，绝不静默
+            raise ContentSnapshotPersistError(f"CONTENT_SNAPSHOT_PERSIST_FAILED: {exc}") from exc
+        context.data["content_snapshot_id"] = snapshot.content_snapshot_id
+        # snapshot identity 回填知识 attributes，供 signal v3 透传 content_snapshot_id。
+        for unit in context.data.get("knowledge") or []:
+            attributes = dict(unit.attributes or {})
+            attributes["content_snapshot_id"] = snapshot.content_snapshot_id
+            unit.attributes = attributes
+        return context
+
+
+def _config_hash_of(config: dict | None) -> str:
+    import hashlib
+    import json
+
+    if not config:
+        return ""
+    return hashlib.sha256(
+        json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
 
 
 class PersistStage:
@@ -637,4 +782,16 @@ class BuildVideoStage:
             transcript_text=transcript,
             source_hash=hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
         )
+        # P0 C-02：获得真实内容后补齐 SourceArtifact 的 source_content_hash（升级重建，语义明确）。
+        existing = context.artifacts.source
+        if existing is not None:
+            context.artifacts.source = SourceArtifact(
+                artifact_id=existing.artifact_id,
+                artifact_type="source",
+                producer_stage=existing.producer_stage,
+                source_type=existing.source_type,
+                source_ref=existing.source_ref,
+                source_content_hash=str(context.data["video"].source_hash or ""),
+                source_metadata=dict(existing.source_metadata),
+            )
         return context

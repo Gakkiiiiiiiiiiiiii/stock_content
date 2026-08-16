@@ -45,7 +45,7 @@ def test_api_vertical_slice(tmp_path):
     assert summary.json()["data"]["video_id"] == video_id
     assert knowledge.json()["items"][0]["video_id"] == video_id
     assert unit.json()["data"]["knowledge_uid"] == search.json()["items"][0]["knowledge_uid"]
-    assert signals.json()["contract_version"] == "content-factor-signal.v2"
+    assert signals.json()["contract_version"] == "content-factor-signal.v3"
     assert signals.json()["items"][0]["knowledge_uid"] == search.json()["items"][0]["knowledge_uid"]
     assert signals.json()["items"][0]["truth_status"] == "NOT_CHECKED"
     assert signals.json()["items"][0]["available_from"]

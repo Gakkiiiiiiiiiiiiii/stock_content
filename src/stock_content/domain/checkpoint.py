@@ -33,6 +33,10 @@ class CheckpointRecord:
         payload["input_artifact_ids"] = list(self.input_artifact_ids)
         payload["output_artifact_ids"] = list(self.output_artifact_ids)
         payload["output_hashes"] = list(self.output_hashes)
+        # canonical：时间统一 ISO8601，保证可直接 JSON 持久化。
+        for key in ("started_at", "finished_at"):
+            if isinstance(payload.get(key), datetime):
+                payload[key] = payload[key].isoformat()
         return payload
 
     @staticmethod
