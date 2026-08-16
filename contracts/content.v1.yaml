@@ -1,0 +1,58 @@
+# content.v1 Contract（设计文档 §7 / §11 / §87）
+# Producer: stock_content   Consumers: stock_agent（Research/Content 节点）
+contract_version: content.v1
+service: stock_content
+positioning: Financial Content Intelligence Service
+endpoints:
+  - name: ingest_bilibili
+    method: POST
+    path: /api/v1/videos/bilibili/ingest
+    idempotency: Idempotency-Key header（§33 Content ingest）
+  - name: ingest_xiaoe
+    method: POST
+    path: /api/v1/videos/xiaoe/ingest
+    idempotency: Idempotency-Key header（§33）
+  - name: get_task
+    method: GET
+    path: /api/v1/tasks/{task_id}
+  - name: get_video
+    method: GET
+    path: /api/v1/videos/{video_id}
+  - name: list_videos
+    method: GET
+    path: /api/v1/videos
+  - name: get_video_segments
+    method: GET
+    path: /api/v1/videos/{video_id}/segments
+  - name: get_video_chapters
+    method: GET
+    path: /api/v1/videos/{video_id}/chapters
+  - name: get_video_summary
+    method: GET
+    path: /api/v1/videos/{video_id}/summary
+  - name: list_video_knowledge
+    method: GET
+    path: /api/v1/videos/{video_id}/knowledge
+  - name: get_knowledge
+    method: GET
+    path: /api/v1/knowledge/{knowledge_uid}
+    returns: [knowledge_kind, truth_status, support_status, review_status, evidence_ids]
+  - name: search_knowledge
+    method: POST
+    path: /api/v1/knowledge/search
+    request:
+      query: { type: string, required: true }
+      filters: { type: object }
+      limit: { type: integer, default: 20 }
+      intent: { type: string }
+  - name: health_version
+    method: GET
+    path: /health/version
+truth_rules:
+  # §11 / §87 External Fact Verification
+  - Quant 只返回市场事实（PIT price snapshot），最终 claim 是否成立的判定属于 Content
+  - Quant 不可用时 external_verification_status=VERIFICATION_PENDING，不得阻塞内容入库
+  - 外部验证不得改写 Content 自身的 truth_status 判定权
+dependencies:
+  allowed: [quant HTTP（market-data.v1）, Model API, PostgreSQL, Qdrant]
+  forbidden: [stock_agent, stock_factor, quant Python import]

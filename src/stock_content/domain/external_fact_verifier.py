@@ -36,7 +36,17 @@ class ExternalFactVerifier:
             outcome = self._provider.verify(item)
             status = str(outcome.get("status") or "NOT_FOUND").upper()
             attributes = (item.get("attributes") or {}) | {"external_verification": outcome}
-            if status == "MATCH":
+            if status == "PENDING":
+                # 设计文档 §87：外部事实源不可用时标记待验证，不阻塞内容入库。
+                results.append(
+                    item
+                    | {
+                        "external_verification_status": "VERIFICATION_PENDING",
+                        "truth_status": item.get("truth_status") or "NOT_CHECKED",
+                        "attributes": attributes,
+                    }
+                )
+            elif status == "MATCH":
                 results.append(
                     item
                     | {

@@ -1,0 +1,37 @@
+# content-factor-signal.v2 Contract（设计文档 §10）
+# Producer: stock_content   Consumers: stock_factor（ContentFeatureProvider）
+contract_version: content-factor-signal.v2
+endpoint:
+  method: POST
+  path: /internal/v1/factor-signals
+request:
+  symbols: { type: array, items: string }
+  start: { type: datetime, required: true }
+  end: { type: datetime, required: true }
+  minimum_support_status: { type: string, default: SOURCE_SUPPORTED }
+response:
+  contract_version: content-factor-signal.v2
+  items:
+    type: array
+    items:
+      knowledge_uid: string
+      symbol: { type: string, description: "如 600519.SH" }
+      subject_name: { type: string, description: "如 贵州茅台" }
+      source_video_id: string
+      as_of: string
+      available_from: { type: datetime, description: "Factor 必须使用 available_from 而不是 event_time，避免内容未来函数（§10）" }
+      knowledge_kind: string
+      sentiment: number
+      truth_status: string
+      support_status: { type: string, example: SOURCE_SUPPORTED }
+      review_status: string
+      evidence_ids: { type: array, items: string }
+      attention_score: number
+      cross_video_consensus: number
+      cross_video_disagreement: number
+rules:
+  - Factor 使用 available_from 而不是 event_time（避免内容未来函数）
+  - 仅推送达到 minimum_support_status 的信号
+dependencies:
+  allowed: [stock_factor HTTP consumer]
+  forbidden: [stock_agent Python import, quant Python import]

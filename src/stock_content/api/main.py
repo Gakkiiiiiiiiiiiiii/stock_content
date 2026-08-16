@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import os
+import uuid
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from stock_content.api.dependencies import build_application
 from stock_content.application.service import ContentApplication
+
+SERVICE_NAME = "stock_content"
+SERVICE_VERSION = "1.0.0"
+CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v2"]
 
 
 class IngestRequest(BaseModel):
@@ -30,26 +36,57 @@ class ContentSignalRequest(BaseModel):
     minimum_support_status: str = "SOURCE_SUPPORTED"
 
 
+def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
+    # §33：Content ingest 支持 Idempotency-Key，避免重试产生重复任务。
+    merged = dict(options or {})
+    if idempotency_key and not merged.get("idempotency_key"):
+        merged["idempotency_key"] = idempotency_key
+    return merged
+
+
 def create_app(service: ContentApplication | None = None) -> FastAPI:
     app = FastAPI(title="stock_content", version="1.0.0")
     application = service or build_application()
 
+    @app.middleware("http")
+    async def trace_headers(request: Request, call_next):
+        # §32：统一 Trace Headers，全链路保持同一 trace_id。
+        trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+        response: Response = await call_next(request)
+        response.headers["x-trace-id"] = trace_id
+        if request.headers.get("x-decision-id"):
+            response.headers["x-decision-id"] = request.headers["x-decision-id"]
+        response.headers["x-caller-service"] = request.headers.get("x-caller-service", "")
+        return response
+
     @app.get("/healthz")
     def health() -> dict:
-        return {"status": "ok", "service": "stock_content", "contract_version": "content.v1"}
+        return {"status": "ok", "service": SERVICE_NAME, "contract_version": "content.v1"}
+
+    @app.get("/health/version")
+    def health_version() -> dict:
+        # §106 Release Version
+        return {
+            "service": SERVICE_NAME,
+            "service_version": SERVICE_VERSION,
+            "git_commit": os.getenv("CONTENT_GIT_COMMIT", "unknown"),
+            "contract_versions": CONTRACT_VERSIONS,
+        }
 
     @app.post("/api/v1/videos/bilibili/ingest")
-    def ingest_bilibili(request: IngestRequest) -> dict:
+    def ingest_bilibili(request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict:
         source_ref = request.url or request.bv_id
         if not source_ref:
             raise HTTPException(status_code=422, detail="url or bv_id is required")
-        return application.enqueue("bilibili", source_ref, request.options)
+        options = _with_idempotency(request.options, idempotency_key)
+        return application.enqueue("bilibili", source_ref, options)
 
     @app.post("/api/v1/videos/xiaoe/ingest")
-    def ingest_xiaoe(request: IngestRequest) -> dict:
+    def ingest_xiaoe(request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict:
         if not request.m3u8_url:
             raise HTTPException(status_code=422, detail="m3u8_url is required")
-        return application.enqueue("xiaoe_hls", request.m3u8_url, request.options)
+        options = _with_idempotency(request.options, idempotency_key)
+        return application.enqueue("xiaoe_hls", request.m3u8_url, options)
 
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: str) -> dict:

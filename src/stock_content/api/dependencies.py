@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from stock_content.adapters.http import HttpExternalFactProvider
+from stock_content.adapters.http import HttpExternalFactProvider, QuantExternalFactProvider
 from stock_content.adapters.media import (
     FasterWhisperRecognizer,
     FfmpegAudioExtractor,
@@ -70,7 +70,13 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
     index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
-    external_provider = HttpExternalFactProvider()
+    # §87：可选 QuantFactClient 仅用于 external fact verification；
+    # 核心 ingestion 不强依赖 Quant。
+    if os.getenv("CONTENT_EXTERNAL_FACT_PROVIDER", "").lower() == "quant":
+        quant_provider = QuantExternalFactProvider()
+        external_provider = quant_provider if quant_provider.configured() else HttpExternalFactProvider()
+    else:
+        external_provider = HttpExternalFactProvider()
     sources = {"bilibili": BilibiliSourceAdapter(), "xiaoe_hls": XiaoeHlsSourceAdapter()}
     pipeline = ContentPipeline(
         [
