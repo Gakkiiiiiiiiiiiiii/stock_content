@@ -22,11 +22,13 @@ from stock_content.adapters.postgres.repositories import (
     PostgresSummaryRepository,
     PostgresVerificationRepository,
     PostgresVideoRepository,
+    SqlSnapshotStore,
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
 from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter
 from stock_content.application.pipeline import ContentPipeline
 from stock_content.application.service import ContentApplication
+from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stages import (
     ASRStage,
     AudioStage,
@@ -105,4 +107,13 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
             IndexStage(index),
         ]
     )
-    return ContentApplication(tasks, videos, knowledge, index, pipeline, chapters, summaries)
+    return ContentApplication(
+        tasks,
+        videos,
+        knowledge,
+        index,
+        pipeline,
+        chapters,
+        summaries,
+        snapshot_service=SnapshotService(SqlSnapshotStore(database.session_factory)),
+    )

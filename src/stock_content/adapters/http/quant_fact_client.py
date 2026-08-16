@@ -85,12 +85,18 @@ class QuantExternalFactProvider:
         self._client = client or QuantFactClient()
 
     def configured(self) -> bool:
-        return os.getenv("CONTENT_EXTERNAL_FACT_PROVIDER", "").lower() == "quant" or bool(os.getenv("QUANT_SERVICE_URL"))
+        return os.getenv("CONTENT_EXTERNAL_FACT_PROVIDER", "").lower() == "quant" or bool(
+            os.getenv("QUANT_SERVICE_URL")
+        )
 
     def verify(self, unit: dict[str, Any]) -> dict[str, Any]:
         attributes = unit.get("attributes") or {}
         symbol = attributes.get("symbol") or unit.get("symbol")
-        event_date = attributes.get("trading_date") or attributes.get("event_date") or str(unit.get("available_from") or "")[:10]
+        event_date = (
+            attributes.get("trading_date")
+            or attributes.get("event_date")
+            or str(unit.get("available_from") or "")[:10]
+        )
         claimed_close = attributes.get("claimed_close")
         claimed_change_pct = attributes.get("claimed_change_pct")
         if not symbol or not event_date:
@@ -106,7 +112,10 @@ class QuantExternalFactProvider:
             return {"status": "NOT_FOUND", "reason": "NO_NUMERIC_CLAIM", "market_fact": snapshot}
         status = "MATCH"
         if claimed_close is not None and snapshot.get("close") is not None:
-            if abs(float(claimed_close) - float(snapshot["close"])) / max(abs(float(snapshot["close"])), 1e-9) * 100 > TOLERANCE_PCT:
+            deviation_pct = (
+                abs(float(claimed_close) - float(snapshot["close"])) / max(abs(float(snapshot["close"])), 1e-9) * 100
+            )
+            if deviation_pct > TOLERANCE_PCT:
                 status = "CONFLICT"
         if claimed_change_pct is not None and snapshot.get("previous_close") and snapshot.get("close"):
             actual_pct = (float(snapshot["close"]) / float(snapshot["previous_close"]) - 1) * 100

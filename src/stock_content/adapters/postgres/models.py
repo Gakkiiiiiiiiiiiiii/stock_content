@@ -330,3 +330,22 @@ class QualityMetricRow(Base):
     value: Mapped[float] = mapped_column(Float)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentSnapshotRow(Base):
+    """详细修改方案 §4 P0-2：ContentSnapshot 权威存储（PostgreSQL 为事实真值）。"""
+
+    __tablename__ = "content_snapshot"
+
+    content_snapshot_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(32), index=True)
+    source_ref: Mapped[str] = mapped_column(Text)
+    source_content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    identity: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    artifact_ids: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    quant_market_snapshot_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    pipeline_version: Mapped[str] = mapped_column(String(40), default="pipeline.v2")
+    schema_version: Mapped[str] = mapped_column(String(40), default="content.snapshot.v1")
+    code_sha: Mapped[str | None] = mapped_column(String(64))
+    config_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

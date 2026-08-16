@@ -10,6 +10,7 @@ from stock_content.adapters.postgres.models import KnowledgeCrossVideoRow, Knowl
 from stock_content.domain.cross_video_corroboration import CrossVideoCorroborationService
 from stock_content.domain.knowledge_enums import support_rank
 from stock_content.domain.models import KnowledgeUnit
+from stock_content.domain.signal_contract import upgrade_signal_v3
 
 
 class PostgresKnowledgeRepository:
@@ -236,10 +237,13 @@ class PostgresKnowledgeRepository:
                         "market_snapshot_id": market_fact.get("data_snapshot_id"),
                         "market_data_version": market_fact.get("data_version"),
                         "market_fact_date": market_fact.get("trading_date"),
+                        "content_snapshot_id": attributes.get("content_snapshot_id"),
+                        "claim_id": attributes.get("claim_id"),
                         "provenance": dict(row.provenance or {}),
                     }
                 )
-            return items
+            # §7：content-factor-signal.v3 —— 正式版本化的金融研究输入。
+            return [upgrade_signal_v3(item) for item in items]
 
 
 def _ticker_code(value: str) -> str | None:

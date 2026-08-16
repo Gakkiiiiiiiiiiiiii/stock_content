@@ -128,9 +128,13 @@ class LifecycleStatus(str, Enum):
     EXTRACTED = "EXTRACTED"
     ACTIVE = "ACTIVE"
     VALIDATED = "VALIDATED"
+    # 详细修改方案 §5 P1-5：新增生命周期状态。
+    STALE = "STALE"
     SUPERSEDED = "SUPERSEDED"
     EXPIRED = "EXPIRED"
     REJECTED = "REJECTED"
+    RETRACTED = "RETRACTED"
+    INVALID = "INVALID"
     RETIRED = "RETIRED"
 
     @classmethod

@@ -1,0 +1,166 @@
+"""FinancialClaim 正式领域模型（详细修改方案 §5 P1-1/P1-3）。
+
+必须区分 Fact / Forecast / Opinion / Inference：
+“明年 GLP-1 API 大概率放量”与“公司 2025 年营收 30 亿元”不能进入同一事实层。
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import date, datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+ClaimType = Literal[
+    "PRICE",
+    "RETURN",
+    "VALUATION",
+    "FINANCIAL_METRIC",
+    "CORPORATE_EVENT",
+    "INDUSTRY_RELATION",
+    "FORECAST",
+    "OPINION",
+]
+
+CLAIM_TYPES: tuple[str, ...] = (
+    "PRICE",
+    "RETURN",
+    "VALUATION",
+    "FINANCIAL_METRIC",
+    "CORPORATE_EVENT",
+    "INDUSTRY_RELATION",
+    "FORECAST",
+    "OPINION",
+)
+
+# claim_type -> 事实层分类。FACT 层允许进入外部核验；其余层禁止冒充事实。
+CLAIM_CATEGORY: dict[str, str] = {
+    "PRICE": "FACT",
+    "RETURN": "FACT",
+    "VALUATION": "FACT",
+    "FINANCIAL_METRIC": "FACT",
+    "CORPORATE_EVENT": "FACT",
+    "INDUSTRY_RELATION": "FACT",
+    "FORECAST": "FORECAST",
+    "OPINION": "OPINION",
+}
+
+# 可绑定 Quant 市场快照进行外部核验的类型（P1-3）。
+QUANT_VERIFIABLE_TYPES: frozenset[str] = frozenset({"PRICE", "RETURN", "VALUATION", "FINANCIAL_METRIC"})
+
+VERIFICATION_STATUSES = (
+    "EXTRACTED",
+    "VERIFICATION_PENDING",
+    "VERIFIED",
+    "CONTRADICTED",
+    "PARTIALLY_VERIFIED",
+    "NOT_VERIFIABLE",
+    "EXPIRED",
+)
+
+
+class FinancialClaim(BaseModel):
+    claim_id: str = ""
+    claim_type: ClaimType
+    fact_category: str = ""
+
+    subject_type: str
+    subject_id: str
+
+    predicate: str
+    value: Any = None
+    unit: str | None = None
+
+    fact_time: datetime | date | None = None
+    published_at: datetime | None = None
+
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    source_confidence: float = Field(ge=0.0, le=1.0)
+    extractor_confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("claim_type")
+    @classmethod
+    def _known_type(cls, value: str) -> str:
+        if value not in CLAIM_TYPES:
+            raise ValueError(f"unknown claim_type: {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _invariants(self) -> "FinancialClaim":
+        # 所有 claim 必须有 evidence（最终验收标准）。
+        if not self.evidence_refs:
+            raise ValueError("claim requires at least one evidence_ref")
+        if not self.fact_category:
+            self.fact_category = CLAIM_CATEGORY[self.claim_type]
+        if not self.claim_id:
+            self.claim_id = claim_id_of(self)
+        return self
+
+    def content_payload(self) -> dict[str, Any]:
+        return {
+            "claim_type": self.claim_type,
+            "subject_type": self.subject_type,
+            "subject_id": self.subject_id,
+            "predicate": self.predicate,
+            "value": self.value,
+            "unit": self.unit,
+            "fact_time": str(self.fact_time) if self.fact_time else None,
+        }
+
+
+def claim_id_of(claim: FinancialClaim) -> str:
+    payload = json.dumps(
+        claim.content_payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return "claim-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def is_quant_verifiable(claim: FinancialClaim) -> bool:
+    return claim.claim_type in QUANT_VERIFIABLE_TYPES
+
+
+class VerificationResult(BaseModel):
+    """P1-3：核验结果必须绑定 Quant Snapshot，禁止只保存 verified=true。"""
+
+    claim_id: str
+    status: Literal[
+        "VERIFIED", "CONTRADICTED", "PARTIALLY_VERIFIED", "NOT_VERIFIABLE", "EXPIRED", "VERIFICATION_PENDING"
+    ]
+
+    market_snapshot_id: str | None = None
+    market_data_version: str | None = None
+    fact_date: date | datetime | None = None
+    adjustment: str | None = None  # 复权口径：NONE / FORWARD / BACKWARD
+    verification_timestamp: datetime | None = None
+    verification_rule_version: str = "verification_rule.v1"
+
+    reference_value: Any = None
+    deviation: float | None = None
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def _binding_invariants(self) -> "VerificationResult":
+        if self.status in {"VERIFIED", "CONTRADICTED", "PARTIALLY_VERIFIED"}:
+            missing = [
+                name
+                for name in ("market_snapshot_id", "market_data_version", "fact_date", "verification_timestamp")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(f"{self.status} requires quant snapshot binding, missing: {missing}")
+        return self
+
+
+__all__ = [
+    "CLAIM_CATEGORY",
+    "CLAIM_TYPES",
+    "ClaimType",
+    "FinancialClaim",
+    "QUANT_VERIFIABLE_TYPES",
+    "VERIFICATION_STATUSES",
+    "VerificationResult",
+    "claim_id_of",
+    "is_quant_verifiable",
+]

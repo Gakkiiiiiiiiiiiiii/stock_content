@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from stock_content.api.dependencies import build_application
 from stock_content.application.service import ContentApplication
+from stock_content.domain.claims import FinancialClaim
 
 SERVICE_NAME = "stock_content"
 SERVICE_VERSION = "1.0.0"
-CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v2"]
+CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3"]
 
 
 class IngestRequest(BaseModel):
@@ -34,6 +36,25 @@ class ContentSignalRequest(BaseModel):
     start: datetime
     end: datetime
     minimum_support_status: str = "SOURCE_SUPPORTED"
+
+
+class ClaimRequest(BaseModel):
+    # §8：FinancialClaim 登记（P1-1）。
+    claim_type: str
+    subject_type: str
+    subject_id: str
+    predicate: str
+    value: Any = None
+    unit: str | None = None
+    fact_time: str | None = None
+    published_at: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    source_confidence: float = 0.5
+    extractor_confidence: float = 0.5
+
+
+class VerificationRetryRequest(BaseModel):
+    claim_id: str | None = None
 
 
 def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
@@ -74,7 +95,9 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         }
 
     @app.post("/api/v1/videos/bilibili/ingest")
-    def ingest_bilibili(request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict:
+    def ingest_bilibili(
+        request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")
+    ) -> dict:
         source_ref = request.url or request.bv_id
         if not source_ref:
             raise HTTPException(status_code=422, detail="url or bv_id is required")
@@ -82,7 +105,9 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         return application.enqueue("bilibili", source_ref, options)
 
     @app.post("/api/v1/videos/xiaoe/ingest")
-    def ingest_xiaoe(request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")) -> dict:
+    def ingest_xiaoe(
+        request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")
+    ) -> dict:
         if not request.m3u8_url:
             raise HTTPException(status_code=422, detail="m3u8_url is required")
         options = _with_idempotency(request.options, idempotency_key)
@@ -153,12 +178,83 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             "filters": request.filters,
         }
 
+    @app.get("/api/v1/videos/{video_id}/snapshots")
+    def list_video_snapshots(video_id: str) -> dict:
+        # §4 P0-2：同一 source 的历次处理产物版本列表。
+        items = application.list_snapshots_for_video(video_id)
+        if items is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        return {"contract_version": "content.v1", "video_id": video_id, "items": items}
+
+    @app.get("/api/v1/content-snapshots/{content_snapshot_id}")
+    def get_content_snapshot(content_snapshot_id: str) -> dict:
+        payload = application.get_content_snapshot(content_snapshot_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="content snapshot not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.post("/api/v1/content-snapshots/{content_snapshot_id}/replay")
+    def replay_content_snapshot(content_snapshot_id: str) -> dict:
+        result = application.replay_content_snapshot(content_snapshot_id)
+        if result.get("error") == "SNAPSHOT_NOT_FOUND":
+            raise HTTPException(status_code=404, detail="content snapshot not found")
+        return {"contract_version": "content.v1", **result}
+
+    @app.post("/api/v1/claims")
+    def register_claim(request: ClaimRequest) -> dict:
+        # §5 P1-1：claim 登记 -> 验证生命周期 + 冲突检测。
+        try:
+            claim = FinancialClaim(
+                claim_type=request.claim_type,
+                subject_type=request.subject_type,
+                subject_id=request.subject_id,
+                predicate=request.predicate,
+                value=request.value,
+                unit=request.unit,
+                fact_time=date.fromisoformat(request.fact_time) if request.fact_time else None,
+                evidence_refs=request.evidence_refs,
+                source_confidence=request.source_confidence,
+                extractor_confidence=request.extractor_confidence,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"contract_version": "content.v1", **application.register_claim(claim)}
+
+    @app.get("/api/v1/claims/{claim_id}")
+    def get_claim(claim_id: str) -> dict:
+        payload = application.get_claim(claim_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="claim not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.get("/api/v1/claims/{claim_id}/verification")
+    def get_claim_verification(claim_id: str) -> dict:
+        payload = application.get_claim_verification(claim_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="claim verification not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.post("/api/v1/verification/retry")
+    def retry_verification(request: VerificationRetryRequest) -> dict:
+        result = application.retry_verification(request.claim_id)
+        if result.get("error") == "CLAIM_NOT_FOUND":
+            raise HTTPException(status_code=404, detail="claim not found")
+        return {"contract_version": "content.v1", **result}
+
+    @app.get("/api/v1/conflicts")
+    def list_conflicts(status: str | None = None) -> dict:
+        try:
+            items = application.list_conflicts(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"contract_version": "content.v1", "items": items}
+
     @app.post("/internal/v1/factor-signals")
     def factor_signals(request: ContentSignalRequest) -> dict:
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
-        return {"contract_version": "content-factor-signal.v2", "items": items}
+        return {"contract_version": "content-factor-signal.v3", "items": items}
 
     return app
 

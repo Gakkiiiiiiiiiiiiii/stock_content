@@ -1,21 +1,108 @@
+# stock_content CI（详细修改方案 §11）
+#
+# PR      -> lint + unit + architecture + contract + small golden + docker-build
+# Nightly -> full golden + quant integration + qdrant rebuild test
 name: test
 
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "15 19 * * *" # Nightly（UTC）
+  workflow_dispatch:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
+        with: {python-version: "3.11", cache: pip}
       - run: pip install -e ".[test]"
-      - run: ruff check src tests
-      - run: pytest --cov=stock_content --cov-report=term-missing
+      - run: ruff check src tests scripts
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: Unit tests（domain/application，不含 API 纵切与 pipeline 集成）
+        run: >
+          pytest tests/test_claim_type_system.py tests/test_verification_lifecycle.py
+          tests/test_knowledge_conflict.py tests/test_knowledge_lifecycle.py
+          tests/test_content_factor_signal_v3.py tests/test_content_snapshot_identity.py
+          tests/test_checkpoint_resume.py tests/test_vector_rebuild.py
+          tests/test_financial_event_extractor.py tests/test_support_status_contract.py
+          -q
+
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - run: pytest tests/test_architecture.py -q
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: Provider/Head contract tests
+        run: >
+          pytest tests/test_artifact_contracts.py tests/test_content_factor_signal_v3.py
+          tests/test_support_status_contract.py -q
+
+  golden-content:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: Small golden（PR）—— 固定 fixture 的确定性 pipeline
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        run: pytest tests/test_pipeline_integration.py tests/test_pipeline_replay.py -q
+      - name: Full golden（Nightly）—— 全量 pipeline + 快照身份 + 断点恢复
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: >
+          pytest tests/test_pipeline_integration.py tests/test_pipeline_replay.py
+          tests/test_content_snapshot_identity.py tests/test_checkpoint_resume.py
+          tests/test_quant_snapshot_lineage.py -q
+
+  integration:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start stack（Postgres + Qdrant + API + worker）
+        run: docker compose up -d --build
+      - name: Wait for API readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8100/healthz > /dev/null; then exit 0; fi
+            sleep 2
+          done
+          docker compose logs --no-color
+          exit 1
+      - name: Quant snapshot lineage E2E
+        run: pip install -e ".[test]" && pytest tests/test_quant_snapshot_lineage.py -q
+      - name: Qdrant rebuild test
+        run: python scripts/rebuild_vector_index.py --from-postgres --collection knowledge_v3 --dry-run --database-url "postgresql+psycopg://postgres:postgres@localhost:5432/stock_content"
+      - name: Collect logs
+        if: always()
+        run: docker compose logs --no-color > compose-logs.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: content-compose-logs, path: compose-logs.txt}
+      - name: Shutdown
+        if: always()
+        run: docker compose down -v
 
   docker-build:
     runs-on: ubuntu-latest
