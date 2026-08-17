@@ -3,6 +3,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
 COPY src ./src
+COPY config ./config
 RUN pip install --no-cache-dir ".[postgres,search,media,multimodal]"
 EXPOSE 8100
 CMD ["python", "-m", "uvicorn", "stock_content.api.main:app", "--host", "0.0.0.0", "--port", "8100"]
