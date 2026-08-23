@@ -1,0 +1,18 @@
+# Phase 1 native multi-agent baseline for stock_content.
+# Sol owns planning, validation, review, and final acceptance.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+review_model = "gpt-5.6-sol"
+
+# The root agent needs to run tests and inspect diffs. The supervisor prompt
+# prohibits it from editing production code; luna_implementer owns those edits.
+sandbox_mode = "workspace-write"
+
+[agents]
+enabled = true
+
+# Phase 1 is intentionally low-concurrency: one writer, with read/test work
+# allowed to run independently when it has a disjoint scope.
+max_concurrent_threads_per_session = 3
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "high"
