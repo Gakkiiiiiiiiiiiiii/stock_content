@@ -14,7 +14,7 @@ from stock_content.domain.claims import FinancialClaim
 
 SERVICE_NAME = "stock_content"
 SERVICE_VERSION = "1.0.0"
-CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3"]
+CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3", "content-factor-signal.v4"]
 
 
 class IngestRequest(BaseModel):
@@ -57,6 +57,12 @@ class VerificationRetryRequest(BaseModel):
     claim_id: str | None = None
 
 
+class ReplayRequest(BaseModel):
+    mode: str = "VERIFY_LINEAGE"
+    pipeline_version: str | None = None
+    overrides: dict[str, Any] = Field(default_factory=dict)
+
+
 def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
     # §33：Content ingest 支持 Idempotency-Key，避免重试产生重复任务。
     merged = dict(options or {})
@@ -73,10 +79,13 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
     async def trace_headers(request: Request, call_next):
         # §32：统一 Trace Headers，全链路保持同一 trace_id。
         trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+        decision_id = request.headers.get("x-decision-id") or None
+        request.state.trace_id = trace_id
+        request.state.decision_id = decision_id
         response: Response = await call_next(request)
         response.headers["x-trace-id"] = trace_id
-        if request.headers.get("x-decision-id"):
-            response.headers["x-decision-id"] = request.headers["x-decision-id"]
+        if decision_id:
+            response.headers["x-decision-id"] = decision_id
         response.headers["x-caller-service"] = request.headers.get("x-caller-service", "")
         return response
 
@@ -96,21 +105,31 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
 
     @app.post("/api/v1/videos/bilibili/ingest")
     def ingest_bilibili(
-        request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")
+        request: IngestRequest,
+        http_request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict:
         source_ref = request.url or request.bv_id
         if not source_ref:
             raise HTTPException(status_code=422, detail="url or bv_id is required")
         options = _with_idempotency(request.options, idempotency_key)
+        options["trace_id"] = http_request.state.trace_id
+        if http_request.state.decision_id:
+            options["decision_id"] = http_request.state.decision_id
         return application.enqueue("bilibili", source_ref, options)
 
     @app.post("/api/v1/videos/xiaoe/ingest")
     def ingest_xiaoe(
-        request: IngestRequest, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")
+        request: IngestRequest,
+        http_request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     ) -> dict:
         if not request.m3u8_url:
             raise HTTPException(status_code=422, detail="m3u8_url is required")
         options = _with_idempotency(request.options, idempotency_key)
+        options["trace_id"] = http_request.state.trace_id
+        if http_request.state.decision_id:
+            options["decision_id"] = http_request.state.decision_id
         return application.enqueue("xiaoe_hls", request.m3u8_url, options)
 
     @app.get("/api/v1/tasks/{task_id}")
@@ -193,15 +212,66 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="content snapshot not found")
         return {"contract_version": "content.v1", "data": payload}
 
-    @app.post("/api/v1/content-snapshots/{content_snapshot_id}/replay")
-    def replay_content_snapshot(content_snapshot_id: str) -> dict:
-        result = application.replay_content_snapshot(content_snapshot_id)
-        if result.get("error") == "SNAPSHOT_NOT_FOUND":
+    @app.get("/api/v1/content-snapshots/{content_snapshot_id}/lineage")
+    def get_content_snapshot_lineage(content_snapshot_id: str) -> dict:
+        payload = application.get_snapshot_lineage(content_snapshot_id)
+        if payload is None:
             raise HTTPException(status_code=404, detail="content snapshot not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.post("/api/v1/content-snapshots/{content_snapshot_id}/replay")
+    def replay_content_snapshot(content_snapshot_id: str, request: ReplayRequest | None = None) -> dict:
+        result = application.replay_content_snapshot(
+            content_snapshot_id,
+            mode=request.mode if request else None,
+            pipeline_version=request.pipeline_version if request else None,
+            overrides=request.overrides if request else None,
+        )
+        error = result.get("error")
+        if error:
+            status = {
+                "SNAPSHOT_NOT_FOUND": 404,
+                "INVALID_REPLAY_MODE": 422,
+                "INVALID_REPLAY_REQUEST": 422,
+                "REPLAY_ARTIFACT_MISSING": 409,
+                "REPLAY_ARTIFACT_HASH_MISMATCH": 409,
+                "REPLAY_LINEAGE_CYCLE": 409,
+                "REPLAY_LINEAGE_REFERENCE_MISSING": 409,
+                "REPLAY_LINEAGE_REFERENCE_INVALID": 409,
+                "REPLAY_IDENTITY_MISMATCH": 409,
+                "REPLAY_NONDETERMINISTIC": 409,
+                "REPLAY_INPUT_UNAVAILABLE": 424,
+                "REPLAY_UNAVAILABLE": 503,
+            }.get(str(error), 500)
+            raise HTTPException(status_code=status, detail=result)
         return {"contract_version": "content.v1", **result}
 
+    @app.get("/api/v1/content-snapshots/{content_snapshot_id}/signals")
+    def get_snapshot_signals(content_snapshot_id: str, claim_id: str | None = None) -> dict:
+        if application.get_content_snapshot(content_snapshot_id) is None:
+            raise HTTPException(status_code=404, detail="content snapshot not found")
+        return {
+            "contract_version": "content-factor-signal.v4",
+            "content_snapshot_id": content_snapshot_id,
+            "items": application.get_snapshot_signals(content_snapshot_id, claim_id),
+        }
+
+    @app.get("/api/v1/artifacts/{artifact_id}")
+    def get_artifact(artifact_id: str) -> dict:
+        payload = application.get_artifact(artifact_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        return {"contract_version": "content.v1", "data": payload}
+
+    @app.get("/api/v1/artifacts/{artifact_id}/lineage")
+    def get_artifact_lineage(artifact_id: str) -> dict:
+        payload = application.get_artifact_lineage(artifact_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        return {"contract_version": "content.v1", "data": payload}
+
     @app.post("/api/v1/claims")
-    def register_claim(request: ClaimRequest) -> dict:
+    def register_claim(request: ClaimRequest, http_request: Request) -> dict:
         # §5 P1-1：claim 登记 -> 验证生命周期 + 冲突检测。
         try:
             claim = FinancialClaim(
@@ -218,7 +288,10 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             )
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"contract_version": "content.v1", **application.register_claim(claim)}
+        return {
+            "contract_version": "content.v1",
+            **application.register_claim(claim, trace_id=getattr(http_request.state, "trace_id", None)),
+        }
 
     @app.get("/api/v1/claims/{claim_id}")
     def get_claim(claim_id: str) -> dict:
@@ -227,12 +300,33 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="claim not found")
         return {"contract_version": "content.v1", "data": payload}
 
+    @app.get("/api/v1/claims/{claim_id}/evidence")
+    def get_claim_evidence(claim_id: str) -> dict:
+        payload = application.get_claim_evidence(claim_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="claim not found")
+        return {"contract_version": "content.v1", "claim_id": claim_id, "items": payload}
+
+    @app.get("/api/v1/claims/{claim_id}/verifications")
+    def get_claim_verifications(claim_id: str) -> dict:
+        payload = application.get_claim_verifications(claim_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="claim not found")
+        return {"contract_version": "content.v1", "claim_id": claim_id, "items": payload}
+
     @app.get("/api/v1/claims/{claim_id}/verification")
     def get_claim_verification(claim_id: str) -> dict:
         payload = application.get_claim_verification(claim_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="claim verification not found")
         return {"contract_version": "content.v1", "data": payload}
+
+    @app.get("/api/v1/signals/{signal_id}/lineage")
+    def get_signal_lineage(signal_id: str) -> dict:
+        payload = application.get_signal_lineage(signal_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="signal not found")
+        return {"contract_version": "content-factor-signal.v4", "data": payload}
 
     @app.post("/api/v1/verification/retry")
     def retry_verification(request: VerificationRetryRequest) -> dict:
@@ -255,6 +349,15 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
         return {"contract_version": "content-factor-signal.v3", "items": items}
+
+    @app.post("/internal/v1/factor-signals/v4")
+    def factor_signals_v4(request: ContentSignalRequest) -> dict:
+        start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
+        end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
+        return {
+            "contract_version": "content-factor-signal.v4",
+            "items": application.factor_signals_v4(request.symbols, start, end),
+        }
 
     return app
 

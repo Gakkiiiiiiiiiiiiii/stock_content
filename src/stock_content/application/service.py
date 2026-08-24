@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -12,8 +14,9 @@ from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stages import cleanup_work_directory
 from stock_content.application.verification_service import VerificationService, run_verification_pass
+from stock_content.domain.artifacts import serialize_artifact
 from stock_content.domain.claims import FinancialClaim
-from stock_content.domain.models import ContentTask
+from stock_content.domain.models import ContentTask, TranscriptSegment
 from stock_content.ports.repositories import (
     ChapterRepository,
     ContentTaskRepository,
@@ -42,6 +45,10 @@ class ContentApplication:
         chapter_repository: ChapterRepository | None = None,
         summary_repository: SummaryRepository | None = None,
         snapshot_service: SnapshotService | None = None,
+        artifact_repository: Any | None = None,
+        claim_repository: Any | None = None,
+        signal_outbox=None,
+        verification_job_repository: Any | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
@@ -51,7 +58,43 @@ class ContentApplication:
         self._chapters = chapter_repository
         self._summaries = summary_repository
         self._snapshots = snapshot_service or SnapshotService()
-        self._replay = ReplayService(self._snapshots)
+        self._artifact_repository = artifact_repository or next(
+            (
+                getattr(stage, "_artifact_repository", None)
+                for stage in getattr(pipeline, "_stages", [])
+                if getattr(stage, "_artifact_repository", None) is not None
+            ),
+            None,
+        )
+        self._claim_repository = claim_repository or next(
+            (
+                getattr(stage, "_claims", None)
+                for stage in getattr(pipeline, "_stages", [])
+                if getattr(stage, "_claims", None) is not None
+            ),
+            None,
+        )
+        self._signal_outbox = signal_outbox
+        self._verification_jobs = verification_job_repository
+        if self._verification_jobs is None and self._claim_repository is not None:
+            sessions = getattr(self._claim_repository, "_sessions", None)
+            if sessions is not None:
+                # Keep the application usable for callers that provide the
+                # canonical SQL claim repository but do not explicitly wire
+                # its sibling durable verification repository.
+                from stock_content.adapters.postgres.repositories.verification_job_repository import (
+                    PostgresVerificationJobRepository,
+                )
+
+                self._verification_jobs = PostgresVerificationJobRepository(sessions)
+        self._replay = ReplayService(
+            self._snapshots,
+            artifact_repository=self._artifact_repository,
+            signal_outbox=self._signal_outbox,
+            task_repository=self._tasks,
+            pipeline=self._pipeline,
+            claim_repository=self._claim_repository,
+        )
         # §5 P1-2/P1-4：Claim 验证生命周期与知识冲突（内存注册表，生产由 worker+DB 驱动）。
         self._verification_lifecycle = VerificationService()
         self._conflict_service = ConflictService()
@@ -97,22 +140,29 @@ class ContentApplication:
             task_id=task.task_id,
             source={"type": task.source_type, "ref": task.source_ref},
             options=task.options,
+            trace={
+                key: str(getattr(task, key, None) or task.options.get(key) or "")
+                for key in ("trace_id", "decision_id")
+                if getattr(task, key, None) or task.options.get(key)
+            },
         )
         try:
+            resume = self._restore_resume_context(context, task)
             result = self._pipeline.process(
                 context,
                 lambda stage, progress: self._tasks.update_progress(task.task_id, stage, progress),
                 lambda stage, checkpoint, progress: self._tasks.checkpoint(task.task_id, stage, checkpoint, progress),
+                resume=resume,
             )
             payload = {
-                "video_id": result.data["video"].video_id,
-                "chapter_count": len(result.data["chapters"]),
-                "knowledge_count": len(result.data["knowledge"]),
-                "summary": result.data["summary"].core_summary,
+                "video_id": result.state.video.video_id,
+                "chapter_count": len(result.state.chapters),
+                "knowledge_count": len(result.state.knowledge),
+                "summary": result.state.summary.core_summary,
             }
             # P0 C-03/C-04：ContentSnapshot 由 SnapshotRecordingStage 在 persist 前基于
             # pipeline 已生成的 typed Artifact 记录；失败时 pipeline 异常 → task FAILED。
-            snapshot_id = result.data.get("content_snapshot_id")
+            snapshot_id = result.state.content_snapshot_id
             if not snapshot_id:
                 self._tasks.fail(task.task_id, "content_snapshot", "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot")
                 return {
@@ -135,12 +185,361 @@ class ContentApplication:
         finally:
             cleanup_work_directory(context)
 
+    def _restore_resume_context(self, context: PipelineContext, task: ContentTask) -> bool:
+        """Restore only the durable, faithful prefix of a previous attempt."""
+        repository = self._artifact_repository
+        if repository is None or not hasattr(repository, "load_checkpoints"):
+            return False
+        stage_versions = {
+            str(stage.name): str(getattr(stage, "stage_version", "1.0.0"))
+            for stage in getattr(self._pipeline, "_stages", [])
+        }
+        records, persisted = repository.load_checkpoints(task.task_id, stage_versions)
+        if not records:
+            return False
+        context.restored_artifacts = dict(persisted)
+        restorable = {
+            "resolve",
+            "download",
+            "frame",
+            "audio",
+            "asr",
+            "diarization",
+            "transcript_postprocess",
+            "ocr",
+            "vision",
+        }
+        prefix: list[Any] = []
+        for record in records:
+            if record.status != "SUCCEEDED" or record.stage not in restorable:
+                break
+            prefix.append(record)
+        context.checkpoints = prefix
+        # Rebuild only the active slots from checkpoint outputs, in execution
+        # order.  ``persisted`` is intentionally a complete, unordered map:
+        # it also contains superseded immutable versions needed by resume
+        # hash validation, but must not decide which transcript/visual item is
+        # active.
+        context.artifacts = type(context.artifacts)()
+        for record in prefix:
+            for artifact_id in record.output_artifact_ids:
+                artifact = persisted.get(artifact_id)
+                if artifact is None:
+                    raise RuntimeError(
+                        f"ARTIFACT_INTEGRITY_ERROR: checkpoint artifact missing {artifact_id}"
+                    )
+                slot = artifact.artifact_type
+                if slot in {"frame", "ocr", "vision"}:
+                    context.artifacts.add({"frame": "frames", "ocr": "ocr", "vision": "vision"}[slot], artifact)
+                elif slot in {
+                    "source", "media", "transcript", "evidence", "claims", "verification", "knowledge", "summary"
+                }:
+                    context.artifacts.set(slot, artifact)
+        self._restore_typed_prefix(context, persisted)
+        # The presence of durable checkpoint rows is itself meaningful.  Do
+        # not silently turn a partially recorded attempt into a clean
+        # download: the pipeline will intentionally rerun only the first
+        # unrestorable boundary when no successful prefix exists.
+        if not prefix:
+            context.checkpoints = []
+        source = context.artifacts.source
+        fixture = self._fixture_options(task.options)
+        media_stages = {"download", "frame", "audio", "asr", "diarization", "transcript_postprocess", "ocr", "vision"}
+        has_media_checkpoint = any(
+            record.status == "SUCCEEDED" and record.stage in media_stages
+            for record in records
+        )
+        if not fixture and has_media_checkpoint:
+            if source is None or not source.raw_storage_uri:
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: durable raw media unavailable for resume")
+            raw_uri = str(source.raw_storage_uri)
+            if raw_uri.startswith("file://"):
+                raw_uri = raw_uri[7:]
+            # A resumable real-media attempt must have a local durable handle;
+            # a source URL is not evidence that the bytes are still available.
+            if not Path(raw_uri).is_file():
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: durable raw media unavailable for resume")
+            expected_hash = str(source.raw_content_hash or source.source_content_hash or "")
+            digest = hashlib.sha256()
+            length = 0
+            with Path(raw_uri).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    length += len(chunk)
+            if expected_hash and digest.hexdigest() != expected_hash:
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: durable raw media hash mismatch")
+            if source.raw_content_length is not None and length != source.raw_content_length:
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: durable raw media length mismatch")
+            # Media-derived outputs use task-scoped ephemeral handles.  A new
+            # worker must recreate that workspace before any extractor runs;
+            # only the raw bytes and immutable artifacts are durable.
+            if context.runtime.work_dir is None:
+                context.runtime.work_dir = Path(
+                    tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-")
+                )
+            context.runtime.video_path = Path(raw_uri)
+            # ``audio`` checkpoints historically contain no filesystem path;
+            # when ASR is the first failed stage, restore the ephemeral audio
+            # handle from the durable video without rerunning the audio stage.
+            if any(record.stage == "audio" and record.status == "SUCCEEDED" for record in records):
+                audio_runner = next(
+                    (
+                        stage
+                        for stage in getattr(self._pipeline, "_stages", [])
+                        if getattr(stage, "name", "") == "audio"
+                    ),
+                    None,
+                )
+                extractor = getattr(getattr(audio_runner, "_stage", audio_runner), "_extractor", None)
+                if extractor is not None:
+                    context.runtime.audio_path = extractor.extract(context.runtime.video_path, context.runtime.work_dir)
+        return bool(records)
+
+    @staticmethod
+    def _fixture_options(options: dict[str, Any]) -> bool:
+        return bool(options.get("offline_fixture") or "transcript" in options or "segments" in options)
+
+    def _restore_typed_prefix(self, context: PipelineContext, persisted: dict[str, Any]) -> None:
+        source = context.artifacts.source
+        transcript = context.artifacts.transcript
+        if source:
+            context.state.metadata = dict(source.source_metadata or {})
+        if transcript:
+            context.state.segments = [
+                TranscriptSegment(
+                    segment_index=item.segment_index,
+                    start_seconds=item.start_seconds,
+                    end_seconds=item.end_seconds,
+                    text=item.text,
+                    confidence=item.confidence,
+                    speaker_id=item.speaker_id or "UNKNOWN",
+                )
+                for item in transcript.segments
+            ]
+            context.state.transcript = " ".join(item.text for item in context.state.segments)
+        context.state.frames = [
+            {
+                "frame_id": item.frame_id,
+                "timestamp_ms": item.timestamp_ms,
+                "image_hash": item.image_hash,
+                "storage_ref": item.storage_ref,
+                "image_path": item.storage_ref,
+            }
+            for item in context.artifacts.frames
+        ]
+        context.state.ocr_evidence = [
+            {
+                **dict(item.blocks[0] if item.blocks else {}),
+                "frame_id": next(
+                    (
+                        frame.frame_id
+                        for frame in context.artifacts.frames
+                        if frame.artifact_id == item.frame_artifact_id
+                    ),
+                    "",
+                ),
+                "evidence_text": item.text,
+            }
+            for item in context.artifacts.ocr
+        ]
+        context.state.frame_insights = [dict(item.payload) for item in context.artifacts.vision]
+        context.state.evidence = list(getattr(context.artifacts.evidence, "evidences", ()) or ())
+        if context.artifacts.claims and self._claim_repository is not None:
+            context.state.claims = [
+                claim
+                for claim_id in context.artifacts.claims.claims
+                if (claim := self._claim_repository.get(str(claim_id))) is not None
+            ]
+
     def get_content_snapshot(self, content_snapshot_id: str) -> dict | None:
         snapshot = self._snapshots.get(content_snapshot_id)
         return snapshot.to_dict() if snapshot else None
 
-    def replay_content_snapshot(self, content_snapshot_id: str) -> dict:
-        return self._replay.replay(content_snapshot_id)
+    def get_artifact(self, artifact_id: str) -> dict | None:
+        artifact = self._artifact_repository.get(artifact_id) if self._artifact_repository else None
+        return serialize_artifact(artifact) if artifact else None
+
+    def get_artifact_lineage(self, artifact_id: str) -> dict | None:
+        if self._artifact_repository is None:
+            return None
+        payload = self._artifact_repository.lineage(artifact_id)
+        return payload or None
+
+    def get_claim_evidence(self, claim_id: str) -> list[str] | None:
+        if self._claim_repository is None or self._claim_repository.get(claim_id) is None:
+            return None
+        return list(self._claim_repository.evidence(claim_id))
+
+    def get_claim_verifications(self, claim_id: str) -> list[dict] | None:
+        if self._claim_repository is None or self._claim_repository.get(claim_id) is None:
+            return None
+        return list(self._claim_repository.verifications(claim_id))
+
+    def get_snapshot_lineage(self, content_snapshot_id: str) -> dict | None:
+        snapshot = self._snapshots.get(content_snapshot_id)
+        if snapshot is None:
+            return None
+
+        lineage_errors: list[str] = []
+
+        def artifact_tree(artifact_id: str, visiting: tuple[str, ...] = ()) -> dict | None:
+            """Build one complete artifact DAG, recording every integrity error."""
+            if self._artifact_repository is None:
+                lineage_errors.append("artifact lineage repository unavailable")
+                return None
+            if artifact_id in visiting:
+                cycle = " -> ".join((*visiting, artifact_id))
+                lineage_errors.append(f"artifact lineage cycle detected: {cycle}")
+                return None
+            artifact = self._artifact_repository.get(artifact_id)
+            if artifact is None:
+                parent = visiting[-1] if visiting else content_snapshot_id
+                lineage_errors.append(f"artifact lineage missing: {parent} -> {artifact_id}")
+                return None
+
+            current_path = (*visiting, artifact_id)
+            parent_ids = sorted({str(item) for item in (artifact.parent_artifact_ids or ())})
+            parents = []
+            for parent_id in parent_ids:
+                parent_tree = artifact_tree(parent_id, current_path)
+                if parent_tree is not None:
+                    parents.append(parent_tree)
+            if len(parents) != len(parent_ids):
+                return None
+
+            payload = serialize_artifact(artifact)
+            payload["parents"] = parents
+            return payload
+
+        artifact_items = []
+        artifact_refs = sorted((snapshot.artifact_ids or {}).items())
+        for slot, artifact_id in artifact_refs:
+            artifact = artifact_tree(str(artifact_id))
+            if artifact is not None:
+                artifact_items.append({"slot": slot, "artifact": artifact})
+
+        def snapshot_tree(item: Any, visiting: tuple[str, ...] = ()) -> dict[str, Any] | None:
+            """Build the complete snapshot ancestry without exposing partial trees.
+
+            A refresh can carry both a logical parent and the snapshot it
+            supersedes.  Treat both fields as graph edges, preserving their
+            stable field order while de-duplicating an edge when both fields
+            point to the same snapshot.  ``visiting`` is path-local so a
+            shared ancestor remains a valid DAG edge, while cycles are still
+            detected deterministically.
+            """
+            identifier = str(item.content_snapshot_id)
+            if identifier in visiting:
+                cycle = " -> ".join((*visiting, identifier))
+                lineage_errors.append(f"snapshot lineage cycle detected: {cycle}")
+                return None
+
+            current_path = (*visiting, identifier)
+            parent_ids: list[str] = []
+            for raw_parent_id in (item.parent_snapshot_id, item.supersedes_snapshot_id):
+                if not raw_parent_id:
+                    continue
+                parent_id = str(raw_parent_id)
+                if parent_id not in parent_ids:
+                    parent_ids.append(parent_id)
+
+            parents: list[dict[str, Any]] = []
+            for parent_id in parent_ids:
+                parent = self._snapshots.get(parent_id)
+                if parent is None:
+                    lineage_errors.append(
+                        f"snapshot lineage parent missing: {identifier} -> {parent_id}"
+                    )
+                    continue
+                parent_tree = snapshot_tree(parent, current_path)
+                if parent_tree is not None:
+                    parents.append(parent_tree)
+
+            if len(parents) != len(parent_ids):
+                return None
+            return {
+                "content_snapshot_id": identifier,
+                "snapshot_kind": item.snapshot_kind,
+                "parent_snapshot_id": item.parent_snapshot_id,
+                "supersedes_snapshot_id": item.supersedes_snapshot_id,
+                "parents": parents,
+            }
+
+        snapshot_tree_payload = snapshot_tree(snapshot)
+        lineage_complete = not lineage_errors
+        return {
+            "snapshot": snapshot.to_dict(),
+            "artifacts": artifact_items if lineage_complete else [],
+            "snapshot_lineage": snapshot_tree_payload if lineage_complete else None,
+            "lineage_complete": lineage_complete,
+            "lineage_errors": sorted(set(lineage_errors)),
+        }
+
+    def get_signal_lineage(self, signal_id: str) -> dict | None:
+        if self._signal_outbox is None or not hasattr(self._signal_outbox, "get_by_signal_id"):
+            return None
+        row = self._signal_outbox.get_by_signal_id(signal_id)
+        if row is None:
+            return None
+        payload = dict(row.payload or {})
+        snapshot_id = str(row.content_snapshot_id or payload.get("content_snapshot_id") or "")
+        claim_id = str(row.claim_id or payload.get("claim_id") or "")
+        snapshot_lineage = self.get_snapshot_lineage(snapshot_id) if snapshot_id else None
+        claim = self._claim_repository.get(claim_id) if self._claim_repository and claim_id else None
+        evidence = self.get_claim_evidence(claim_id) if claim_id else None
+        artifact_items = list((snapshot_lineage or {}).get("artifacts") or [])
+        artifacts_by_slot = {str(item.get("slot")): item.get("artifact") for item in artifact_items}
+        return {
+            "signal": payload,
+            "snapshot": (snapshot_lineage or {}).get("snapshot"),
+            "claim": claim.model_dump(mode="json") if claim else None,
+            "evidence_ids": evidence,
+            "evidence": artifacts_by_slot.get("evidence"),
+            "source": artifacts_by_slot.get("source"),
+            "artifacts": artifact_items,
+        }
+
+    def get_snapshot_signals(self, content_snapshot_id: str, claim_id: str | None = None) -> list[dict]:
+        if self._signal_outbox is None:
+            return []
+        return [
+            dict(row.payload or {})
+            for row in self._signal_outbox.list_for_snapshot(content_snapshot_id, claim_id=claim_id)
+        ]
+
+    def factor_signals_v4(self, symbols: list[str], start: datetime, end: datetime) -> list[dict]:
+        if self._signal_outbox is None:
+            return []
+        wanted = set(symbols)
+        items = []
+        for row in self._signal_outbox.list_all(include_published=True):
+            payload = dict(row.payload or {})
+            if wanted and payload.get("symbol") not in wanted:
+                continue
+            available = payload.get("available_from") or payload.get("published_at")
+            try:
+                when = datetime.fromisoformat(str(available).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=start.tzinfo)
+            if start <= when <= end:
+                items.append(payload)
+        return items
+
+    def replay_content_snapshot(
+        self,
+        content_snapshot_id: str,
+        mode: str | None = None,
+        pipeline_version: str | None = None,
+        overrides: dict[str, Any] | None = None,
+    ) -> dict:
+        return self._replay.replay(
+            content_snapshot_id,
+            mode=mode,
+            pipeline_version=pipeline_version,
+            overrides=overrides,
+        )
 
     def list_snapshots_for_video(self, video_id: str) -> list[dict] | None:
         video = self._videos.get(video_id)
@@ -151,38 +550,71 @@ class ContentApplication:
 
     # ---- FinancialClaim / Verification / Conflict（§5 P1）----
 
-    def register_claim(self, claim: FinancialClaim) -> dict:
+    def register_claim(self, claim: FinancialClaim, trace_id: str | None = None) -> dict:
         """登记 claim：进入验证生命周期 + 冲突检测（不阻塞主链路）。"""
+        if self._claim_repository is not None:
+            self._claim_repository.save(claim)
+            # Persist the verification state after the claim commit.  The
+            # repository enforces (claim_id, provider) idempotency, so HTTP
+            # retries cannot create duplicate jobs or results.
+            if self._verification_jobs is not None:
+                self._verification_jobs.enqueue([claim], provider="quant", trace_id=trace_id)
         self._claims_registry[claim.claim_id] = claim
         verified_ids = self._verification_lifecycle.verified_claim_ids()
         item = self._verification_lifecycle.submit(claim)
         conflicts = self._conflict_service.register_claims(
             list(self._claims_registry.values()), verified_claim_ids=verified_ids
         )
+        persistent = self._persistent_verification(claim.claim_id)
         return {
             "claim_id": claim.claim_id,
             "fact_category": claim.fact_category,
-            "verification_status": item.status,
+            "verification_status": (persistent or {}).get("status", item.status),
             "conflicts": [conflict.to_dict() for conflict in conflicts],
         }
 
     def get_claim(self, claim_id: str) -> dict | None:
-        claim = self._claims_registry.get(claim_id)
+        claim = self._claim_repository.get(claim_id) if self._claim_repository is not None else None
+        claim = claim or self._claims_registry.get(claim_id)
         if claim is None:
             return None
+        persistent = self._persistent_verification(claim_id)
         item = self._verification_lifecycle.get(claim_id)
         return {
             **claim.model_dump(mode="json"),
-            "verification_status": item.status if item else "EXTRACTED",
+            "verification_status": (persistent or {}).get("status", item.status if item else "EXTRACTED"),
+            **({"verification": persistent} if persistent is not None else {}),
         }
 
     def get_claim_verification(self, claim_id: str) -> dict | None:
+        persistent = self._persistent_verification(claim_id)
+        if persistent is not None:
+            return persistent
         item = self._verification_lifecycle.get(claim_id)
         return item.to_dict() if item else None
 
     def retry_verification(self, claim_id: str | None = None) -> dict:
         """POST /api/v1/verification/retry：手动触发一轮到期核验。"""
         if claim_id:
+            if self._claim_repository is not None and self._claim_repository.get(claim_id) is None:
+                return {"error": "CLAIM_NOT_FOUND", "claim_id": claim_id}
+            if self._verification_jobs is not None:
+                job_info = self._persistent_job(claim_id)
+                if job_info is not None:
+                    job_id = str(job_info["job_id"])
+                    status = str(job_info.get("status") or "")
+                    # Never revoke another worker's active lease through a
+                    # manual retry request.  PENDING already is the desired
+                    # durable retry state; terminal/DLQ rows may be reopened.
+                    if status not in {"PENDING", "LEASED"}:
+                        self._verification_jobs.requeue(job_id)
+                    return {
+                        "processed": 1,
+                        "pending": 1,
+                        "dlq": [],
+                        "statuses": {claim_id: "VERIFICATION_PENDING"},
+                        "job_id": job_id,
+                    }
             item = self._verification_lifecycle.get(claim_id)
             if item is None:
                 return {"error": "CLAIM_NOT_FOUND", "claim_id": claim_id}
@@ -195,6 +627,33 @@ class ContentApplication:
             "dlq": self._verification_lifecycle.dlq(),
             "statuses": {entry.claim.claim_id: entry.status for entry in processed},
         }
+
+    def _persistent_verification(self, claim_id: str) -> dict | None:
+        """Read durable verification state before consulting process memory."""
+        if self._claim_repository is None or not hasattr(self._claim_repository, "verifications"):
+            return None
+        rows = list(self._claim_repository.verifications(claim_id))
+        if not rows:
+            return None
+        # A result is authoritative over the still-present job row.  The
+        # repository returns deterministic rows but we explicitly prefer the
+        # immutable result to make this rule clear at the API boundary.
+        result_rows = [row for row in rows if row.get("verification_id")]
+        if result_rows:
+            return result_rows[-1]
+        job = rows[-1]
+        status = str(job.get("status") or "VERIFICATION_PENDING")
+        if status in {"PENDING", "LEASED"}:
+            status = "VERIFICATION_PENDING"
+        return {**job, "status": status}
+
+    def _persistent_job(self, claim_id: str) -> dict | None:
+        if self._claim_repository is None or not hasattr(self._claim_repository, "verifications"):
+            return None
+        for row in self._claim_repository.verifications(claim_id):
+            if row.get("job_id"):
+                return row
+        return None
 
     def list_conflicts(self, status: str | None = None) -> list[dict]:
         return self._conflict_service.list_conflicts(status)

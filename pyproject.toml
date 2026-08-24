@@ -28,6 +28,8 @@ multimodal = [
 
 [project.scripts]
 stock-content-worker = "stock_content.workers.content_worker:main"
+stock-content-verification-worker = "stock_content.workers.verification_worker:main"
+stock-content-signal-publisher = "stock_content.workers.signal_publisher_worker:main"
 
 [tool.ruff]
 line-length = 120

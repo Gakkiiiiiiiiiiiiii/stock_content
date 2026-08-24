@@ -54,7 +54,20 @@ class QdrantKnowledgeIndex:
                 PointStruct(
                     id=str(uuid5(NAMESPACE_URL, unit.knowledge_uid)),
                     vector=self._embed(unit.statement),
-                    payload={"knowledge_uid": unit.knowledge_uid, "ticker": unit.ticker, "kind": unit.kind},
+                    # Qdrant is only a search projection.  Keep the complete
+                    # filtering/lineage envelope in the payload, while the
+                    # relational row remains authoritative for hydration.
+                    payload={
+                        "knowledge_uid": unit.knowledge_uid,
+                        "content_snapshot_id": (unit.attributes or {}).get("content_snapshot_id"),
+                        "claim_ids": list((unit.provenance or {}).get("claim_ids") or []),
+                        "ticker": unit.ticker,
+                        "knowledge_kind": unit.knowledge_kind,
+                        "kind": unit.kind,
+                        "support_status": unit.support_status,
+                        "verification_status": unit.truth_status,
+                        "available_from": unit.available_from.isoformat(),
+                    },
                 )
                 for unit in units
             ],

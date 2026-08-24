@@ -65,10 +65,29 @@ def _load_knowledge_from_postgres(database_url: str | None) -> list[dict[str, An
         return [
             {
                 "knowledge_uid": row.knowledge_uid,
+                "video_id": row.video_id,
+                "chapter_id": row.chapter_id,
                 "statement": row.statement,
                 "kind": row.kind,
+                "knowledge_kind": row.knowledge_kind,
+                "knowledge_version": row.knowledge_version,
+                "subject": row.subject,
+                "subject_key": row.subject_key,
+                "predicate_key": row.predicate_key,
                 "ticker": row.ticker,
+                "support_status": row.support_status,
+                "truth_status": row.truth_status,
+                "review_status": row.review_status,
                 "lifecycle_status": row.lifecycle_status,
+                "confidence": row.confidence,
+                "as_of": row.as_of,
+                "available_from": row.available_from,
+                "valid_from": row.valid_from,
+                "valid_to": row.valid_to,
+                "source_statement_hash": row.source_statement_hash,
+                "content_hash": row.content_hash,
+                "attributes": dict(row.attributes or {}),
+                "provenance": dict(row.provenance or {}),
             }
             for row in rows
         ]
@@ -94,13 +113,28 @@ class _RebuildTarget:
         units = [
             KnowledgeUnit(
                 knowledge_uid=item["knowledge_uid"],
-                video_id="",
-                chapter_id=None,
+                video_id=str(item.get("video_id") or ""),
+                chapter_id=item.get("chapter_id"),
                 statement=item["statement"],
                 kind=item.get("kind") or "CLAIM",
+                knowledge_kind=item.get("knowledge_kind") or "STATE",
+                knowledge_version=int(item.get("knowledge_version") or 1),
+                subject=item.get("subject"),
+                subject_key=item.get("subject_key"),
+                predicate_key=item.get("predicate_key"),
                 ticker=item.get("ticker"),
-                as_of=datetime.now(UTC),
-                available_from=datetime.now(UTC),
+                support_status=item.get("support_status") or "SOURCE_SUPPORTED",
+                truth_status=item.get("truth_status") or "NOT_CHECKED",
+                review_status=item.get("review_status") or "UNREVIEWED",
+                confidence=float(item.get("confidence") or 0.6),
+                as_of=item.get("as_of") or datetime.now(UTC),
+                available_from=item.get("available_from") or datetime.now(UTC),
+                valid_from=item.get("valid_from"),
+                valid_to=item.get("valid_to"),
+                source_statement_hash=item.get("source_statement_hash"),
+                content_hash=item.get("content_hash"),
+                attributes=dict(item.get("attributes") or {}),
+                provenance=dict(item.get("provenance") or {}),
             )
             for item in items
         ]

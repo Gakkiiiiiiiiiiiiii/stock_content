@@ -9,7 +9,16 @@ import logging
 import os
 import time
 
+from stock_content.adapters.http import QuantExternalFactProvider
+from stock_content.adapters.postgres.database import Database
+from stock_content.adapters.postgres.repositories import (
+    PostgresVerificationJobRepository,
+    SqlClaimRepository,
+)
+from stock_content.application.verification_refresh import VerificationRefreshService
 from stock_content.application.verification_service import VerificationService, run_verification_pass
+from stock_content.application.verification_worker import VerificationWorkerApplication
+from stock_content.domain.lineage import default_code_sha
 
 LOGGER = logging.getLogger(__name__)
 
@@ -26,14 +35,30 @@ def run_once(service: VerificationService) -> dict:
     }
 
 
+def run_db_once(worker_id: str = "verification-worker", limit: int = 10) -> dict[str, int]:
+    """Run one durable pass; production authority is PostgreSQL, not memory."""
+    default_code_sha()
+    database = Database()
+    database.create_schema()
+    jobs = PostgresVerificationJobRepository(database.session_factory)
+    claims = SqlClaimRepository(database.session_factory)
+    configured = QuantExternalFactProvider()
+    provider = configured if configured.configured() else None
+    refresh = VerificationRefreshService(database.session_factory, jobs, claims)
+    return VerificationWorkerApplication(jobs, claims, provider, refresh).run_once(worker_id, limit)
+
+
 def main() -> None:  # pragma: no cover - 进程入口，由部署编排驱动
     logging.basicConfig(level=logging.INFO)
+    # Validate release identity before entering the retry loop.  Deployment
+    # misconfiguration must terminate startup, not be logged forever as a
+    # transient database/provider failure.
+    default_code_sha()
     poll_interval = float(os.getenv("VERIFICATION_POLL_SECONDS", str(DEFAULT_POLL_INTERVAL_SECONDS)))
-    service = VerificationService(provider=None)  # provider 由部署装配注入
     LOGGER.info("verification worker started (poll=%.1fs)", poll_interval)
     while True:
         try:
-            stats = run_once(service)
+            stats = run_db_once(os.getenv("VERIFICATION_WORKER_ID", "verification-worker"))
             LOGGER.info("verification pass: %s", stats)
         except Exception:  # noqa: BLE001 - worker 永不退出
             LOGGER.exception("verification pass failed")

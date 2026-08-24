@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -13,6 +14,9 @@ def utcnow() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+JSONPayload = JSON().with_variant(JSONB(), "postgresql")
 
 
 class ContentTaskRow(Base):
@@ -341,11 +345,183 @@ class ContentSnapshotRow(Base):
     source_type: Mapped[str] = mapped_column(String(32), index=True)
     source_ref: Mapped[str] = mapped_column(Text)
     source_content_hash: Mapped[str] = mapped_column(String(64), index=True)
-    identity: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    artifact_ids: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
-    quant_market_snapshot_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    identity: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    artifact_ids: Mapped[dict[str, str]] = mapped_column(JSONPayload, default=dict)
+    quant_market_snapshot_ids: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
     pipeline_version: Mapped[str] = mapped_column(String(40), default="pipeline.v2")
     schema_version: Mapped[str] = mapped_column(String(40), default="content.snapshot.v1")
     code_sha: Mapped[str | None] = mapped_column(String(64))
     config_hash: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+    # v2 lineage (kept additive for 012/013 databases)
+    source_artifact_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    artifact_root_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    snapshot_kind: Mapped[str] = mapped_column(String(32), default="INITIAL")
+    parent_snapshot_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    supersedes_snapshot_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    producer_manifest: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+
+
+class ContentArtifactRow(Base):
+    __tablename__ = "content_artifact"
+    __table_args__ = (
+        UniqueConstraint("artifact_type", "content_hash", name="uq_content_artifact_type_hash"),
+    )
+    artifact_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    artifact_type: Mapped[str] = mapped_column(String(40), index=True)
+    schema_version: Mapped[str] = mapped_column(String(40), default="artifact.v1")
+    producer_stage: Mapped[str] = mapped_column(String(80), default="")
+    producer_version: Mapped[str] = mapped_column(String(80), default="1.0.0")
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    parent_artifact_ids: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class ContentArtifactEdgeRow(Base):
+    __tablename__ = "content_artifact_edge"
+    edge_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("content_artifact.artifact_id", ondelete="CASCADE"), index=True)
+    parent_artifact_id: Mapped[str] = mapped_column(String(96), index=True)
+    relation: Mapped[str] = mapped_column(String(40), default="PARENT")
+
+
+class ContentStageCheckpointRow(Base):
+    __tablename__ = "content_stage_checkpoint"
+    checkpoint_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("content_ingest_task.task_id", ondelete="CASCADE"), index=True)
+    stage: Mapped[str] = mapped_column(String(80), index=True)
+    stage_version: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    artifact_ids: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    artifact_hashes: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FinancialClaimRow(Base):
+    __tablename__ = "financial_claim"
+    claim_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    claim_type: Mapped[str] = mapped_column(String(48), index=True)
+    fact_category: Mapped[str] = mapped_column(String(32), index=True)
+    subject_type: Mapped[str] = mapped_column(String(80))
+    subject_id: Mapped[str] = mapped_column(String(255), index=True)
+    predicate: Mapped[str] = mapped_column(String(255), index=True)
+    value: Mapped[Any] = mapped_column(JSONPayload)
+    unit: Mapped[str | None] = mapped_column(String(40))
+    currency: Mapped[str | None] = mapped_column(String(16))
+    fact_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_confidence: Mapped[float] = mapped_column(Float)
+    extractor_confidence: Mapped[float] = mapped_column(Float)
+    extraction_model_id: Mapped[str] = mapped_column(String(120), default="unknown")
+    extraction_prompt_version: Mapped[str] = mapped_column(String(120), default="unknown")
+    condition_text: Mapped[str | None] = mapped_column(Text)
+    invalidation_text: Mapped[str | None] = mapped_column(Text)
+    claim_schema_version: Mapped[str] = mapped_column(String(40), default="claim.v2")
+    normalization_version: Mapped[str] = mapped_column(String(40), default="normalization.v1")
+    source_support_status: Mapped[str] = mapped_column(String(24), default="UNSUPPORTED")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ClaimEvidenceRow(Base):
+    __tablename__ = "claim_evidence"
+    __table_args__ = (
+        UniqueConstraint("claim_id", "evidence_id", name="uq_claim_evidence_claim_evidence"),
+    )
+    member_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("financial_claim.claim_id", ondelete="CASCADE"), index=True)
+    evidence_id: Mapped[str] = mapped_column(String(96), index=True)
+    relation: Mapped[str] = mapped_column(String(32), default="SUPPORTS")
+
+
+class ClaimArtifactMemberRow(Base):
+    __tablename__ = "claim_artifact_member"
+    member_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("content_artifact.artifact_id", ondelete="CASCADE"), index=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("financial_claim.claim_id", ondelete="CASCADE"), index=True)
+
+
+class ClaimVerificationJobRow(Base):
+    __tablename__ = "claim_verification_job"
+    job_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("financial_claim.claim_id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_retries: Mapped[int] = mapped_column(Integer, default=5)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    trace_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (UniqueConstraint("claim_id", "provider"),)
+
+
+class ClaimVerificationResultRow(Base):
+    __tablename__ = "claim_verification_result"
+    verification_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("financial_claim.claim_id", ondelete="CASCADE"), index=True)
+    provider: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    market_snapshot_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    market_data_version: Mapped[str | None] = mapped_column(String(80))
+    result_payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    trace_id: Mapped[str | None] = mapped_column(String(96))
+    fact_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    adjustment: Mapped[str | None] = mapped_column(String(32))
+    verification_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    verification_rule_version: Mapped[str | None] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentSnapshotArtifactRow(Base):
+    __tablename__ = "content_snapshot_artifact"
+    member_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("content_snapshot.content_snapshot_id", ondelete="CASCADE"), index=True
+    )
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("content_artifact.artifact_id"), index=True)
+    slot: Mapped[str] = mapped_column(String(40), index=True)
+
+
+class SignalOutboxRow(Base):
+    __tablename__ = "content_signal_outbox"
+    outbox_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    signal_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    content_snapshot_id: Mapped[str | None] = mapped_column(String(80), index=True)
+    claim_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    schema_version: Mapped[str] = mapped_column(String(48), default="content-factor-signal.v4")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @property
+    def retry_count(self) -> int:
+        """Design-level name; ``attempts`` remains the legacy column."""
+        return self.attempts
+
+    @retry_count.setter
+    def retry_count(self, value: int) -> None:
+        self.attempts = value
+
+
+class ContentSourceHeadRow(Base):
+    __tablename__ = "content_source_head"
+    source_identity_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    latest_snapshot_id: Mapped[str] = mapped_column(String(80))
+    latest_verified_snapshot_id: Mapped[str | None] = mapped_column(String(80))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

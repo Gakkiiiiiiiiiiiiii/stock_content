@@ -121,7 +121,7 @@ def validate_resume(
             if artifact is None:
                 raise CheckpointValidationError(f"missing artifact for stage {record.stage}: {artifact_id}")
             actual = str(getattr(artifact, "content_hash", "") or "")
-            if expected_hash and actual and actual != expected_hash:
+            if expected_hash != actual:
                 raise CheckpointValidationError(
                     f"artifact hash mismatch for stage {record.stage}: {artifact_id}"
                 )

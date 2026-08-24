@@ -21,6 +21,7 @@ ClaimType = Literal[
     "INDUSTRY_RELATION",
     "FORECAST",
     "OPINION",
+    "INFERENCE",
 ]
 
 CLAIM_TYPES: tuple[str, ...] = (
@@ -44,6 +45,9 @@ CLAIM_CATEGORY: dict[str, str] = {
     "INDUSTRY_RELATION": "FACT",
     "FORECAST": "FORECAST",
     "OPINION": "OPINION",
+    # Kept outside the legacy CLAIM_TYPES tuple for v1 consumers while being
+    # a distinct canonical category in the v2 model.
+    "INFERENCE": "INFERENCE",
 }
 
 # 可绑定 Quant 市场快照进行外部核验的类型（P1-3）。
@@ -52,12 +56,15 @@ QUANT_VERIFIABLE_TYPES: frozenset[str] = frozenset({"PRICE", "RETURN", "VALUATIO
 VERIFICATION_STATUSES = (
     "EXTRACTED",
     "VERIFICATION_PENDING",
+    "NOT_REQUIRED",
     "VERIFIED",
     "CONTRADICTED",
     "PARTIALLY_VERIFIED",
     "NOT_VERIFIABLE",
     "EXPIRED",
+    "MANUAL_REVIEW",
 )
+SUPPORTED_CLAIM_TYPES: frozenset[str] = frozenset((*CLAIM_TYPES, "INFERENCE"))
 
 
 class FinancialClaim(BaseModel):
@@ -71,21 +78,38 @@ class FinancialClaim(BaseModel):
     predicate: str
     value: Any = None
     unit: str | None = None
+    currency: str | None = None
 
     fact_time: datetime | date | None = None
+    period_start: date | None = None
+    period_end: date | None = None
     published_at: datetime | None = None
 
     evidence_refs: list[str] = Field(default_factory=list)
+    source_support_status: Literal[
+        "SUPPORTED", "PARTIALLY_SUPPORTED", "UNSUPPORTED", "AMBIGUOUS"
+    ] = "UNSUPPORTED"
 
     source_confidence: float = Field(ge=0.0, le=1.0)
     extractor_confidence: float = Field(ge=0.0, le=1.0)
+    extraction_model_id: str = "unknown"
+    extraction_prompt_version: str = "unknown"
+    condition_text: str | None = None
+    invalidation_text: str | None = None
+    claim_schema_version: str = "claim.v2"
+    normalization_version: str = "normalization.v1"
 
     @field_validator("claim_type")
     @classmethod
     def _known_type(cls, value: str) -> str:
-        if value not in CLAIM_TYPES:
+        if value not in SUPPORTED_CLAIM_TYPES:
             raise ValueError(f"unknown claim_type: {value}")
         return value
+
+    @field_validator("source_support_status", mode="before")
+    @classmethod
+    def _normalize_support_status(cls, value: object) -> object:
+        return "PARTIALLY_SUPPORTED" if str(value).upper() == "PARTIAL" else value
 
     @model_validator(mode="after")
     def _invariants(self) -> "FinancialClaim":
@@ -106,7 +130,12 @@ class FinancialClaim(BaseModel):
             "predicate": self.predicate,
             "value": self.value,
             "unit": self.unit,
+            "currency": self.currency,
             "fact_time": str(self.fact_time) if self.fact_time else None,
+            "period_start": str(self.period_start) if self.period_start else None,
+            "period_end": str(self.period_end) if self.period_end else None,
+            "claim_schema_version": self.claim_schema_version,
+            "normalization_version": self.normalization_version,
         }
 
 
@@ -126,7 +155,14 @@ class VerificationResult(BaseModel):
 
     claim_id: str
     status: Literal[
-        "VERIFIED", "CONTRADICTED", "PARTIALLY_VERIFIED", "NOT_VERIFIABLE", "EXPIRED", "VERIFICATION_PENDING"
+        "VERIFIED",
+        "CONTRADICTED",
+        "PARTIALLY_VERIFIED",
+        "NOT_VERIFIABLE",
+        "NOT_REQUIRED",
+        "MANUAL_REVIEW",
+        "EXPIRED",
+        "VERIFICATION_PENDING",
     ]
 
     market_snapshot_id: str | None = None
@@ -156,6 +192,7 @@ class VerificationResult(BaseModel):
 __all__ = [
     "CLAIM_CATEGORY",
     "CLAIM_TYPES",
+    "SUPPORTED_CLAIM_TYPES",
     "ClaimType",
     "FinancialClaim",
     "QUANT_VERIFIABLE_TYPES",

@@ -1,0 +1,79 @@
+name: content-factor-signal
+version: content-factor-signal.v4
+type: object
+additionalProperties: false
+required: [signal_id, decision_id, signal_schema_version, signal_policy_version, content_snapshot_id, claim_id, verification_artifact_id, signal_status, truth_scope, symbol, signal_type, fact_category, direction, magnitude, confidence, event_time, available_from, published_at, source, support, verification, evidence_refs, producer, policy]
+properties:
+  signal_id: {type: string, minLength: 1}
+  decision_id: {type: string, minLength: 1}
+  signal_schema_version: {const: content-factor-signal.v4}
+  signal_policy_version: {type: string, minLength: 1}
+  content_snapshot_id: {type: string, minLength: 1}
+  claim_id: {type: string, minLength: 1}
+  verification_artifact_id: {type: string, minLength: 1}
+  signal_status: {enum: [NORMAL, DEGRADED, SUPPRESSED, CONTRADICTION]}
+  event_type: {type: [string, 'null']}
+  truth_scope: {enum: [FACT, AUTHOR_FORECAST, AUTHOR_OPINION, SYSTEM_INFERENCE, UNKNOWN]}
+  symbol: {type: string, minLength: 1}
+  signal_type: {enum: [FACT, FORECAST, OPINION, INFERENCE]}
+  fact_category: {type: string, minLength: 1}
+  direction: {enum: [LONG, SHORT, NEUTRAL]}
+  magnitude: {}
+  confidence: {type: number, minimum: 0, maximum: 1}
+  event_time: {type: string, minLength: 1}
+  available_from: {type: string, minLength: 1}
+  published_at: {type: string, minLength: 1}
+  snapshot_id: {type: string, minLength: 1}
+  source:
+    type: object
+    additionalProperties: false
+    required: [source_artifact_id, source_type, source_ref]
+    properties:
+      source_artifact_id: {type: string, minLength: 1}
+      source_type: {type: string, minLength: 1}
+      source_ref: {type: string, minLength: 1}
+  support:
+    type: object
+    additionalProperties: false
+    required: [status, score, evidence_refs]
+    properties:
+      status: {enum: [SUPPORTED, PARTIALLY_SUPPORTED, UNSUPPORTED, AMBIGUOUS]}
+      score: {type: number, minimum: 0, maximum: 1}
+      evidence_refs: {type: array, items: {type: string}}
+  verification:
+    type: object
+    additionalProperties: false
+    required: [status, provider, market_snapshot_id, market_data_version, verification_rule_version]
+    properties:
+      status: {type: string, minLength: 1}
+      provider: {type: string, minLength: 1}
+      market_snapshot_id: {type: [string, 'null']}
+      market_data_version: {type: [string, 'null']}
+      verification_rule_version: {type: string, minLength: 1}
+  producer:
+    type: object
+    additionalProperties: false
+    required: [service, service_version, code_sha, pipeline_version, model_id, prompt_version, trace_id, decision_id]
+    properties:
+      service: {type: string, minLength: 1}
+      service_version: {type: string, minLength: 1}
+      code_sha: {type: string, minLength: 1}
+      container_digest: {type: [string, 'null']}
+      dependency_lock_hash: {type: [string, 'null']}
+      python_lock_hash: {type: [string, 'null']}
+      pipeline_version: {type: string, minLength: 1}
+      model_id: {type: string, minLength: 1}
+      prompt_version: {type: string, minLength: 1}
+      trace_id: {type: string, minLength: 1}
+      decision_id: {type: string, minLength: 1}
+      decision: {type: string, minLength: 1}
+  policy:
+    type: object
+    additionalProperties: false
+    required: [signal_policy_version]
+    properties:
+      signal_policy_version: {type: string, minLength: 1}
+      forecast_confidence_threshold: {type: number, minimum: 0, maximum: 1}
+  evidence_refs:
+    type: array
+    items: {type: string}

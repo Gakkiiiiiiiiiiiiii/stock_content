@@ -171,3 +171,110 @@ def test_replay_uses_artifact_lineage(tmp_path, monkeypatch):
     # 每个被引用的 artifact id 都必须真实存在于 registry。
     known = {artifact.artifact_id for artifact in registry.artifacts()}
     assert set(data["artifact_ids"].values()) <= known
+
+
+def test_reprocess_fixture_is_exact_and_closes_task(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    options = {
+        **_ingest_options(),
+        "available_from": "2025-01-02T03:04:05+00:00",
+    }
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1golden", "options": options}
+    )
+    application.process_next("replay-golden")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+
+    replay = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay", json={"mode": "REPROCESS"}
+    )
+    assert replay.status_code == 200
+    body = replay.json()
+    assert "differences" in body
+    assert not body.get("differences")
+    replay_task = client.get(f"/api/v1/tasks/{body['replay_id']}")
+    assert replay_task.status_code == 200
+    assert replay_task.json()["status"] == "SUCCEEDED"
+
+
+def test_migration_replay_creates_child_snapshot(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1migration", "options": _ingest_options()}
+    )
+    application.process_next("replay-migration")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    replay = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4"},
+    )
+    assert replay.status_code == 200
+    candidate = client.get(f"/api/v1/content-snapshots/{replay.json()['candidate_snapshot_id']}").json()["data"]
+    assert candidate["snapshot_kind"] == "MIGRATION"
+    assert candidate["parent_snapshot_id"] == snapshot_id
+    assert candidate["supersedes_snapshot_id"] == snapshot_id
+    assert candidate["pipeline_version"] == "pipeline.v4"
+
+
+def test_task_specific_options_do_not_change_snapshot_identity(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    ids = []
+    for key, trace in (("request-a", "trace-a"), ("request-b", "trace-b")):
+        options = {
+            **_ingest_options(),
+            "available_from": "2025-01-02T03:04:05+00:00",
+            "idempotency_key": key,
+            "trace_id": trace,
+        }
+        enqueue = client.post(
+            "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1identity", "options": options}
+        )
+        application.process_next("replay-identity")
+        ids.append(client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"])
+    assert ids[0] == ids[1]
+    configuration = client.get(f"/api/v1/content-snapshots/{ids[0]}").json()["data"]["configuration"]
+    assert "pipeline_options" not in configuration
+
+
+def test_reprocess_difference_is_structured_and_task_fails(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1different", "options": _ingest_options()}
+    )
+    application.process_next("replay-different")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    replay = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "REPROCESS", "overrides": {"transcript": "different fixture"}},
+    )
+    assert replay.status_code == 409
+    body = replay.json()["detail"]
+    assert body["error"] == "REPLAY_NONDETERMINISTIC"
+    assert body["differences"]
+    assert client.get(f"/api/v1/tasks/{body['replay_id']}").json()["status"] == "FAILED"
+
+
+def test_reprocess_pipeline_failure_closes_created_task(tmp_path, monkeypatch):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1failure", "options": _ingest_options()}
+    )
+    application.process_next("replay-failure")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+
+    def fail_pipeline(_context):
+        raise RuntimeError("fixture pipeline failed")
+
+    monkeypatch.setattr(application._pipeline, "process", fail_pipeline)
+    replay = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay", json={"mode": "REPROCESS"}
+    )
+    assert replay.status_code == 500
+    detail = replay.json()["detail"]
+    assert detail["error"] == "REPLAY_FAILED"
+    assert client.get(f"/api/v1/tasks/{detail['replay_id']}").json()["status"] == "FAILED"

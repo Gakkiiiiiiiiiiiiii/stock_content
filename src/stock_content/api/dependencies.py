@@ -22,12 +22,16 @@ from stock_content.adapters.postgres.repositories import (
     PostgresSummaryRepository,
     PostgresVerificationRepository,
     PostgresVideoRepository,
+    SignalOutboxRepository,
+    SqlArtifactRepository,
+    SqlClaimRepository,
     SqlSnapshotStore,
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
 from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter
 from stock_content.application.pipeline import ContentPipeline
 from stock_content.application.service import ContentApplication
+from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stage_runner import wrap_all
 from stock_content.application.stages import (
@@ -35,6 +39,7 @@ from stock_content.application.stages import (
     AudioStage,
     BuildVideoStage,
     ChapterStage,
+    ClaimPersistenceStage,
     DownloadStage,
     FinancialEnrichmentStage,
     FrameExtractionStage,
@@ -54,6 +59,7 @@ from stock_content.application.stages import (
 )
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
@@ -79,12 +85,17 @@ STAGE_VERSIONS: dict[str, str] = {
     "financial_enrichment": "1.0.0",
     "summary": "1.0.0",
     "content_snapshot": "1.0.0",
+    "claim_persistence": "1.0.0",
     "persist": "1.0.0",
     "index": "1.0.0",
 }
 
 
 def build_application(database_url: str | None = None, enable_qdrant: bool | None = None) -> ContentApplication:
+    # Validate release identity before opening a database or constructing any
+    # external client.  Development/test environments retain the historical
+    # ``unknown`` fallback through the domain policy.
+    default_code_sha()
     database = Database(database_url)
     database.create_schema()
     tasks = PostgresContentTaskRepository(database.session_factory)
@@ -95,6 +106,8 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     financial = PostgresFinancialRepository(database.session_factory)
     entities = PostgresFinancialEntityRepository(database.session_factory)
     verifications = PostgresVerificationRepository(database.session_factory)
+    artifacts = SqlArtifactRepository(database.session_factory)
+    claims = SqlClaimRepository(database.session_factory)
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
     index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
@@ -108,6 +121,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     sources = {"bilibili": BilibiliSourceAdapter(), "xiaoe_hls": XiaoeHlsSourceAdapter()}
     # P0 C-03/C-04：快照在 persist 前基于 pipeline 已生成 Artifact 记录；失败即 task 失败。
     snapshot_service = SnapshotService(SqlSnapshotStore(database.session_factory))
+    signal_outbox = SignalOutboxRepository(database.session_factory)
     stages = [
         ResolveSourceStage(sources),
         DownloadStage(sources),
@@ -130,13 +144,35 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         VerificationStage(),
         FinancialEnrichmentStage(),
         SummaryStage(SummaryGenerator()),
+        ClaimPersistenceStage(claims, artifacts),
         SnapshotRecordingStage(snapshot_service),
-        PersistStage(videos, chapters, knowledge, summaries, multimodal, financial, entities, verifications),
+        PersistStage(
+            videos,
+            chapters,
+            knowledge,
+            summaries,
+            multimodal,
+            financial,
+            entities,
+            verifications,
+            artifacts,
+            claims,
+            snapshot_service=snapshot_service,
+            signal_service=SignalService(),
+            signal_outbox=signal_outbox,
+        ),
         IndexStage(index),
     ]
     # P0 C-01：生产主链路全部经 StageRunner，产出 Artifact Checkpoint v2。
     # 版本号来自稳定常量，不得随机生成。
-    pipeline = ContentPipeline(wrap_all(stages, STAGE_VERSIONS))
+    pipeline = ContentPipeline(
+        wrap_all(
+            stages,
+            STAGE_VERSIONS,
+            artifact_repository=artifacts,
+            legacy_fallback=False,
+        )
+    )
     return ContentApplication(
         tasks,
         videos,
@@ -146,4 +182,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         chapters,
         summaries,
         snapshot_service=snapshot_service,
+        artifact_repository=artifacts,
+        claim_repository=claims,
+        signal_outbox=signal_outbox,
     )

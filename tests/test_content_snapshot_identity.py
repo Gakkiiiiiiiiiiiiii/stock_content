@@ -8,10 +8,23 @@ from __future__ import annotations
 import pytest
 
 from stock_content.adapters.postgres.database import Database
-from stock_content.adapters.postgres.repositories.snapshot_repository import SqlSnapshotStore
+from stock_content.adapters.postgres.repositories import SqlArtifactRepository, SqlSnapshotStore
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import SnapshotService
+from stock_content.domain.artifacts import SourceArtifact
 from stock_content.domain.lineage import build_content_snapshot
+
+
+def _persist_source(database, *, artifact_id: str, source_content_hash: str) -> None:
+    SqlArtifactRepository(database.session_factory).put(
+        SourceArtifact(
+            artifact_id=artifact_id,
+            artifact_type="source",
+            source_type="bilibili",
+            source_ref="BV1",
+            source_content_hash=source_content_hash,
+        )
+    )
 
 
 def _record(service: SnapshotService, **overrides) -> str:
@@ -64,11 +77,61 @@ def test_snapshot_binds_lineage_fields():
     assert "task" not in snapshot.to_dict()  # task_id 禁止参与快照身份
 
 
+def test_build_normalizes_manifest_conflicts_before_identity_hashing():
+    conflicting = build_content_snapshot(
+        source_type="fixture",
+        source_ref="provenance",
+        source_content_hash="hash",
+        code_sha="top-sha",
+        config_hash="top-config",
+        producer_manifest={
+            "code_sha": "nested-sha",
+            "configs": {"config_hash": "nested-config"},
+            "container_digest": "sha256:fixture",
+        },
+    )
+    already_normalized = build_content_snapshot(
+        source_type="fixture",
+        source_ref="provenance",
+        source_content_hash="hash",
+        code_sha="top-sha",
+        config_hash="top-config",
+        producer_manifest={
+            "code_sha": "top-sha",
+            "configs": {"config_hash": "top-config"},
+            "container_digest": "sha256:fixture",
+        },
+    )
+
+    assert conflicting.code_sha == conflicting.producer_manifest["code_sha"] == "top-sha"
+    assert conflicting.config_hash == conflicting.producer_manifest["configs"]["config_hash"] == "top-config"
+    assert conflicting.content_snapshot_id == already_normalized.content_snapshot_id
+    assert conflicting.producer_manifest == already_normalized.producer_manifest
+
+
+def test_build_falls_back_to_manifest_provenance_when_top_level_is_empty():
+    snapshot = build_content_snapshot(
+        source_type="fixture",
+        source_ref="provenance-fallback",
+        source_content_hash="hash",
+        producer_manifest={
+            "code_sha": "manifest-sha",
+            "configs": {"config_hash": "manifest-config"},
+        },
+    )
+
+    assert snapshot.code_sha == "manifest-sha"
+    assert snapshot.config_hash == "manifest-config"
+    assert snapshot.producer_manifest["code_sha"] == snapshot.code_sha
+    assert snapshot.producer_manifest["configs"]["config_hash"] == snapshot.config_hash
+
+
 def test_sql_snapshot_store_roundtrip(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'snap.db'}")
     database.create_schema()
     store = SqlSnapshotStore(database.session_factory)
     service = SnapshotService(store)
+    _persist_source(database, artifact_id="source-1", source_content_hash="content-hash-1")
     snapshot_id = _record(service)
 
     fetched = service.get(snapshot_id)
@@ -102,6 +165,7 @@ def test_replay_identity_matches(tmp_path):
     database.create_schema()
     service = SnapshotService(SqlSnapshotStore(database.session_factory))
     replay = ReplayService(service)
+    _persist_source(database, artifact_id="source-1", source_content_hash="content-hash-1")
     snapshot_id = _record(service)
 
     result = replay.replay(snapshot_id)

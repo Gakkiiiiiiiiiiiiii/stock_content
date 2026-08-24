@@ -17,9 +17,9 @@ import httpx
 TOLERANCE_PCT = 1.0
 
 
-def _trace_headers() -> dict[str, str]:
+def _trace_headers(trace_id: str | None = None) -> dict[str, str]:
     # §32：统一 Trace Headers，content → quant 调用透传 trace 与调用方标识。
-    return {"X-Trace-Id": uuid4().hex, "X-Caller-Service": "stock_content"}
+    return {"X-Trace-Id": trace_id or uuid4().hex, "X-Caller-Service": "stock_content"}
 
 
 class QuantFactClient:
@@ -32,7 +32,9 @@ class QuantFactClient:
     def configured(self) -> bool:
         return bool(os.getenv("QUANT_SERVICE_URL") or os.getenv("CONTENT_EXTERNAL_FACT_PROVIDER") == "quant")
 
-    def get_price_snapshot(self, symbol: str, event_date: str) -> dict[str, Any] | None:
+    def get_price_snapshot(
+        self, symbol: str, event_date: str, trace_id: str | None = None
+    ) -> dict[str, Any] | None:
         """返回 event_date 当天（或最近一个交易日）的 PIT 价格快照。"""
         day = date.fromisoformat(str(event_date)[:10])
         payload = {
@@ -42,9 +44,9 @@ class QuantFactClient:
             "frequency": "1d",
             "adjust": "none",
         }
-        response = self._post("/api/v1/market/bars/batch", payload)
+        response = self._post("/api/v1/market/bars/batch", payload, trace_id)
         if response is None or response.status_code == 404:
-            response = self._post("/v1/bars/batch", payload)
+            response = self._post("/v1/bars/batch", payload, trace_id)
         if response is None:
             return None
         response.raise_for_status()
@@ -71,9 +73,14 @@ class QuantFactClient:
             "data_version": data.get("data_version"),
         }
 
-    def _post(self, path: str, payload: dict) -> httpx.Response | None:
+    def _post(self, path: str, payload: dict, trace_id: str | None = None) -> httpx.Response | None:
         try:
-            return httpx.post(f"{self._url}{path}", json=payload, headers=_trace_headers(), timeout=self._timeout)
+            return httpx.post(
+                f"{self._url}{path}",
+                json=payload,
+                headers=_trace_headers(trace_id),
+                timeout=self._timeout,
+            )
         except httpx.HTTPError:
             return None
 
@@ -89,7 +96,7 @@ class QuantExternalFactProvider:
             os.getenv("QUANT_SERVICE_URL")
         )
 
-    def verify(self, unit: dict[str, Any]) -> dict[str, Any]:
+    def verify(self, unit: dict[str, Any], trace_id: str | None = None) -> dict[str, Any]:
         attributes = unit.get("attributes") or {}
         symbol = attributes.get("symbol") or unit.get("symbol")
         event_date = (
@@ -102,7 +109,14 @@ class QuantExternalFactProvider:
         if not symbol or not event_date:
             return {"status": "NOT_FOUND", "reason": "MISSING_CLAIM_FIELDS"}
         try:
-            snapshot = self._client.get_price_snapshot(str(symbol), str(event_date))
+            try:
+                snapshot = self._client.get_price_snapshot(
+                    str(symbol), str(event_date), trace_id
+                )
+            except TypeError:
+                # Backward-compatible test/provider boundary before trace
+                # propagation was added.
+                snapshot = self._client.get_price_snapshot(str(symbol), str(event_date))
         except Exception:  # noqa: BLE001
             snapshot = None
         if snapshot is None:
