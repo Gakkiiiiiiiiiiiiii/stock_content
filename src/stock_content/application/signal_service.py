@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from stock_content.domain.signal_contract import validate_signal_v4
+from stock_content.domain.signal_contract import upgrade_signal_v5, validate_signal_v4, validate_signal_v5
 from stock_content.domain.signal_policy import SignalPolicy
 
 
@@ -33,6 +33,14 @@ class SignalService:
         """Alias used by the Postgres rebuild path; IDs remain stable."""
         return self._policy.build_initial_signals(snapshot, claims, verification,
                                                    trace_id=trace_id, decision_id=decision_id)
+
+    def build_signal_v5(self, projection: dict[str, Any]) -> dict[str, Any]:
+        """Validate/build the lineage-only v5 projection from SQL data."""
+        return upgrade_signal_v5(projection)
+
+    @staticmethod
+    def validate_signal_v5(signal: dict[str, Any]) -> dict[str, Any]:
+        return validate_signal_v5(signal)
 
     # Compatibility with callers that use the shorter names.
     build_initial = build_initial_signals

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from stock_content.domain.lineage import (
@@ -18,6 +19,28 @@ from stock_content.domain.lineage import (
 
 class SnapshotIntegrityError(ValueError):
     """A snapshot id was reused for a different immutable payload."""
+
+
+def choose_snapshot_commit_candidate(
+    *,
+    ingested_at: datetime,
+    extraction_completed_at: datetime,
+    source_available_at: datetime | None = None,
+    reference_available_at: datetime | None = None,
+    external_available_at: datetime | None = None,
+    candidate: datetime | None = None,
+) -> datetime:
+    """Choose a commit time no earlier than every known dependency.
+
+    A caller-provided candidate is validated rather than silently moved; this
+    makes an unavailable snapshot a deterministic failure at the boundary.
+    """
+    dependencies = [ingested_at, extraction_completed_at]
+    dependencies.extend(item for item in (source_available_at, reference_available_at, external_available_at) if item)
+    minimum = max(dependencies)
+    if candidate is not None and candidate < minimum:
+        raise ValueError("snapshot commit candidate precedes an available dependency")
+    return candidate or minimum
 
 
 class SnapshotStore(Protocol):
@@ -86,6 +109,8 @@ class SnapshotService:
         parent_snapshot_id: str | None = None,
         supersedes_snapshot_id: str | None = None,
         pipeline_version: str = "pipeline.v3",
+        created_at: datetime | None = None,
+        _persist: bool = True,
     ) -> ContentSnapshot:
         models = model_versions or {}
         # Keep the redundant top-level fields and nested producer manifest
@@ -127,7 +152,22 @@ class SnapshotService:
             parent_snapshot_id=parent_snapshot_id,
             supersedes_snapshot_id=supersedes_snapshot_id,
             pipeline_version=pipeline_version,
+            created_at=created_at,
         )
+        return self._store.save(snapshot) if _persist else snapshot
+
+    def record_bundle_from_artifacts(
+        self,
+        *,
+        occurrences=(),
+        lifecycle_events=(),
+        **kwargs: Any,
+    ) -> ContentSnapshot:
+        """Build and publish a snapshot plus dependent ledgers atomically."""
+        snapshot = self.record_from_artifacts(_persist=False, **kwargs)
+        saver = getattr(self._store, "save_bundle", None)
+        if saver is not None:
+            return saver(snapshot, occurrences=occurrences, lifecycle_events=lifecycle_events)
         return self._store.save(snapshot)
 
     def get(self, content_snapshot_id: str) -> ContentSnapshot | None:
@@ -141,4 +181,10 @@ class SnapshotService:
         return lineage_of(snapshot).to_dict() if snapshot else None
 
 
-__all__ = ["InMemorySnapshotStore", "SnapshotIntegrityError", "SnapshotService", "SnapshotStore"]
+__all__ = [
+    "InMemorySnapshotStore",
+    "SnapshotIntegrityError",
+    "SnapshotService",
+    "SnapshotStore",
+    "choose_snapshot_commit_candidate",
+]

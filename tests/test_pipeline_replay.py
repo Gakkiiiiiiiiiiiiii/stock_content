@@ -1,6 +1,7 @@
 """Pipeline Replay + Idempotency 三概念 API 测试（详细修改方案 §4 P0-2/P0-3）。"""
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from stock_content.api.dependencies import build_application
@@ -278,3 +279,142 @@ def test_reprocess_pipeline_failure_closes_created_task(tmp_path, monkeypatch):
     detail = replay.json()["detail"]
     assert detail["error"] == "REPLAY_FAILED"
     assert client.get(f"/api/v1/tasks/{detail['replay_id']}").json()["status"] == "FAILED"
+
+
+@pytest.mark.parametrize("missing_ledger", ["occurrence", "lifecycle"])
+def test_verify_lineage_rejects_missing_snapshot_closure_rows(tmp_path, missing_ledger):
+    """Historical replay resolves the IDs in its artifacts, never latest state."""
+    from sqlalchemy import delete
+
+    from stock_content.adapters.postgres.models import (
+        ClaimOccurrenceRow,
+        LifecycleEventLedgerRow,
+    )
+
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1closure", "options": _ingest_options()}
+    )
+    application.process_next("closure-test")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    snapshot = application._snapshots.get(snapshot_id)  # noqa: SLF001
+    artifact_repository = application._artifact_repository  # noqa: SLF001
+    if missing_ledger == "occurrence":
+        artifact = artifact_repository.get(snapshot.artifact_ids["occurrences"])
+        row_model = ClaimOccurrenceRow
+        identifier = artifact.occurrence_ids[0]
+    else:
+        artifact = artifact_repository.get(snapshot.artifact_ids["lifecycle"])
+        row_model = LifecycleEventLedgerRow
+        identifier = (artifact.claim_lifecycle_event_ids or artifact.occurrence_lifecycle_event_ids)[0]
+    sessions = artifact_repository._sessions  # noqa: SLF001
+    with sessions.begin() as session:
+        session.execute(delete(row_model).where(row_model.__table__.primary_key.columns.values()[0] == identifier))
+
+    result = application.replay_content_snapshot(snapshot_id)
+    assert result["error"] == "REPLAY_LINEAGE_REFERENCE_MISSING"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("claim_id", "claim-outside-snapshot"),
+        ("source_artifact_id", "source-outside-snapshot"),
+        ("transcript_artifact_id", "transcript-outside-snapshot"),
+        ("semantic_segment_id", "semantic-segment-outside-snapshot"),
+    ],
+)
+def test_verify_lineage_rejects_occurrence_row_outside_snapshot(tmp_path, field, value):
+    """A durable row is not part of a snapshot unless its immutable references close."""
+    from sqlalchemy import update
+
+    from stock_content.adapters.postgres.models import ClaimOccurrenceRow
+
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1closure-tamper", "options": _ingest_options()}
+    )
+    application.process_next("closure-tamper")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    snapshot = application._snapshots.get(snapshot_id)  # noqa: SLF001
+    artifact_repository = application._artifact_repository  # noqa: SLF001
+    occurrence_artifact = artifact_repository.get(snapshot.artifact_ids["occurrences"])
+    occurrence_id = occurrence_artifact.occurrence_ids[0]
+
+    with artifact_repository._sessions.begin() as session:  # noqa: SLF001
+        session.execute(
+            update(ClaimOccurrenceRow)
+            .where(ClaimOccurrenceRow.occurrence_id == occurrence_id)
+            .values(**{field: value})
+        )
+
+    result = application.replay_content_snapshot(snapshot_id)
+    assert result["error"] == "REPLAY_LINEAGE_REFERENCE_INVALID"
+
+
+def test_verify_lineage_rejects_occurrence_evidence_outside_snapshot(tmp_path):
+    """All four occurrence evidence roles must be members of the active EvidenceArtifact."""
+    from sqlalchemy import insert
+
+    from stock_content.adapters.postgres.models import ClaimOccurrenceEvidenceRow
+
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1evidence-tamper", "options": _ingest_options()}
+    )
+    application.process_next("evidence-tamper")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    snapshot = application._snapshots.get(snapshot_id)  # noqa: SLF001
+    artifact_repository = application._artifact_repository  # noqa: SLF001
+    occurrence_artifact = artifact_repository.get(snapshot.artifact_ids["occurrences"])
+    occurrence_id = occurrence_artifact.occurrence_ids[0]
+
+    with artifact_repository._sessions.begin() as session:  # noqa: SLF001
+        session.execute(
+            insert(ClaimOccurrenceEvidenceRow).values(
+                occurrence_id=occurrence_id,
+                evidence_id="evidence-outside-snapshot",
+                evidence_role="PRIMARY",
+                ordinal=999,
+            )
+        )
+
+    result = application.replay_content_snapshot(snapshot_id)
+    assert result["error"] == "REPLAY_LINEAGE_REFERENCE_INVALID"
+
+
+def test_verify_lineage_rejects_lifecycle_target_type_tampering(tmp_path):
+    """The lifecycle artifact's claim/occurrence buckets constrain target_type."""
+    from sqlalchemy import update
+
+    from stock_content.adapters.postgres.models import LifecycleEventLedgerRow
+
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1lifecycle-tamper", "options": _ingest_options()}
+    )
+    application.process_next("lifecycle-tamper")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    snapshot = application._snapshots.get(snapshot_id)  # noqa: SLF001
+    artifact_repository = application._artifact_repository  # noqa: SLF001
+    lifecycle_artifact = artifact_repository.get(snapshot.artifact_ids["lifecycle"])
+    if lifecycle_artifact.claim_lifecycle_event_ids:
+        event_id = lifecycle_artifact.claim_lifecycle_event_ids[0]
+        wrong_target_type = "OCCURRENCE"
+    else:
+        event_id = lifecycle_artifact.occurrence_lifecycle_event_ids[0]
+        wrong_target_type = "CLAIM"
+
+    with artifact_repository._sessions.begin() as session:  # noqa: SLF001
+        session.execute(
+            update(LifecycleEventLedgerRow)
+            .where(LifecycleEventLedgerRow.lifecycle_event_id == event_id)
+            .values(target_type=wrong_target_type)
+        )
+
+    result = application.replay_content_snapshot(snapshot_id)
+    assert result["error"] == "REPLAY_LINEAGE_REFERENCE_INVALID"

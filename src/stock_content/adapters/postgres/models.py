@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, CheckConstraint, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -70,6 +70,9 @@ class VideoSegmentRow(Base):
     __table_args__ = (UniqueConstraint("video_id", "segment_index"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Stable transcript coordinate.  SQL upgrades fill legacy rows with an
+    # explicit legacy_trseg_ identity before new writes are accepted.
+    segment_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True, index=True)
     video_id: Mapped[str] = mapped_column(ForeignKey("video_asset.video_id", ondelete="CASCADE"), index=True)
     segment_index: Mapped[int] = mapped_column(Integer)
     start_seconds: Mapped[float] = mapped_column(Float)
@@ -303,7 +306,7 @@ class KnowledgeConflictRow(Base):
 
 
 class KnowledgeLifecycleEventRow(Base):
-    __tablename__ = "knowledge_lifecycle_event"
+    __tablename__ = "knowledge_lifecycle_event_legacy"
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_uid: Mapped[str] = mapped_column(
         ForeignKey("knowledge_unit.knowledge_uid", ondelete="CASCADE"), index=True
@@ -315,6 +318,164 @@ class KnowledgeLifecycleEventRow(Base):
     trigger: Mapped[str] = mapped_column(String(80))
     actor: Mapped[str] = mapped_column(String(80))
     event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LifecycleEventLedgerRow(Base):
+    """Forward-compatible append-only ledger (migration 020)."""
+    __tablename__ = "knowledge_lifecycle_event"
+    __table_args__ = (
+        CheckConstraint("target_type IN ('CLAIM','OCCURRENCE')"),
+    )
+    lifecycle_event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    target_type: Mapped[str] = mapped_column(String(32), index=True)
+    target_id: Mapped[str] = mapped_column(String(128), index=True)
+    from_status: Mapped[str | None] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32))
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    reason_code: Mapped[str] = mapped_column(String(80))
+    policy_version: Mapped[str] = mapped_column(String(64))
+    supersedes_event_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SemanticSegmentRow(Base):
+    __tablename__ = "semantic_segment"
+    __table_args__ = (
+        UniqueConstraint("transcript_artifact_id", "segment_index"),
+        CheckConstraint("start_segment_index <= end_segment_index"),
+        CheckConstraint("start_ms <= end_ms"),
+    )
+    semantic_segment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    transcript_artifact_id: Mapped[str] = mapped_column(String(128), index=True)
+    video_id: Mapped[str] = mapped_column(String(64), index=True)
+    segment_index: Mapped[int] = mapped_column(Integer)
+    start_segment_id: Mapped[str] = mapped_column(String(128))
+    end_segment_id: Mapped[str] = mapped_column(String(128))
+    start_segment_index: Mapped[int] = mapped_column(Integer)
+    end_segment_index: Mapped[int] = mapped_column(Integer)
+    start_ms: Mapped[int] = mapped_column(Integer)
+    end_ms: Mapped[int] = mapped_column(Integer)
+    topic: Mapped[str | None] = mapped_column(Text)
+    subject: Mapped[str | None] = mapped_column(String(255))
+    segment_type: Mapped[str] = mapped_column(String(40), default="ANALYSIS")
+    model_id: Mapped[str] = mapped_column(String(160), default="")
+    prompt_version: Mapped[str] = mapped_column(String(80), default="")
+    confidence: Mapped[float | None] = mapped_column(Float)
+    artifact_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class TemporalBindingRow(Base):
+    __tablename__ = "claim_temporal_binding"
+    __table_args__ = (
+        CheckConstraint("value_type IN ('NONE','DATE','TIMESTAMP')"),
+        CheckConstraint(
+            "value_type <> 'DATE' OR (start_time IS NULL AND end_time IS NULL AND "
+            "earliest_start_time IS NULL AND latest_start_time IS NULL AND "
+            "earliest_end_time IS NULL AND latest_end_time IS NULL)"
+        ),
+        CheckConstraint(
+            "value_type <> 'TIMESTAMP' OR (start_date IS NULL AND end_date IS NULL AND "
+            "earliest_start_date IS NULL AND latest_start_date IS NULL AND "
+            "earliest_end_date IS NULL AND latest_end_date IS NULL)"
+        ),
+        CheckConstraint(
+            "value_type <> 'NONE' OR (start_time IS NULL AND end_time IS NULL AND "
+            "earliest_start_time IS NULL AND latest_start_time IS NULL AND "
+            "earliest_end_time IS NULL AND latest_end_time IS NULL AND start_date IS NULL AND "
+            "end_date IS NULL AND earliest_start_date IS NULL AND latest_start_date IS NULL AND "
+            "earliest_end_date IS NULL AND latest_end_date IS NULL)"
+        ),
+    )
+    claim_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    temporal_binding_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    role: Mapped[str] = mapped_column(String(40))
+    scope: Mapped[str] = mapped_column(String(32))
+    value_type: Mapped[str] = mapped_column(String(16))
+    start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    earliest_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    earliest_end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latest_end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    earliest_start_date: Mapped[date | None] = mapped_column(Date)
+    latest_start_date: Mapped[date | None] = mapped_column(Date)
+    earliest_end_date: Mapped[date | None] = mapped_column(Date)
+    latest_end_date: Mapped[date | None] = mapped_column(Date)
+    period_label: Mapped[str | None] = mapped_column(String(64))
+    raw_expression: Mapped[str | None] = mapped_column(Text)
+    expression_key: Mapped[str | None] = mapped_column(String(128))
+    precision: Mapped[str] = mapped_column(String(32))
+    granularity: Mapped[str | None] = mapped_column(String(32))
+    assertion_status: Mapped[str] = mapped_column(String(32))
+    metric_temporal_nature: Mapped[str | None] = mapped_column(String(32))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    timezone: Mapped[str | None] = mapped_column(String(64))
+    calendar_type: Mapped[str | None] = mapped_column(String(32))
+    calendar_id: Mapped[str | None] = mapped_column(String(64))
+    market_session: Mapped[str | None] = mapped_column(String(32))
+    recurrence: Mapped[dict[str, Any] | None] = mapped_column(JSONPayload)
+    normalization_status: Mapped[str] = mapped_column(String(32))
+    normalization_reason: Mapped[str | None] = mapped_column(Text)
+    normalization_version: Mapped[str] = mapped_column(String(64))
+    source_evidence_refs: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    reference_snapshot_id: Mapped[str | None] = mapped_column(String(128))
+    reference_data_version: Mapped[str | None] = mapped_column(String(128))
+    reference_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class TemporalRelationRow(Base):
+    __tablename__ = "claim_temporal_relation"
+    claim_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    temporal_relation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    relation_type: Mapped[str] = mapped_column(String(32))
+    from_binding_id: Mapped[str] = mapped_column(String(128))
+    to_binding_id: Mapped[str] = mapped_column(String(128))
+    lag_value: Mapped[float | None] = mapped_column(Float)
+    lag_unit: Mapped[str | None] = mapped_column(String(32))
+    lag_min: Mapped[float | None] = mapped_column(Float)
+    lag_max: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)
+
+
+class ClaimOccurrenceRow(Base):
+    __tablename__ = "claim_occurrence"
+    __table_args__ = (
+        CheckConstraint("available_from >= ingested_at"),
+        CheckConstraint("available_from >= extraction_completed_at"),
+        CheckConstraint("available_from >= snapshot_committed_at"),
+    )
+    occurrence_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_artifact_id: Mapped[str] = mapped_column(String(128), index=True)
+    transcript_artifact_id: Mapped[str] = mapped_column(String(128), index=True)
+    semantic_segment_id: Mapped[str] = mapped_column(String(64), index=True)
+    assertion_locator_hash: Mapped[str] = mapped_column(String(128))
+    asserted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_availability_quality: Mapped[str] = mapped_column(String(32), default="UNKNOWN")
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    extraction_completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    snapshot_committed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    available_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_support_status: Mapped[str] = mapped_column(String(40), default="SOURCE_LOCATED")
+    source_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    extractor_confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    raw_temporal_expressions: Mapped[list[Any]] = mapped_column(JSONPayload, default=list)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+
+
+class ClaimOccurrenceEvidenceRow(Base):
+    __tablename__ = "claim_occurrence_evidence"
+    __table_args__ = (UniqueConstraint("occurrence_id", "evidence_id", "evidence_role"),)
+    occurrence_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    evidence_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    evidence_role: Mapped[str] = mapped_column(String(32), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AnalysisDocumentRow(Base):
@@ -361,6 +522,7 @@ class ContentSnapshotRow(Base):
     parent_snapshot_id: Mapped[str | None] = mapped_column(String(80), index=True)
     supersedes_snapshot_id: Mapped[str | None] = mapped_column(String(80), index=True)
     producer_manifest: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    lifecycle_artifact_id: Mapped[str | None] = mapped_column(String(128), index=True)
 
 
 class ContentArtifactRow(Base):
@@ -490,6 +652,7 @@ class ContentSnapshotArtifactRow(Base):
     )
     artifact_id: Mapped[str] = mapped_column(ForeignKey("content_artifact.artifact_id"), index=True)
     slot: Mapped[str] = mapped_column(String(40), index=True)
+    artifact_role: Mapped[str | None] = mapped_column(String(40))
 
 
 class SignalOutboxRow(Base):

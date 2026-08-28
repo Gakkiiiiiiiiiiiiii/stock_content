@@ -10,6 +10,7 @@ from stock_content.adapters.postgres.models import (
     ClaimEvidenceRow,
     ClaimVerificationJobRow,
     ContentArtifactRow,
+    ContentSnapshotRow,
     ContentStageCheckpointRow,
     FinancialClaimRow,
     KnowledgeUnitRow,
@@ -21,11 +22,17 @@ from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stage_runner import StageResult, StageRunner
 from stock_content.application.stages import FrameExtractionStage
 from stock_content.domain.artifacts import SourceArtifact
+from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.checkpoint import CheckpointValidationError
 from stock_content.domain.models import KnowledgeUnit
+from stock_content.domain.semantic_context_builder import SemanticContext
 
 
-def _run(tmp_path: Path, frame_hash: str) -> tuple[object, object]:
+def _run(
+    tmp_path: Path,
+    frame_hash: str,
+    transcript: str = "股票600000基本面良好。",
+) -> tuple[object, object]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
     task = application.enqueue(
@@ -33,7 +40,7 @@ def _run(tmp_path: Path, frame_hash: str) -> tuple[object, object]:
         "BV-chain",
         {
             "metadata": {"title": "fixture"},
-            "transcript": "股票600000基本面良好。",
+            "transcript": transcript,
             "offline_fixture": True,
             "frames": [{"frame_id": "frame-1", "timestamp_ms": 100, "image_hash": frame_hash}],
             "ocr_evidence": [{"frame_id": "frame-1", "timestamp_ms": 100, "text": "100"}],
@@ -45,7 +52,7 @@ def _run(tmp_path: Path, frame_hash: str) -> tuple[object, object]:
 
 
 def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
-    application, (_, result) = _run(tmp_path, "frame-a")
+    application, (_, result) = _run(tmp_path, "frame-a", "股票600000营收增长10%。")
     assert result["status"] == "SUCCEEDED"
     repo = application._pipeline._stages[0]._artifact_repository  # noqa: SLF001
     with repo._sessions() as session:  # noqa: SLF001
@@ -55,6 +62,7 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
         jobs = session.scalars(select(ClaimVerificationJobRow)).all()
         claim_members = session.scalars(select(ClaimArtifactMemberRow)).all()
         checkpoints = session.scalars(select(ContentStageCheckpointRow)).all()
+        snapshots = session.scalars(select(ContentSnapshotRow)).all()
     types = {item.artifact_type for item in artifacts}
     assert {
         "source",
@@ -77,6 +85,52 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
     for item in artifacts:
         assert set(item.parent_artifact_ids or ()) <= artifact_ids
     assert {item.stage for item in checkpoints} >= {"resolve", "download", "knowledge", "content_snapshot"}
+    snapshot = snapshots[-1]
+    active = {
+        slot: next(item for item in artifacts if item.artifact_id == artifact_id)
+        for slot, artifact_id in snapshot.artifact_ids.items()
+    }
+    assert active["transcript"].artifact_id in active["semantic_segments"].parent_artifact_ids
+    assert active["semantic_segments"].artifact_id in active["evidence"].parent_artifact_ids
+    assert active["evidence"].artifact_id in active["occurrences"].parent_artifact_ids
+    assert active["occurrences"].artifact_id in active["claims"].parent_artifact_ids
+    assert active["claims"].artifact_id in active["verification"].parent_artifact_ids
+    assert active["verification"].artifact_id in active["lifecycle"].parent_artifact_ids
+    assert active["lifecycle"].artifact_id in active["knowledge"].parent_artifact_ids
+    assert active["knowledge"].artifact_id in active["summary"].parent_artifact_ids
+
+
+def test_non_quant_claim_persists_not_verifiable_result_without_job(tmp_path):
+    application, (_, result) = _run(tmp_path, "frame-non-quant", "行业增长放缓。")
+    assert result["status"] == "SUCCEEDED"
+    claim_repository = application._claim_repository  # noqa: SLF001
+    with claim_repository._sessions() as session:  # noqa: SLF001
+        claims = session.scalars(select(FinancialClaimRow)).all()
+        jobs = session.scalars(select(ClaimVerificationJobRow)).all()
+        from stock_content.adapters.postgres.models import ClaimVerificationResultRow
+
+        results = session.scalars(select(ClaimVerificationResultRow)).all()
+    assert claims
+    assert not jobs
+    assert results and all(item.status == "NOT_VERIFIABLE" for item in results)
+
+
+def test_offline_fixture_ticker_policy_is_adapter_only():
+    extractor = AtomicClaimExtractor()
+    ticker_context = SemanticContext(
+        semantic_segment_id="segment-ticker",
+        start_ms=0,
+        end_ms=1000,
+        transcript_segments=[{"segment_index": 0, "text": "股票600000基本面良好。"}],
+    )
+    opinion_context = SemanticContext(
+        semantic_segment_id="segment-opinion",
+        start_ms=0,
+        end_ms=1000,
+        transcript_segments=[{"segment_index": 0, "text": "行业增长放缓。"}],
+    )
+    assert extractor.extract(ticker_context, offline_fixture=True)[0].claim_type == "FINANCIAL_METRIC"
+    assert extractor.extract(opinion_context, offline_fixture=True)[0].claim_type == "INDUSTRY_RELATION"
 
 
 def test_raw_visual_change_changes_snapshot_with_same_transcript(tmp_path):

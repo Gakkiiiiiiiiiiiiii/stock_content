@@ -17,6 +17,8 @@ PRODUCER_VERSION = "1.0.0"
 SERVICE_VERSION = "1.0.0"
 SIGNAL_SCHEMA_V4 = "content-factor-signal.v4"
 SIGNAL_SCHEMA_V4_MAJOR = 4
+SIGNAL_SCHEMA_V5 = "content-factor-signal.v5"
+SIGNAL_SCHEMA_V5_MAJOR = 5
 
 _DIRECTION_BY_SENTIMENT = {"BULLISH": "LONG", "BEARISH": "SHORT"}
 
@@ -352,6 +354,136 @@ def validate_signal_v4(signal: dict[str, Any]) -> dict[str, Any]:
     return signal
 
 
+def upgrade_signal_v5(item: dict[str, Any]) -> dict[str, Any]:
+    """Build the lineage-only v5 signal projection from a knowledge payload."""
+    attributes = dict(item.get("attributes") or {})
+    snapshot = item.get("content_snapshot_id") or attributes.get("content_snapshot_id")
+    claim_id = item.get("claim_id") or attributes.get("claim_id")
+    occurrence_id = item.get("occurrence_id") or attributes.get("occurrence_id")
+    semantic_segment_id = item.get("semantic_segment_id") or attributes.get("semantic_segment_id")
+    lifecycle_artifact_id = item.get("lifecycle_artifact_id") or attributes.get("lifecycle_artifact_id")
+    if not all((snapshot, claim_id, occurrence_id, semantic_segment_id, lifecycle_artifact_id)):
+        raise ValueError("content-factor-signal.v5 requires complete occurrence and lifecycle lineage")
+    def project_binding(binding: dict[str, Any]) -> dict[str, Any]:
+        """Drop internal precision/reference metadata from the public child."""
+        value_type = str(binding.get("value_type") or "").upper()
+        if value_type == "TIMESTAMP":
+            start = binding.get("start_time") or binding.get("earliest_start_time")
+            end = binding.get("end_time") or binding.get("latest_end_time")
+        elif value_type == "DATE":
+            start = binding.get("start_date") or binding.get("earliest_start_date")
+            end = binding.get("end_date") or binding.get("latest_end_date")
+        else:
+            start = end = None
+        def as_text(value: Any) -> str | None:
+            return value.isoformat() if hasattr(value, "isoformat") else value
+        return {
+            "temporal_binding_id": binding.get("temporal_binding_id"),
+            "role": binding.get("role"),
+            "scope": binding.get("scope"),
+            "period_label": binding.get("period_label"),
+            "start_date": as_text(start),
+            "end_date": as_text(end),
+            "assertion_status": binding.get("assertion_status"),
+        }
+
+    raw_bindings = list(item.get("temporal_bindings") or attributes.get("temporal_bindings") or [])
+    payload = {
+        "signal_id": item.get("signal_id") or "signal-" + hashlib.sha256(
+            f"{snapshot}:{claim_id}:{occurrence_id}".encode("utf-8")
+        ).hexdigest()[:32],
+        "signal_schema_version": SIGNAL_SCHEMA_V5,
+        "claim_id": claim_id,
+        "occurrence_id": occurrence_id,
+        "semantic_segment_id": semantic_segment_id,
+        "asserted_at": item.get("asserted_at") or attributes.get("asserted_at"),
+        "source_available_at": item.get("source_available_at") or attributes.get("source_available_at"),
+        "source_availability_quality": str(
+            item.get("source_availability_quality")
+            or attributes.get("source_availability_quality")
+            or "UNKNOWN"
+        ).upper(),
+        "available_from": item.get("available_from") or attributes.get("available_from"),
+        "temporal_bindings": [project_binding(binding) for binding in raw_bindings],
+        "lifecycle": {
+            "status": item.get("lifecycle_status") or attributes.get("lifecycle_status") or "ACTIVE",
+            "lifecycle_artifact_id": lifecycle_artifact_id,
+        },
+        "content_snapshot_id": snapshot,
+    }
+    return validate_signal_v5(payload)
+
+
+def validate_signal_v5(signal: dict[str, Any]) -> dict[str, Any]:
+    """Strict validator for the non-trading content-factor-signal.v5 contract."""
+    if not isinstance(signal, dict):
+        raise ValueError("v5 signal must be an object")
+    allowed = {
+        "signal_id", "signal_schema_version", "claim_id", "occurrence_id", "semantic_segment_id",
+        "asserted_at", "source_available_at", "source_availability_quality", "available_from",
+        "temporal_bindings", "lifecycle", "content_snapshot_id",
+    }
+    _reject_non_string_keys(signal, "v5 signal")
+    unexpected = sorted(set(signal) - allowed)
+    if unexpected:
+        raise ValueError(f"v5 signal contains unsupported fields: {', '.join(unexpected)}")
+    required = {
+        "signal_id", "signal_schema_version", "claim_id", "occurrence_id", "semantic_segment_id",
+        "asserted_at", "source_available_at", "source_availability_quality", "available_from",
+        "temporal_bindings", "lifecycle", "content_snapshot_id",
+    }
+    missing = sorted(key for key in required if key not in signal or signal[key] is None)
+    # These timestamps are explicitly nullable in the occurrence model.
+    missing = [key for key in missing if key not in {"asserted_at", "source_available_at"}]
+    if missing:
+        raise ValueError(f"v5 signal missing {', '.join(missing)}")
+    if signal.get("signal_schema_version") != SIGNAL_SCHEMA_V5:
+        raise ValueError("unsupported signal schema major")
+    forbidden = {"order_qty", "limit_price", "portfolio_weight", "execute_at"}
+    if forbidden.intersection(signal):
+        raise ValueError("v5 signal cannot contain trading instruction fields")
+    for key in (
+        "signal_id", "claim_id", "occurrence_id", "semantic_segment_id", "available_from", "content_snapshot_id"
+    ):
+        if not isinstance(signal[key], str) or not signal[key]:
+            raise ValueError(f"v5 signal {key} must be a non-empty string")
+    if signal.get("asserted_at") is not None and not isinstance(signal["asserted_at"], str):
+        raise ValueError("v5 signal asserted_at must be a string or null")
+    if signal.get("source_available_at") is not None and not isinstance(signal["source_available_at"], str):
+        raise ValueError("v5 signal source_available_at must be a string or null")
+    _require_enum(
+        signal["source_availability_quality"],
+        {"EXACT", "PUBLISHED_TIME_PROXY", "INGEST_TIME_UPPER_BOUND", "UNKNOWN"},
+        "source_availability_quality",
+    )
+    bindings = signal["temporal_bindings"]
+    if not isinstance(bindings, list):
+        raise ValueError("v5 signal temporal_bindings must be an array")
+    binding_fields = {
+        "temporal_binding_id", "role", "scope", "period_label", "start_date", "end_date", "assertion_status",
+    }
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise ValueError("v5 temporal binding must be an object")
+        _reject_additional_properties(binding, binding_fields, "v5 temporal binding")
+        for key in ("temporal_binding_id", "role", "scope", "assertion_status"):
+            if key not in binding or not isinstance(binding[key], str) or not binding[key]:
+                raise ValueError(f"v5 temporal binding missing {key}")
+        for key in ("period_label", "start_date", "end_date"):
+            if key not in binding:
+                raise ValueError(f"v5 temporal binding missing {key}")
+            if binding[key] is not None and not isinstance(binding[key], str):
+                raise ValueError(f"v5 temporal binding {key} must be a string or null")
+    lifecycle = signal["lifecycle"]
+    if not isinstance(lifecycle, dict):
+        raise ValueError("v5 lifecycle must be an object")
+    _reject_additional_properties(lifecycle, {"status", "lifecycle_artifact_id"}, "v5 lifecycle")
+    for key in ("status", "lifecycle_artifact_id"):
+        if not isinstance(lifecycle.get(key), str) or not lifecycle[key]:
+            raise ValueError(f"v5 lifecycle missing {key}")
+    return signal
+
+
 def _reject_additional_properties(value: dict[str, Any], allowed: set[str], object_name: str) -> None:
     _reject_non_string_keys(value, object_name)
     unexpected = sorted(set(value) - allowed)
@@ -423,11 +555,15 @@ __all__ = [
     "SIGNAL_SCHEMA_VERSION",
     "SIGNAL_SCHEMA_V4",
     "SIGNAL_SCHEMA_V4_MAJOR",
+    "SIGNAL_SCHEMA_V5",
+    "SIGNAL_SCHEMA_V5_MAJOR",
     "accepts_schema_version",
     "is_normal_v3_signal",
     "signal_id_v4",
     "upgrade_signal_v4",
     "validate_signal_v4",
+    "upgrade_signal_v5",
+    "validate_signal_v5",
     "signal_major_version",
     "upgrade_signal_v3",
 ]

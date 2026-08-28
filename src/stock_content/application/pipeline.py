@@ -10,6 +10,42 @@ from typing import Any, Protocol
 from stock_content.domain.artifacts import ArtifactRegistry
 from stock_content.domain.checkpoint import CheckpointRecord, validate_resume
 
+CORE_METRIC_KEYS = (
+    "semantic_segments_per_video",
+    "semantic_segment_duration_p50",
+    "semantic_segment_duration_p95",
+    "segmentation_repair_rate",
+    "segmentation_failure_rate",
+    "claims_per_semantic_segment",
+    "zero_claim_segment_ratio",
+    "claim_grounding_reject_rate",
+    "temporal_expression_grounding_reject_rate",
+    "temporal_binding_count",
+    "temporal_normalization_success_rate",
+    "temporal_normalization_partial_rate",
+    "temporal_normalization_unresolved_rate",
+    "temporal_partial_rate",
+    "temporal_unresolved_rate",
+    "temporal_role_distribution",
+    "unresolved_expression_collision_rate",
+    "forecast_target_missing_rate",
+    "fiscal_period_unresolved_rate",
+    "market_session_unresolved_rate",
+    "metric_temporal_nature_unknown_rate",
+    "planned_vs_actual_ratio",
+    "occurrences_per_claim",
+    "lifecycle_transition_count",
+    "correction_count",
+    "lifecycle_correction_count",
+    "dependency_availability_delay_ms",
+    "cross_source_claim_ratio",
+    "pit_query_mismatch_count",
+)
+
+
+def _default_metrics() -> dict[str, float]:
+    return {key: 0.0 for key in CORE_METRIC_KEYS}
+
 
 @dataclass
 class RuntimeWorkspace:
@@ -18,7 +54,7 @@ class RuntimeWorkspace:
     work_dir: Path | None = None
     video_path: Path | None = None
     audio_path: Path | None = None
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=_default_metrics)
 
 
 @dataclass
@@ -33,6 +69,14 @@ class PipelineState:
     ocr_evidence: list[dict[str, Any]] = field(default_factory=list)
     multimodal_context: dict[str, Any] = field(default_factory=dict)
     temporal_windows: list[dict[str, Any]] = field(default_factory=list)
+    semantic_segments: list[Any] = field(default_factory=list)
+    semantic_contexts: list[Any] = field(default_factory=list)
+    claim_drafts: list[Any] = field(default_factory=list)
+    grounded_occurrences: list[Any] = field(default_factory=list)
+    temporal_bindings: list[Any] = field(default_factory=list)
+    temporal_bindings_by_draft: dict[int, list[Any]] = field(default_factory=dict)
+    occurrences: list[Any] = field(default_factory=list)
+    lifecycle_events: list[Any] = field(default_factory=list)
     chapters: list[Any] = field(default_factory=list)
     video: Any = None
     knowledge: list[Any] = field(default_factory=list)
@@ -164,7 +208,18 @@ class ContentPipeline:
                 artifact.artifact_id: artifact for artifact in context.artifacts.artifacts()
             }
             artifacts_by_id.update(context.restored_artifacts)
-            completed = set(validate_resume(context.checkpoints, artifacts_by_id))
+            validated = validate_resume(context.checkpoints, artifacts_by_id)
+            # A checkpoint from an older semantic-major pipeline may contain
+            # a later legacy stage (for example ``knowledge``) but no record
+            # for the newly inserted semantic stages.  Only the faithful
+            # contiguous prefix of the current stage graph is skippable;
+            # otherwise a later checkpoint could bypass required new work.
+            completed = set()
+            for stage in self._stages:
+                if stage.name in validated:
+                    completed.add(stage.name)
+                else:
+                    break
         for index, stage in enumerate(self._stages):
             context.current_stage = stage.name
             if stage.name in completed:

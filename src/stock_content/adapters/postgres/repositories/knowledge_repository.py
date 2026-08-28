@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import sessionmaker
 
-from stock_content.adapters.postgres.models import KnowledgeCrossVideoRow, KnowledgeEvidenceRow, KnowledgeUnitRow
+from stock_content.adapters.postgres.models import (
+    KnowledgeCrossVideoRow,
+    KnowledgeEvidenceRow,
+    KnowledgeUnitRow,
+    LifecycleEventLedgerRow,
+)
 from stock_content.domain.cross_video_corroboration import CrossVideoCorroborationService
 from stock_content.domain.knowledge_enums import support_rank
 from stock_content.domain.models import KnowledgeUnit
@@ -40,6 +45,9 @@ class PostgresKnowledgeRepository:
             "as_of": row.as_of.isoformat(),
             "as_of_time": row.as_of.isoformat(),
             "available_from": row.available_from.isoformat(),
+            # Preserve the complete temporal/occurrence projection.  Search
+            # callers use PostgreSQL's hydrated payload as the PIT authority.
+            "attributes": dict(row.attributes or {}),
             "valid_from": row.valid_from.isoformat() if row.valid_from else None,
             "valid_to": row.valid_to.isoformat() if row.valid_to else None,
             "provenance": dict(row.provenance or {}),
@@ -52,6 +60,109 @@ class PostgresKnowledgeRepository:
             if value:
                 query = query.where(getattr(KnowledgeUnitRow, field) == value)
         return query
+
+    @staticmethod
+    def _pit_matches(payload: dict, filters: dict) -> bool:
+        """Apply PIT and temporal predicates to an authoritative SQL payload."""
+        mode = str(filters.get("pit_mode") or filters.get("availability_mode") or "SYSTEM").upper()
+        if mode not in {"SYSTEM", "PUBLIC_STRICT", "PUBLIC_ALLOW_PROXY"}:
+            raise ValueError(f"unknown pit mode: {mode}")
+        as_of = filters.get("availability_as_of")
+        attributes = dict(payload.get("attributes") or {})
+        quality = str(attributes.get("source_availability_quality") or "UNKNOWN").upper()
+        if mode == "PUBLIC_STRICT" and (quality != "EXACT" or not attributes.get("source_available_at")):
+            return False
+        if mode == "PUBLIC_ALLOW_PROXY" and quality not in {
+            "EXACT", "PUBLISHED_TIME_PROXY", "INGEST_TIME_UPPER_BOUND"
+        }:
+            return False
+        if as_of is not None:
+            as_of_text = _iso(as_of)
+            if _iso(payload.get("available_from")) > as_of_text:
+                return False
+            source_available = attributes.get("source_available_at")
+            if mode == "PUBLIC_STRICT":
+                if not source_available or _iso(source_available) > as_of_text:
+                    return False
+            elif mode == "PUBLIC_ALLOW_PROXY":
+                if not source_available or _iso(source_available) > as_of_text:
+                    return False
+
+        bindings = list(attributes.get("temporal_bindings") or [])
+        role = filters.get("temporal_role")
+        target_start = filters.get("target_start")
+        target_end = filters.get("target_end")
+        if role or target_start or target_end:
+            candidates = [item for item in bindings if not role or str(item.get("role") or "") == str(role)]
+            if target_start or target_end:
+                candidates = [item for item in candidates if _binding_overlaps(item, target_start, target_end)]
+            if not candidates:
+                return False
+        segment_id = filters.get("semantic_segment_id")
+        if segment_id and str(attributes.get("semantic_segment_id") or "") != str(segment_id):
+            return False
+
+        business_as_of = filters.get("business_as_of")
+        knowledge_as_of = filters.get("knowledge_as_of")
+        if business_as_of is not None or knowledge_as_of is not None:
+            business = _iso(business_as_of) if business_as_of else "9999-12-31T23:59:59+00:00"
+            knowledge = _iso(knowledge_as_of) if knowledge_as_of else "9999-12-31T23:59:59+00:00"
+            events = list(attributes.get("lifecycle_events") or [])
+            if events:
+                visible = [
+                    item for item in events
+                    if _iso(item.get("effective_at")) <= business
+                    and _iso(item.get("recorded_at")) <= knowledge
+                ]
+                if not visible:
+                    return False
+                state = max(visible, key=lambda item: (
+                    _iso(item.get("effective_at")), _iso(item.get("recorded_at")),
+                    str(item.get("lifecycle_event_id") or ""),
+                )).get("to_status")
+                if state not in {None, "ACTIVE"}:
+                    return False
+            elif payload.get("lifecycle_status") not in {None, "ACTIVE"}:
+                return False
+        return True
+
+    @staticmethod
+    def _lifecycle_matches(session, payload: dict, filters: dict) -> bool:
+        """Resolve bitemporal lifecycle state from the authoritative ledger."""
+        business = filters.get("business_as_of") or datetime.max.replace(tzinfo=UTC)
+        knowledge = filters.get("knowledge_as_of") or datetime.max.replace(tzinfo=UTC)
+        attrs = dict(payload.get("attributes") or {})
+        target_specs = []
+        if attrs.get("claim_id"):
+            target_specs.append(("CLAIM", str(attrs["claim_id"])))
+        if attrs.get("occurrence_id"):
+            target_specs.append(("OCCURRENCE", str(attrs["occurrence_id"])))
+        if not target_specs:
+            target_specs.append(("CLAIM", str(payload.get("knowledge_uid") or "")))
+        for target_type, target_id in target_specs:
+            rows = session.scalars(
+                select(LifecycleEventLedgerRow).where(
+                    LifecycleEventLedgerRow.target_type == target_type,
+                    LifecycleEventLedgerRow.target_id == target_id,
+                    LifecycleEventLedgerRow.effective_at <= business,
+                    LifecycleEventLedgerRow.recorded_at <= knowledge,
+                )
+            ).all()
+            if not rows:
+                if (
+                    attrs.get("claim_id")
+                    or attrs.get("occurrence_id")
+                    or filters.get("business_as_of") is not None
+                    or filters.get("knowledge_as_of") is not None
+                ):
+                    return False
+                if payload.get("lifecycle_status") != "ACTIVE":
+                    return False
+                continue
+            latest = max(rows, key=lambda row: (row.effective_at, row.recorded_at, row.lifecycle_event_id))
+            if latest.to_status != "ACTIVE":
+                return False
+        return True
 
     def replace_for_video(self, video_id: str, units: list[KnowledgeUnit]) -> None:
         with self._sessions.begin() as session:
@@ -148,6 +259,46 @@ class PostgresKnowledgeRepository:
             ).all()
             return [self._payload(row) for row in rows]
 
+    def list_for_video_as_of(
+        self,
+        video_id: str,
+        as_of: datetime,
+        limit: int = 100,
+        *,
+        availability_mode: str = "SYSTEM",
+        temporal_role: str | None = None,
+        semantic_segment_id: str | None = None,
+    ) -> list[dict]:
+        """PIT read helper; never reads rows newer than the requested clock."""
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(KnowledgeUnitRow)
+                .where(KnowledgeUnitRow.video_id == video_id, KnowledgeUnitRow.available_from <= as_of)
+                .order_by(KnowledgeUnitRow.available_from, KnowledgeUnitRow.knowledge_uid)
+            ).all()
+            payloads = [self._payload(row) for row in rows]
+        mode = str(availability_mode).upper()
+        if mode not in {"SYSTEM", "PUBLIC_STRICT", "PUBLIC_ALLOW_PROXY"}:
+            raise ValueError(f"unknown availability mode: {availability_mode}")
+        result = []
+        for payload in payloads:
+            if not self._pit_matches(payload, {
+                "availability_as_of": as_of,
+                "pit_mode": mode,
+                "temporal_role": temporal_role,
+                "semantic_segment_id": semantic_segment_id,
+            }):
+                continue
+            quality = str((payload.get("attributes") or {}).get("source_availability_quality") or "UNKNOWN").upper()
+            payload["source_availability_quality"] = quality
+            result.append(payload)
+        # PUBLIC/semantic predicates are evaluated against the authoritative
+        # payload after the SQL candidate scan.  Applying ``limit`` in SQL
+        # first can hide a later eligible row behind an earlier rejected one.
+        return result[:limit]
+
+    list_pit = list_for_video_as_of
+
     def search(self, query: str, filters: dict, limit: int) -> list[dict]:
         with self._sessions() as session:
             statement = select(KnowledgeUnitRow).where(
@@ -158,8 +309,26 @@ class PostgresKnowledgeRepository:
                 )
             )
             statement = self._apply_filters(statement, filters)
-            rows = session.scalars(statement.order_by(KnowledgeUnitRow.confidence.desc()).limit(limit)).all()
-            return [self._payload(row) for row in rows]
+            # Apply the cheap relational cutoff before limiting.  When any
+            # post-filter is active, fetch the complete SQL candidate set so
+            # rejected high-confidence rows cannot hide later eligible rows.
+            cutoff = filters.get("availability_as_of")
+            if cutoff is not None:
+                statement = statement.where(KnowledgeUnitRow.available_from <= cutoff)
+            post_filter = any(
+                key in filters for key in (
+                    "pit_mode", "availability_mode", "availability_as_of", "temporal_role",
+                    "target_start", "target_end", "semantic_segment_id", "business_as_of", "knowledge_as_of",
+                )
+            )
+            query = statement.order_by(KnowledgeUnitRow.confidence.desc())
+            rows = session.scalars(query if post_filter else query.limit(limit)).all()
+            filtered = [
+                payload for row in rows
+                if self._pit_matches(payload := self._payload(row), filters)
+                and self._lifecycle_matches(session, payload, filters)
+            ]
+            return filtered[:limit]
 
     def hydrate(self, knowledge_uids: list[str], filters: dict) -> list[dict]:
         if not knowledge_uids:
@@ -169,7 +338,12 @@ class PostgresKnowledgeRepository:
             statement = self._apply_filters(statement, filters)
             rows = session.scalars(statement).all()
             by_uid = {row.knowledge_uid: self._payload(row) for row in rows}
-            return [by_uid[uid] for uid in knowledge_uids if uid in by_uid]
+            return [
+                by_uid[uid] for uid in knowledge_uids
+                if uid in by_uid
+                and self._pit_matches(by_uid[uid], filters)
+                and self._lifecycle_matches(session, by_uid[uid], filters)
+            ]
 
     def factor_signals(
         self,
@@ -245,7 +419,129 @@ class PostgresKnowledgeRepository:
             # §7：content-factor-signal.v3 —— 正式版本化的金融研究输入。
             return [upgrade_signal_v3(item) for item in items]
 
+    def factor_signals_v5(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        minimum_support_status: str,
+        *,
+        availability_as_of: datetime | None = None,
+        pit_mode: str | None = None,
+    ) -> list[dict]:
+        """Build lineage-only v5 signals from SQL rows after PIT filtering."""
+        from stock_content.domain.signal_contract import upgrade_signal_v5
+
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(KnowledgeUnitRow)
+                .where(
+                    KnowledgeUnitRow.available_from >= start,
+                    KnowledgeUnitRow.available_from <= end,
+                    KnowledgeUnitRow.review_status != "REJECTED",
+                )
+                .order_by(KnowledgeUnitRow.available_from, KnowledgeUnitRow.knowledge_uid)
+            ).all()
+            minimum = support_rank(minimum_support_status)
+            requested = {_ticker_code(symbol) for symbol in symbols if _ticker_code(symbol)}
+            items: list[dict] = []
+            for row in rows:
+                if support_rank(row.support_status) < minimum:
+                    continue
+                if requested and _ticker_code(row.ticker or row.subject_key or "") not in requested:
+                    continue
+                payload = self._payload(row)
+                filters = {
+                    "availability_as_of": availability_as_of,
+                    "pit_mode": pit_mode or "SYSTEM",
+                }
+                if not self._pit_matches(payload, filters):
+                    continue
+                if not self._lifecycle_matches(session, payload, filters):
+                    continue
+                try:
+                    items.append(upgrade_signal_v5(payload))
+                except ValueError:
+                    # A legacy knowledge row has no complete v5 lineage and
+                    # must not be emitted as a misleading signal.
+                    continue
+            return items
+
 
 def _ticker_code(value: str) -> str | None:
     match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value))
     return match.group(1) if match else None
+
+
+def _iso(value: object) -> str:
+    if value is None:
+        return ""
+    text = value.isoformat() if isinstance(value, datetime) else str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _iso_date(value: object) -> str:
+    text = _iso(value)
+    return text[:10]
+
+
+def _binding_overlaps(binding: dict, target_start: object, target_end: object) -> bool:
+    """Compare DATE/TIMESTAMP binding intervals, failing closed if unknown."""
+    value_type = str(binding.get("value_type") or "").upper()
+    if value_type not in {"DATE", "TIMESTAMP"}:
+        # Some persisted projections omit value_type.  Infer it only from a
+        # concrete endpoint; an unresolved binding must never match a range.
+        if binding.get("start_time") or binding.get("end_time"):
+            value_type = "TIMESTAMP"
+        elif binding.get("start_date") or binding.get("end_date"):
+            value_type = "DATE"
+        else:
+            return False
+    if value_type == "DATE":
+        def parse(value):
+            return _date_value(value)
+
+        lower = binding.get("start_date") or binding.get("earliest_start_date")
+        upper = binding.get("end_date") or binding.get("latest_end_date")
+    else:
+        def parse(value):
+            return _timestamp_value(value)
+
+        lower = binding.get("start_time") or binding.get("earliest_start_time")
+        upper = binding.get("end_time") or binding.get("latest_end_time")
+    try:
+        lower = parse(lower) if lower is not None else None
+        upper = parse(upper) if upper is not None else None
+        requested_lower = parse(target_start) if target_start is not None else None
+        requested_upper = parse(target_end) if target_end is not None else None
+    except (TypeError, ValueError):
+        return False
+    # No endpoints is UNRESOLVED/TIMELESS and cannot satisfy a target range.
+    if lower is None and upper is None:
+        return False
+    return (requested_lower is None or upper is None or upper >= requested_lower) and (
+        requested_upper is None or lower is None or lower <= requested_upper
+    )
+
+
+def _date_value(value: object):
+    if value is None:
+        return None
+    text = value.isoformat() if hasattr(value, "isoformat") else str(value)
+    return datetime.fromisoformat(text[:10]).date()
+
+
+def _timestamp_value(value: object):
+    if value is None:
+        return None
+    text = value.isoformat() if hasattr(value, "isoformat") else str(value).replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)

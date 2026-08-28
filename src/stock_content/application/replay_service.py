@@ -46,19 +46,23 @@ class ReplayService:
         {
             "idempotency_key", "trace_id", "decision_id", "replay_raw_storage_uri",
             "replay_snapshot_kind", "replay_parent_snapshot_id", "replay_supersedes_snapshot_id",
-            "replay_pipeline_version",
+            "replay_pipeline_version", "replay_lifecycle_timestamp",
         }
     )
 
     def __init__(self, snapshots: SnapshotService, *, artifact_repository: Any | None = None,
                  signal_outbox: Any | None = None, task_repository: Any | None = None,
-                 pipeline: Any | None = None, claim_repository: Any | None = None) -> None:
+                 pipeline: Any | None = None, claim_repository: Any | None = None,
+                 occurrence_repository: Any | None = None,
+                 lifecycle_repository: Any | None = None) -> None:
         self._snapshots = snapshots
         self._artifacts = artifact_repository
         self._signal_outbox = signal_outbox
         self._tasks = task_repository
         self._pipeline = pipeline
         self._claims = claim_repository
+        self._occurrences = occurrence_repository
+        self._lifecycle = lifecycle_repository
 
     def replay(self, content_snapshot_id: str, *, mode: str | None = None,
                pipeline_version: str | None = None,
@@ -212,9 +216,13 @@ class ReplayService:
                                                f"{artifact.artifact_id}.{field} references missing {reference}",
                                                artifact_id=artifact.artifact_id, reference_id=reference)
 
-        evidence_artifact = by_type.get("evidence")
-        claim_artifact = by_type.get("claims")
-        verification_artifact = by_type.get("verification")
+        # A replay can legitimately load superseded artifacts through a
+        # parent edge (for example an early empty evidence artifact).  The
+        # snapshot slot, not dict iteration order or artifact type alone, is
+        # authoritative for the active chain.
+        evidence_artifact = loaded.get(str(mapping.get("evidence") or "")) or by_type.get("evidence")
+        claim_artifact = loaded.get(str(mapping.get("claims") or "")) or by_type.get("claims")
+        verification_artifact = loaded.get(str(mapping.get("verification") or "")) or by_type.get("verification")
         evidence_ids = {str(getattr(item, "evidence_id", ""))
                         for item in (getattr(evidence_artifact, "evidences", ()) or ())}
         loaded_evidence_parents = {
@@ -251,6 +259,207 @@ class ReplayService:
                     if str(evidence_id) not in evidence_ids:
                         raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
                                                    f"claim references missing evidence {evidence_id}")
+
+        # Occurrence and lifecycle artifacts contain immutable row IDs.  A
+        # replay must resolve exactly those IDs; reading a latest projection
+        # would allow history to change underneath an old snapshot.
+        occurrence_artifact = loaded.get(str(mapping.get("occurrences") or ""))
+        occurrence_ids = tuple(getattr(occurrence_artifact, "occurrence_ids", ()) or ())
+        # Occurrence rows are bitemporal, immutable records.  Their artifact
+        # stores only row IDs, so the active snapshot slots are the authority
+        # for the artifact set against which every row reference is checked.
+        # A row that happens to exist in the database must never make a
+        # historical snapshot appear complete when the row's source chain is
+        # outside that snapshot.
+        active_source_id = str(mapping.get("source") or "")
+        active_transcript_id = str(mapping.get("transcript") or "")
+        active_semantic_id = str(mapping.get("semantic_segments") or "")
+        active_evidence_id = str(mapping.get("evidence") or "")
+        active_claim_id = str(mapping.get("claims") or "")
+        if occurrence_ids:
+            required_slots = {
+                "source": active_source_id,
+                "transcript": active_transcript_id,
+                "semantic_segments": active_semantic_id,
+                "evidence": active_evidence_id,
+                "claims": active_claim_id,
+            }
+            missing_slots = [slot for slot, artifact_id in required_slots.items() if not artifact_id]
+            if missing_slots:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_MISSING",
+                    "occurrence closure is missing active snapshot artifact slots",
+                    missing_slots=missing_slots,
+                )
+            active_artifacts = {
+                slot: loaded.get(artifact_id)
+                for slot, artifact_id in required_slots.items()
+            }
+            missing_artifacts = [slot for slot, artifact in active_artifacts.items() if artifact is None]
+            if missing_artifacts:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_MISSING",
+                    "occurrence closure is missing active snapshot artifacts",
+                    missing_slots=missing_artifacts,
+                )
+            expected_types = {
+                "source": "source",
+                "transcript": "transcript",
+                "semantic_segments": "semantic_segments",
+                "evidence": "evidence",
+                "claims": "claims",
+            }
+            for slot, expected_type in expected_types.items():
+                actual_type = str(getattr(active_artifacts[slot], "artifact_type", ""))
+                if actual_type != expected_type:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"snapshot {slot} slot points to {actual_type or 'unknown'} artifact",
+                        artifact_id=required_slots[slot],
+                        expected_type=expected_type,
+                    )
+            semantic_transcript_id = str(
+                getattr(active_artifacts["semantic_segments"], "transcript_artifact_id", "")
+            )
+            if semantic_transcript_id != active_transcript_id:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "semantic segment artifact does not belong to snapshot transcript",
+                )
+            if str(getattr(active_artifacts["evidence"], "transcript_artifact_id", "")) not in {
+                "", active_transcript_id
+            }:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "evidence artifact does not belong to snapshot transcript",
+                )
+            occurrence_semantic_id = str(
+                getattr(occurrence_artifact, "semantic_segment_artifact_id", "") or ""
+            )
+            if occurrence_semantic_id and occurrence_semantic_id != active_semantic_id:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "occurrence artifact references a semantic artifact outside the snapshot",
+                    artifact_id=occurrence_semantic_id,
+                )
+            occurrence_evidence_id = str(
+                getattr(occurrence_artifact, "evidence_artifact_id", "") or ""
+            )
+            if occurrence_evidence_id and occurrence_evidence_id != active_evidence_id:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "occurrence artifact references an evidence artifact outside the snapshot",
+                    artifact_id=occurrence_evidence_id,
+                )
+        semantic_segment_ids = {
+            str(getattr(item, "semantic_segment_id", None) or
+                (item.get("semantic_segment_id") if isinstance(item, dict) else ""))
+            for item in (getattr(loaded.get(active_semantic_id), "segments", ()) or ())
+        }
+        active_evidence_ids = {
+            str(getattr(item, "evidence_id", None) or
+                (item.get("evidence_id") if isinstance(item, dict) else ""))
+            for item in (getattr(loaded.get(active_evidence_id), "evidences", ()) or ())
+        }
+        if occurrence_ids and self._occurrences is None:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_MISSING",
+                "occurrence repository is unavailable for snapshot closure",
+            )
+        occurrence_rows = {}
+        for occurrence_id in occurrence_ids:
+            occurrence = self._occurrences.get(str(occurrence_id))
+            if occurrence is None:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_MISSING",
+                    f"occurrence row {occurrence_id} is missing",
+                )
+            if str(getattr(occurrence, "occurrence_id", "")) != str(occurrence_id):
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    f"occurrence row id does not match artifact: {occurrence_id}",
+                )
+            occurrence_claim_id = str(getattr(occurrence, "claim_id", ""))
+            if occurrence_claim_id not in claim_ids:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    f"occurrence {occurrence_id} references a claim outside the snapshot",
+                )
+            if str(getattr(occurrence, "source_artifact_id", "")) != active_source_id:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    f"occurrence {occurrence_id} references a source outside the snapshot",
+                )
+            if str(getattr(occurrence, "transcript_artifact_id", "")) != active_transcript_id:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    f"occurrence {occurrence_id} references a transcript outside the snapshot",
+                )
+            semantic_segment_id = str(getattr(occurrence, "semantic_segment_id", ""))
+            if semantic_segment_id not in semantic_segment_ids:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    f"occurrence {occurrence_id} references a semantic segment outside the snapshot",
+                )
+            for role, refs in (
+                ("primary", getattr(occurrence, "evidence_refs", ()) or ()),
+                ("condition", getattr(occurrence, "condition_evidence_refs", ()) or ()),
+                ("invalidation", getattr(occurrence, "invalidation_evidence_refs", ()) or ()),
+                ("temporal", getattr(occurrence, "temporal_evidence_refs", ()) or ()),
+            ):
+                outside = sorted({str(ref) for ref in refs} - active_evidence_ids)
+                if outside:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"occurrence {occurrence_id} {role} evidence is outside the snapshot",
+                        evidence_ids=outside,
+                    )
+            occurrence_rows[str(occurrence_id)] = occurrence
+
+        lifecycle_artifact = loaded.get(str(mapping.get("lifecycle") or ""))
+        lifecycle_ids = (
+            tuple(getattr(lifecycle_artifact, "claim_lifecycle_event_ids", ()) or ())
+            + tuple(getattr(lifecycle_artifact, "occurrence_lifecycle_event_ids", ()) or ())
+        )
+        if lifecycle_ids and self._lifecycle is None:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_MISSING",
+                "lifecycle repository is unavailable for snapshot closure",
+            )
+        lifecycle_groups = (
+            ("CLAIM", tuple(getattr(lifecycle_artifact, "claim_lifecycle_event_ids", ()) or ())),
+            ("OCCURRENCE", tuple(getattr(lifecycle_artifact, "occurrence_lifecycle_event_ids", ()) or ())),
+        )
+        for expected_target_type, event_ids in lifecycle_groups:
+            for event_id in event_ids:
+                event = self._lifecycle.get(str(event_id))
+                if event is None:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_MISSING",
+                        f"lifecycle event row {event_id} is missing",
+                    )
+                if str(getattr(event, "lifecycle_event_id", "")) != str(event_id):
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"lifecycle event id does not match artifact: {event_id}",
+                    )
+                target_id = str(getattr(event, "target_id", ""))
+                target_type = getattr(
+                    getattr(event, "target_type", None), "value", getattr(event, "target_type", "")
+                )
+                if str(target_type) != expected_target_type:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"lifecycle event {event_id} target_type does not match its artifact membership",
+                        expected_target_type=expected_target_type,
+                        actual_target_type=str(target_type),
+                    )
+                valid_target_ids = claim_ids if expected_target_type == "CLAIM" else set(occurrence_rows)
+                if not target_id or target_id not in valid_target_ids:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"lifecycle event {event_id} targets an object outside the snapshot",
+                    )
         if verification_artifact is not None:
             for result in getattr(verification_artifact, "results", ()) or ():
                 claim_id = str(getattr(result, "claim_id", None) or
@@ -321,6 +530,10 @@ class ReplayService:
                         options["available_from"] = (
                             timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
                         )
+                        # Lifecycle projection has a deterministic transcript
+                        # boundary clock; do not let this compatibility claim
+                        # timestamp alter replay identity.
+                        options["replay_lifecycle_timestamp"] = "derive_transcript_boundary"
             uri = str(getattr(source, "raw_storage_uri", "") or "")
             if uri and not uri.startswith("fixture://"):
                 options["replay_raw_storage_uri"] = uri

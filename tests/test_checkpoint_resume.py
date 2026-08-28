@@ -129,6 +129,10 @@ def test_production_pipeline_stages_are_stage_runners(tmp_path):
     for stage in stages:
         assert isinstance(stage, StageRunner), f"{getattr(stage, 'name', stage)} 未经 StageRunner 包装"
         assert stage.stage_version == STAGE_VERSIONS[stage.name]
+    stage_names = [stage.name for stage in stages]
+    assert stage_names.index("verification") < stage_names.index("financial_enrichment") < stage_names.index(
+        "lifecycle_projection"
+    )
     # 稳定常量：两次构建版本一致。
     second = build_application(f"sqlite:///{tmp_path / 'content2.db'}", enable_qdrant=False)
     assert [s.stage_version for s in second._pipeline._stages] == [s.stage_version for s in stages]  # noqa: SLF001
@@ -154,8 +158,33 @@ def test_production_run_writes_checkpoint_v2_payload(tmp_path):
     task = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()
     assert task["status"] == "SUCCEEDED"
     checkpoint = task["checkpoint"]
+    from stock_content.api.dependencies import STAGE_VERSIONS
+
     for stage_name in ("resolve", "asr", "knowledge", "summary", "content_snapshot", "persist"):
         record = checkpoint[stage_name]["checkpoint"]
         assert record["schema_version"] == "checkpoint.v2"
         assert record["status"] == "SUCCEEDED"
-        assert record["stage_version"] == "1.0.0"
+        assert record["stage_version"] == STAGE_VERSIONS[stage_name]
+
+
+def test_resume_cannot_skip_new_semantic_major_stages():
+    """Later legacy checkpoints are not a contiguous prefix of the new graph."""
+    class SemanticStage(KnowledgeStage):
+        name = "semantic_segmentation"
+
+    source = SourceStage()
+    knowledge = KnowledgeStage()
+    semantic = SemanticStage()
+    pipeline = ContentPipeline([
+        StageRunner(source),
+        StageRunner(semantic),
+        StageRunner(knowledge),
+    ])
+    context = PipelineContext(task_id="major-boundary", source={"type": "fixture", "ref": "x"})
+    context.checkpoints = [
+        build_checkpoint(stage="source", stage_version="1.0.0", output_artifacts=[]),
+        build_checkpoint(stage="knowledge", stage_version="final.1.0", output_artifacts=[]),
+    ]
+    pipeline.process(context, resume=True)
+    assert semantic.runs == 1
+    assert knowledge.runs == 1

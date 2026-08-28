@@ -14,7 +14,7 @@ from stock_content.domain.claims import FinancialClaim
 
 SERVICE_NAME = "stock_content"
 SERVICE_VERSION = "1.0.0"
-CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3", "content-factor-signal.v4"]
+CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3", "content-factor-signal.v4", "content-factor-signal.v5"]
 
 
 class IngestRequest(BaseModel):
@@ -29,6 +29,14 @@ class KnowledgeSearchRequest(BaseModel):
     filters: dict = Field(default_factory=dict)
     limit: int = Field(default=20, ge=1, le=100)
     intent: str | None = None
+    availability_as_of: datetime | None = None
+    target_start: str | None = None
+    target_end: str | None = None
+    temporal_role: str | None = None
+    semantic_segment_id: str | None = None
+    business_as_of: datetime | None = None
+    knowledge_as_of: datetime | None = None
+    pit_mode: str | None = None
 
 
 class ContentSignalRequest(BaseModel):
@@ -36,6 +44,8 @@ class ContentSignalRequest(BaseModel):
     start: datetime
     end: datetime
     minimum_support_status: str = "SOURCE_SUPPORTED"
+    availability_as_of: datetime | None = None
+    pit_mode: str | None = None
 
 
 class ClaimRequest(BaseModel):
@@ -179,6 +189,46 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "video_id": video_id, "items": items}
 
+    # Register the static search route before /knowledge/{knowledge_uid};
+    # otherwise FastAPI treats the literal "search" as a knowledge id.
+    @app.get("/api/v1/knowledge/search")
+    def search_knowledge_get(
+        query: str,
+        availability_as_of: datetime | None = None,
+        target_start: str | None = None,
+        target_end: str | None = None,
+        temporal_role: str | None = None,
+        semantic_segment_id: str | None = None,
+        business_as_of: datetime | None = None,
+        knowledge_as_of: datetime | None = None,
+        pit_mode: str | None = None,
+        limit: int = 20,
+    ) -> dict:
+        try:
+            items = application.search_knowledge(
+                query, {}, max(1, min(limit, 100)),
+                availability_as_of=availability_as_of,
+                target_start=target_start,
+                target_end=target_end,
+                temporal_role=temporal_role,
+                semantic_segment_id=semantic_segment_id,
+                business_as_of=business_as_of,
+                knowledge_as_of=knowledge_as_of,
+                pit_mode=pit_mode,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "contract_version": "content.v1", "items": items,
+            "limit": max(1, min(limit, 100)), "intent": "research",
+            "filters": {
+                "availability_as_of": availability_as_of, "target_start": target_start,
+                "target_end": target_end, "temporal_role": temporal_role,
+                "semantic_segment_id": semantic_segment_id, "business_as_of": business_as_of,
+                "knowledge_as_of": knowledge_as_of, "pit_mode": pit_mode,
+            },
+        }
+
     @app.get("/api/v1/knowledge/{knowledge_uid}")
     def get_knowledge(knowledge_uid: str) -> dict:
         payload = application.get_knowledge(knowledge_uid)
@@ -188,13 +238,31 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
 
     @app.post("/api/v1/knowledge/search")
     def search_knowledge(request: KnowledgeSearchRequest) -> dict:
-        items = application.search_knowledge(request.query, request.filters, request.limit)
+        effective_filters = {
+            **dict(request.filters or {}),
+            **{
+                key: value for key, value in {
+                    "availability_as_of": request.availability_as_of,
+                    "target_start": request.target_start,
+                    "target_end": request.target_end,
+                    "temporal_role": request.temporal_role,
+                    "semantic_segment_id": request.semantic_segment_id,
+                    "business_as_of": request.business_as_of,
+                    "knowledge_as_of": request.knowledge_as_of,
+                    "pit_mode": request.pit_mode,
+                }.items() if value is not None
+            },
+        }
+        try:
+            items = application.search_knowledge(request.query, effective_filters, request.limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "contract_version": "content.v1",
             "items": items,
             "limit": request.limit,
             "intent": request.intent or "research",
-            "filters": request.filters,
+            "filters": effective_filters,
         }
 
     @app.get("/api/v1/videos/{video_id}/snapshots")
@@ -358,6 +426,23 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             "contract_version": "content-factor-signal.v4",
             "items": application.factor_signals_v4(request.symbols, start, end),
         }
+
+    @app.post("/internal/v1/factor-signals/v5")
+    def factor_signals_v5(request: ContentSignalRequest) -> dict:
+        start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
+        end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
+        try:
+            items = application.factor_signals_v5(
+                request.symbols,
+                start,
+                end,
+                request.minimum_support_status,
+                availability_as_of=request.availability_as_of,
+                pit_mode=request.pit_mode,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"contract_version": "content-factor-signal.v5", "items": items}
 
     return app
 

@@ -45,6 +45,28 @@ endpoints:
       filters: { type: object }
       limit: { type: integer, default: 20 }
       intent: { type: string }
+      availability_as_of: { type: [string, 'null'], required: false }
+      target_start: { type: [string, 'null'], required: false }
+      target_end: { type: [string, 'null'], required: false }
+      temporal_role: { type: [string, 'null'], required: false }
+      semantic_segment_id: { type: [string, 'null'], required: false }
+      business_as_of: { type: [string, 'null'], required: false }
+      knowledge_as_of: { type: [string, 'null'], required: false }
+      pit_mode: { enum: [SYSTEM, PUBLIC_STRICT, PUBLIC_ALLOW_PROXY], required: false }
+  - name: search_knowledge_get
+    method: GET
+    path: /api/v1/knowledge/search
+    query:
+      query: { type: string, required: true }
+      availability_as_of: { type: string, required: false }
+      target_start: { type: string, required: false }
+      target_end: { type: string, required: false }
+      temporal_role: { type: string, required: false }
+      semantic_segment_id: { type: string, required: false }
+      business_as_of: { type: string, required: false }
+      knowledge_as_of: { type: string, required: false }
+      pit_mode: { enum: [SYSTEM, PUBLIC_STRICT, PUBLIC_ALLOW_PROXY], required: false }
+      limit: { type: integer, default: 20 }
   - name: health_version
     method: GET
     path: /health/version

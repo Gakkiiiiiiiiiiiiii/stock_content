@@ -4,7 +4,9 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from stock_content.domain.artifacts import ArtifactBase
+from stock_content.domain.claim_occurrence import ClaimOccurrence
 from stock_content.domain.claims import FinancialClaim
+from stock_content.domain.lifecycle_event import KnowledgeLifecycleEvent
 from stock_content.domain.models import (
     ContentTask,
     KnowledgeUnit,
@@ -13,6 +15,7 @@ from stock_content.domain.models import (
     VideoChapter,
     VideoSummary,
 )
+from stock_content.domain.semantic_segment import SemanticSegment
 
 
 class KnowledgeRepository(Protocol):
@@ -32,6 +35,17 @@ class KnowledgeRepository(Protocol):
         start: datetime,
         end: datetime,
         minimum_support_status: str,
+    ) -> list[dict]: ...
+
+    def factor_signals_v5(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        minimum_support_status: str,
+        *,
+        availability_as_of: datetime | None = None,
+        pit_mode: str | None = None,
     ) -> list[dict]: ...
 
 
@@ -104,6 +118,31 @@ class ClaimRepository(Protocol):
     def get(self, claim_id: str) -> FinancialClaim | None: ...
     def evidence(self, claim_id: str) -> list[str]: ...
     def claims_for_evidence(self, evidence_id: str) -> list[FinancialClaim]: ...
+
+
+class SemanticSegmentRepository(Protocol):
+    def save(self, segment: SemanticSegment | Any) -> Any: ...
+
+    def get(self, semantic_segment_id: str) -> SemanticSegment | None: ...
+
+    def list_for_transcript(self, transcript_artifact_id: str) -> list[SemanticSegment]: ...
+
+
+class ClaimOccurrenceRepository(Protocol):
+    def save(self, occurrence: ClaimOccurrence) -> ClaimOccurrence: ...
+
+    def get(self, occurrence_id: str) -> ClaimOccurrence | None: ...
+
+    def list_for_claim(self, claim_id: str) -> list[ClaimOccurrence]: ...
+
+
+class LifecycleRepository(Protocol):
+    def append(self, event: KnowledgeLifecycleEvent) -> KnowledgeLifecycleEvent: ...
+
+    def get(self, lifecycle_event_id: str) -> KnowledgeLifecycleEvent | None: ...
+
+    def select_as_of(self, *, target_type: str, target_id: str, business_as_of: datetime,
+                     knowledge_as_of: datetime) -> KnowledgeLifecycleEvent | None: ...
 
 
 class VerificationJobRepository(Protocol):

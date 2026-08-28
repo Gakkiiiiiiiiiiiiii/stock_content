@@ -4,6 +4,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
 from stock_content.adapters.postgres.models import VideoAssetRow, VideoSegmentRow
+from stock_content.domain.artifacts import legacy_transcript_segment_id
 from stock_content.domain.models import TranscriptSegment, VideoAsset
 
 
@@ -23,7 +24,19 @@ class PostgresVideoRepository:
                 for name, value in values.items():
                     setattr(row, name, value)
             session.execute(delete(VideoSegmentRow).where(VideoSegmentRow.video_id == video.video_id))
-            session.add_all(VideoSegmentRow(video_id=video.video_id, **vars(segment)) for segment in segments)
+            rows = []
+            for segment in segments:
+                segment_values = vars(segment).copy()
+                if not segment_values.get("segment_id"):
+                    segment_values["segment_id"] = legacy_transcript_segment_id(
+                        segment.segment_index,
+                        segment.start_seconds,
+                        segment.end_seconds,
+                        segment.raw_text or segment.text,
+                        legacy_namespace=video.video_id,
+                    )
+                rows.append(VideoSegmentRow(video_id=video.video_id, **segment_values))
+            session.add_all(rows)
 
     def get(self, video_id: str) -> dict | None:
         with self._sessions() as session:
@@ -51,6 +64,7 @@ class PostgresVideoRepository:
                 "resolved_at": row.resolved_at,
                 "segments": [
                     {
+                        "segment_id": item.segment_id,
                         "segment_index": item.segment_index,
                         "start_seconds": item.start_seconds,
                         "end_seconds": item.end_seconds,

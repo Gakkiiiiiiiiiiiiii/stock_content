@@ -57,17 +57,7 @@ class QdrantKnowledgeIndex:
                     # Qdrant is only a search projection.  Keep the complete
                     # filtering/lineage envelope in the payload, while the
                     # relational row remains authoritative for hydration.
-                    payload={
-                        "knowledge_uid": unit.knowledge_uid,
-                        "content_snapshot_id": (unit.attributes or {}).get("content_snapshot_id"),
-                        "claim_ids": list((unit.provenance or {}).get("claim_ids") or []),
-                        "ticker": unit.ticker,
-                        "knowledge_kind": unit.knowledge_kind,
-                        "kind": unit.kind,
-                        "support_status": unit.support_status,
-                        "verification_status": unit.truth_status,
-                        "available_from": unit.available_from.isoformat(),
-                    },
+                    payload=_projection_payload(unit),
                 )
                 for unit in units
             ],
@@ -82,3 +72,38 @@ class QdrantKnowledgeIndex:
             with_payload=True,
         )
         return [str(point.payload["knowledge_uid"]) for point in response.points]
+
+
+def _projection_payload(unit: KnowledgeUnit) -> dict:
+    """Build the complete candidate projection; SQL remains authoritative."""
+    attributes = dict(unit.attributes or {})
+    bindings = list(attributes.get("temporal_bindings") or [])
+    primary = bindings[0] if bindings else {}
+    return {
+        "knowledge_uid": unit.knowledge_uid,
+        "occurrence_id": attributes.get("occurrence_id"),
+        "claim_id": attributes.get("claim_id") or unit.knowledge_uid,
+        "claim_ids": list(
+            (unit.provenance or {}).get("claim_ids")
+            or [attributes.get("claim_id") or unit.knowledge_uid]
+        ),
+        "semantic_segment_id": attributes.get("semantic_segment_id"),
+        "temporal_scope": primary.get("scope"),
+        "primary_temporal_role": primary.get("role") or attributes.get("temporal_role"),
+        "period_label": primary.get("period_label"),
+        "forecast_start": primary.get("start_date"),
+        "forecast_end": primary.get("end_date"),
+        "granularity": primary.get("granularity"),
+        "assertion_status": primary.get("assertion_status"),
+        "available_from": unit.available_from.isoformat(),
+        "source_available_at": attributes.get("source_available_at"),
+        "source_availability_quality": attributes.get("source_availability_quality", "UNKNOWN"),
+        "lifecycle_status": unit.lifecycle_status,
+        "lifecycle_artifact_id": attributes.get("lifecycle_artifact_id"),
+        "content_snapshot_id": attributes.get("content_snapshot_id"),
+        "ticker": unit.ticker,
+        "knowledge_kind": unit.knowledge_kind,
+        "kind": unit.kind,
+        "support_status": unit.support_status,
+        "verification_status": unit.truth_status,
+    }

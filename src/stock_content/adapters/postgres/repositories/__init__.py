@@ -5,6 +5,7 @@ from stock_content.adapters.postgres.repositories.artifact_repository import (
     SqlArtifactRepository,
 )
 from stock_content.adapters.postgres.repositories.chapter_repository import PostgresChapterRepository
+from stock_content.adapters.postgres.repositories.claim_occurrence_repository import ClaimOccurrenceRepository
 from stock_content.adapters.postgres.repositories.claim_repository import (
     ClaimRepository,
     PostgresClaimRepository,
@@ -14,7 +15,9 @@ from stock_content.adapters.postgres.repositories.content_task_repository import
 from stock_content.adapters.postgres.repositories.entity_repository import PostgresFinancialEntityRepository
 from stock_content.adapters.postgres.repositories.financial_repository import PostgresFinancialRepository
 from stock_content.adapters.postgres.repositories.knowledge_repository import PostgresKnowledgeRepository
+from stock_content.adapters.postgres.repositories.lifecycle_repository import LifecycleRepository
 from stock_content.adapters.postgres.repositories.multimodal_repository import PostgresMultimodalRepository
+from stock_content.adapters.postgres.repositories.semantic_segment_repository import SemanticSegmentRepository
 from stock_content.adapters.postgres.repositories.signal_outbox_repository import (
     SignalOutboxIntegrityError,
     SignalOutboxRepository,
@@ -30,10 +33,13 @@ from stock_content.adapters.postgres.repositories.video_repository import Postgr
 
 __all__ = [
     "PostgresChapterRepository",
+    "ClaimOccurrenceRepository",
     "PostgresContentTaskRepository",
     "PostgresFinancialRepository",
     "PostgresFinancialEntityRepository",
     "PostgresKnowledgeRepository",
+    "LifecycleRepository",
+    "SemanticSegmentRepository",
     "PostgresMultimodalRepository",
     "PostgresSummaryRepository",
     "PostgresVideoRepository",

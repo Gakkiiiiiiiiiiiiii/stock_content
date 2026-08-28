@@ -50,12 +50,24 @@ class TranscriptSegment:
     start_seconds: float
     end_seconds: float
     text: str
+    # Stable identity is additive.  Runtime callers that do not yet have the
+    # immutable media/ASR manifest may leave this empty; the artifact adapter
+    # computes the authoritative id once those fields are available.
+    segment_id: str = ""
     confidence: float | None = None
     raw_text: str | None = None
     normalized_text: str | None = None
     speaker_id: str = "UNKNOWN"
     speaker_confidence: float | None = None
     correction_records: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def start_ms(self) -> int:
+        return round(self.start_seconds * 1000)
+
+    @property
+    def end_ms(self) -> int:
+        return round(self.end_seconds * 1000)
 
 
 @dataclass

@@ -49,6 +49,9 @@ class ContentApplication:
         claim_repository: Any | None = None,
         signal_outbox=None,
         verification_job_repository: Any | None = None,
+        occurrence_repository: Any | None = None,
+        lifecycle_repository: Any | None = None,
+        pipeline_config: dict[str, Any] | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
@@ -75,7 +78,18 @@ class ContentApplication:
             None,
         )
         self._signal_outbox = signal_outbox
+        self._occurrence_repository = occurrence_repository or next(
+            (getattr(stage, "_repository", None) for stage in getattr(pipeline, "_stages", [])
+             if getattr(stage, "name", "") == "claim_occurrence_persistence"),
+            None,
+        )
+        self._lifecycle_repository = lifecycle_repository or next(
+            (getattr(stage, "_repository", None) for stage in getattr(pipeline, "_stages", [])
+             if getattr(stage, "name", "") == "lifecycle_projection"),
+            None,
+        )
         self._verification_jobs = verification_job_repository
+        self._pipeline_config = dict(pipeline_config or {})
         if self._verification_jobs is None and self._claim_repository is not None:
             sessions = getattr(self._claim_repository, "_sessions", None)
             if sessions is not None:
@@ -94,6 +108,8 @@ class ContentApplication:
             task_repository=self._tasks,
             pipeline=self._pipeline,
             claim_repository=self._claim_repository,
+            occurrence_repository=self._occurrence_repository,
+            lifecycle_repository=self._lifecycle_repository,
         )
         # §5 P1-2/P1-4：Claim 验证生命周期与知识冲突（内存注册表，生产由 worker+DB 驱动）。
         self._verification_lifecycle = VerificationService()
@@ -102,6 +118,14 @@ class ContentApplication:
 
     def enqueue(self, source_type: str, source_ref: str, options: dict | None = None) -> dict:
         options = options or {}
+        if self._pipeline_config:
+            options = {
+                **options,
+                "pipeline_config": {
+                    **self._pipeline_config,
+                    **dict(options.get("pipeline_config") or {}),
+                },
+            }
         # §4 P0-3：三个禁止混用的概念：
         #   request_idempotency_key —— 防 HTTP 重试重复创建任务；
         #   source_identity_hash   —— 是否同一来源；
@@ -208,6 +232,14 @@ class ContentApplication:
             "transcript_postprocess",
             "ocr",
             "vision",
+            "semantic_segmentation",
+            "semantic_context",
+            "atomic_claim_extraction",
+            "evidence_grounding",
+            "temporal_normalization",
+            "claim_canonicalization",
+            "claim_occurrence_persistence",
+            "lifecycle_projection",
         }
         prefix: list[Any] = []
         for record in records:
@@ -232,7 +264,8 @@ class ContentApplication:
                 if slot in {"frame", "ocr", "vision"}:
                     context.artifacts.add({"frame": "frames", "ocr": "ocr", "vision": "vision"}[slot], artifact)
                 elif slot in {
-                    "source", "media", "transcript", "evidence", "claims", "verification", "knowledge", "summary"
+                    "source", "media", "transcript", "semantic_segments", "evidence", "claims",
+                    "occurrences", "lifecycle", "verification", "knowledge", "summary"
                 }:
                     context.artifacts.set(slot, artifact)
         self._restore_typed_prefix(context, persisted)
@@ -344,12 +377,53 @@ class ContentApplication:
         ]
         context.state.frame_insights = [dict(item.payload) for item in context.artifacts.vision]
         context.state.evidence = list(getattr(context.artifacts.evidence, "evidences", ()) or ())
+        if context.artifacts.semantic_segments:
+            context.state.semantic_segments = list(context.artifacts.semantic_segments.segments or ())
+        if context.artifacts.occurrences:
+            occurrence_ids = tuple(context.artifacts.occurrences.occurrence_ids or ())
+            if occurrence_ids and self._occurrence_repository is None:
+                raise RuntimeError(
+                    "ARTIFACT_INTEGRITY_ERROR: occurrence repository unavailable for checkpoint rows"
+                )
+            context.state.occurrences = []
+            for occurrence_id in occurrence_ids:
+                occurrence = self._occurrence_repository.get(str(occurrence_id))
+                if occurrence is None:
+                    raise RuntimeError(
+                        f"ARTIFACT_INTEGRITY_ERROR: occurrence row missing {occurrence_id}"
+                    )
+                context.state.occurrences.append(occurrence)
+        if context.artifacts.lifecycle:
+            lifecycle_ids = (
+                tuple(context.artifacts.lifecycle.claim_lifecycle_event_ids or ())
+                + tuple(context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ())
+            )
+            if lifecycle_ids and self._lifecycle_repository is None:
+                raise RuntimeError(
+                    "ARTIFACT_INTEGRITY_ERROR: lifecycle repository unavailable for checkpoint rows"
+                )
+            context.state.lifecycle_events = []
+            for event_id in lifecycle_ids:
+                event = self._lifecycle_repository.get(str(event_id))
+                if event is None:
+                    raise RuntimeError(
+                        f"ARTIFACT_INTEGRITY_ERROR: lifecycle event row missing {event_id}"
+                    )
+                context.state.lifecycle_events.append(event)
         if context.artifacts.claims and self._claim_repository is not None:
-            context.state.claims = [
-                claim
-                for claim_id in context.artifacts.claims.claims
-                if (claim := self._claim_repository.get(str(claim_id))) is not None
-            ]
+            claim_ids = tuple(context.artifacts.claims.claims or ())
+            context.state.claims = []
+            for claim_id in claim_ids:
+                claim = self._claim_repository.get(str(claim_id))
+                if claim is None:
+                    raise RuntimeError(
+                        f"ARTIFACT_INTEGRITY_ERROR: claim row missing {claim_id}"
+                    )
+                context.state.claims.append(claim)
+        elif context.artifacts.claims and context.artifacts.claims.claims:
+            raise RuntimeError(
+                "ARTIFACT_INTEGRITY_ERROR: claim repository unavailable for checkpoint rows"
+            )
 
     def get_content_snapshot(self, content_snapshot_id: str) -> dict | None:
         snapshot = self._snapshots.get(content_snapshot_id)
@@ -658,16 +732,91 @@ class ContentApplication:
     def list_conflicts(self, status: str | None = None) -> list[dict]:
         return self._conflict_service.list_conflicts(status)
 
-    def search_knowledge(self, query: str, filters: dict, limit: int) -> list[dict]:
+    def search_knowledge(
+        self,
+        query: str,
+        filters: dict,
+        limit: int,
+        *,
+        availability_as_of: datetime | None = None,
+        target_start: str | None = None,
+        target_end: str | None = None,
+        temporal_role: str | None = None,
+        semantic_segment_id: str | None = None,
+        business_as_of: datetime | None = None,
+        knowledge_as_of: datetime | None = None,
+        pit_mode: str | None = None,
+    ) -> list[dict]:
+        effective_filters = dict(filters or {})
+        if pit_mode is None and "pit_mode" not in effective_filters:
+            pit_mode = str(self._pipeline_config.get("public_pit_default_mode") or "PUBLIC_STRICT")
+        for key, value in {
+            "availability_as_of": availability_as_of,
+            "target_start": target_start,
+            "target_end": target_end,
+            "temporal_role": temporal_role,
+            "semantic_segment_id": semantic_segment_id,
+            "business_as_of": business_as_of,
+            "knowledge_as_of": knowledge_as_of,
+            "pit_mode": pit_mode,
+        }.items():
+            if value is not None:
+                effective_filters[key] = value
         try:
             knowledge_uids = self._index.search(query, limit * 2)
-            items = self._knowledge.hydrate(knowledge_uids, filters)
-            if items:
-                return items[:limit]
+            if knowledge_uids:
+                # Qdrant is candidate-only; every item is hydrated and
+                # filtered by the PostgreSQL authority before it is returned.
+                hydrated = self._knowledge.hydrate(knowledge_uids, effective_filters)
+                if len(hydrated) >= limit:
+                    return hydrated[:limit]
+                # Candidate search can return only rows rejected by an
+                # authoritative PIT filter.  Fill the shortfall from the
+                # relational authority, preserving candidate order and
+                # removing any rows already hydrated from the index.
+                fallback = self._knowledge.search(query, effective_filters, limit)
+                seen = {
+                    str(item.get("knowledge_uid"))
+                    for item in hydrated
+                    if item.get("knowledge_uid") is not None
+                }
+                for item in fallback:
+                    uid = item.get("knowledge_uid")
+                    if uid is not None and str(uid) in seen:
+                        continue
+                    hydrated.append(item)
+                    if uid is not None:
+                        seen.add(str(uid))
+                    if len(hydrated) >= limit:
+                        break
+                return hydrated[:limit]
         except Exception as exc:
             # The relational index remains available during Qdrant outages.
             LOGGER.warning("semantic search unavailable; using relational fallback: %s", exc)
-        return self._knowledge.search(query, filters, limit)
+        return self._knowledge.search(query, effective_filters, limit)
+
+    def factor_signals_v5(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        minimum_support_status: str,
+        *,
+        availability_as_of: datetime | None = None,
+        pit_mode: str | None = None,
+    ) -> list[dict]:
+        """Return the v5 lineage projection from PostgreSQL authority."""
+        method = getattr(self._knowledge, "factor_signals_v5", None)
+        if method is None:
+            return []
+        return method(
+            symbols,
+            start,
+            end,
+            minimum_support_status,
+            availability_as_of=availability_as_of,
+            pit_mode=pit_mode,
+        )
 
     def factor_signals(
         self,

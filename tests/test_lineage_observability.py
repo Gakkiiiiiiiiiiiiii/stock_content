@@ -151,7 +151,7 @@ def test_qdrant_projection_contains_lineage_and_filter_payload(monkeypatch):
         ]
     )
     payload = captured["points"][0].payload
-    assert payload == {
+    assert {
         "knowledge_uid": "k-lineage",
         "content_snapshot_id": "cs-1",
         "claim_ids": ["claim-1"],
@@ -161,4 +161,10 @@ def test_qdrant_projection_contains_lineage_and_filter_payload(monkeypatch):
         "support_status": "SOURCE_SUPPORTED",
         "verification_status": "VERIFIED",
         "available_from": "2026-01-01T00:00:00+00:00",
-    }
+    }.items() <= payload.items()
+    assert {
+        "occurrence_id", "claim_id", "semantic_segment_id", "temporal_scope",
+        "primary_temporal_role", "period_label", "forecast_start", "forecast_end",
+        "granularity", "assertion_status", "source_available_at",
+        "source_availability_quality", "lifecycle_status", "lifecycle_artifact_id",
+    } <= payload.keys()

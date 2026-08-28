@@ -1,24 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import shutil
 import tempfile
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from stock_content.adapters.http.model_client import ContentModelClient
 from stock_content.application.pipeline import PipelineContext
-from stock_content.application.snapshot_service import SnapshotService
+from stock_content.application.snapshot_service import SnapshotService, choose_snapshot_commit_candidate
 from stock_content.application.stage_runner import StageResult
 from stock_content.domain.artifacts import (
     ClaimArtifact,
+    ClaimOccurrenceArtifact,
     EvidenceArtifact,
     EvidenceItem,
     FrameArtifact,
     KnowledgeArtifact,
+    LifecycleArtifact,
     MediaArtifact,
     OCRArtifact,
     SourceArtifact,
@@ -30,8 +33,13 @@ from stock_content.domain.artifacts import (
     artifact_id_of,
     canonical_json,
 )
+from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.chapter import ChapterSegmenter
+from stock_content.domain.claim_canonicalizer import ClaimCanonicalizer
+from stock_content.domain.claim_draft import ClaimOccurrenceDraft
+from stock_content.domain.claim_draft_grounder import ClaimDraftGrounder
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
+from stock_content.domain.claim_occurrence import ClaimOccurrence
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
@@ -39,13 +47,25 @@ from stock_content.domain.financial_event_extractor import FinancialEventExtract
 from stock_content.domain.financial_numeric import parse_financial_numerics
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
+from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
 from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
+from stock_content.domain.lifecycle_event import KnowledgeLifecycleEvent
 from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoAsset
+from stock_content.domain.semantic_context_builder import SemanticContextBuilder
 from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
+from stock_content.domain.semantic_segmenter import SemanticSegmenter
 from stock_content.domain.summary import SummaryGenerator
+from stock_content.domain.temporal_normalizer import TemporalNormalizer
+from stock_content.domain.temporal_semantics import (
+    MetricTemporalNature,
+    OccurrenceTimes,
+    TemporalAssertionStatus,
+    TemporalRole,
+    TemporalScope,
+)
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
 from stock_content.ports.media import AudioExtractor, SourceAdapter, SpeechRecognizer
 from stock_content.ports.repositories import (
@@ -67,6 +87,43 @@ def _stage_result(context: PipelineContext, *slots: str) -> StageResult:
         elif value is not None:
             produced.append(value)
     return StageResult(context=context, produced_artifacts=tuple(produced))
+
+
+def _resolved_datetime(value: Any, field_name: str) -> datetime | None:
+    """Parse resolver-provided timestamps with one explicit legacy policy.
+
+    Resolver payloads historically contained both ISO strings and Unix epoch
+    timestamps.  Keep both representations accepted, but reject malformed or
+    timezone-invalid values instead of silently substituting a task clock.
+    Naive values retain the repository's existing policy: interpret them as
+    UTC, then normalize every accepted value to UTC for lineage equality.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            raise ValueError(f"invalid {field_name}: non-finite timestamp")
+        try:
+            parsed = datetime.fromtimestamp(float(value), tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(f"invalid {field_name}: {value!r}") from exc
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValueError(f"invalid {field_name}: empty timestamp")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid {field_name}: {value!r}") from exc
+    else:
+        raise ValueError(f"invalid {field_name}: expected datetime, ISO timestamp, or Unix timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if parsed.utcoffset() is None:
+        raise ValueError(f"invalid {field_name}: timezone offset is unavailable")
+    return parsed.astimezone(UTC)
 
 
 class ResolveSourceStage:
@@ -163,6 +220,47 @@ class DownloadStage:
         self._work_root = work_root
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        fixture = bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+        )
+        if fixture:
+            # Offline fixtures are synthetic, deterministic sources.  Give
+            # them an explicit availability boundary so the public-strict
+            # default remains meaningful without treating UNKNOWN as public.
+            fixture_available = (
+                context.options.get("source_available_at")
+                or context.state.metadata.get("source_available_at")
+                or context.state.metadata.get("available_at")
+                or context.options.get("available_from")
+                or context.options.get("as_of")
+            )
+            if fixture_available is None:
+                fixture_available = datetime.now(UTC)
+            context.options.setdefault("source_available_at", fixture_available)
+            context.options.setdefault("source_availability_quality", "EXACT")
+        if not fixture:
+            # Capture once at immutable download completion.  Downstream
+            # replay uses this value instead of deriving a new wall clock.
+            context.options.setdefault("ingested_at", datetime.now(UTC))
+            explicit_available = (
+                context.options.get("source_available_at")
+                or context.state.metadata.get("source_available_at")
+                or context.state.metadata.get("available_at")
+            )
+            if explicit_available is not None:
+                context.options.setdefault("source_available_at", explicit_available)
+                context.options.setdefault(
+                    "source_availability_quality",
+                    context.state.metadata.get("source_availability_quality") or "EXACT",
+                )
+            else:
+                # Download completion is an upper bound, not proof of public
+                # availability.  A published timestamp is only a proxy when
+                # the adapter explicitly supplies one.
+                context.options.setdefault("source_available_at", context.options["ingested_at"])
+                context.options.setdefault("source_availability_quality", "INGEST_TIME_UPPER_BOUND")
         replay_uri = context.options.get("replay_raw_storage_uri")
         if replay_uri:
             context.runtime.work_dir = Path(
@@ -611,16 +709,739 @@ class ChapterStage:
         return _stage_result(context)
 
 
+class SemanticSegmentationStage:
+    """Authoritative semantic boundary stage; chapters remain compatibility output."""
+
+    name = "semantic_segmentation"
+    required_inputs = ("transcript",)
+    output_types = ("semantic_segments",)
+
+    def __init__(self, segmenter: SemanticSegmenter | None = None, model_gateway=None, repository=None) -> None:
+        self._segmenter = segmenter or SemanticSegmenter(model_gateway)
+        self._repository = repository
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        if transcript is None:
+            raise ValueError("semantic segmentation requires transcript artifact")
+        try:
+            result = self._segmenter.segment(
+                transcript,
+                offline_fixture=bool(
+                    context.options.get("offline_fixture")
+                    or "transcript" in context.options
+                    or "segments" in context.options
+                ),
+            )
+        except Exception:
+            # Keep the metric fail-closed while preserving the stage error.
+            context.runtime.metrics["segmentation_failure_rate"] = 1.0
+            raise
+        context.state["semantic_segments"] = list(result.segments)
+        context.runtime.metrics.update(result.metrics)
+        durations = sorted(max(0, item.end_ms - item.start_ms) for item in result.segments)
+        count = len(durations)
+        def _percentile(percent: float) -> float:
+            if not durations:
+                return 0.0
+            index = max(0, min(count - 1, int((count - 1) * percent)))
+            return float(durations[index])
+        context.runtime.metrics.update({
+            "semantic_segments_per_video": float(count),
+            "semantic_segment_duration_p50": _percentile(0.50),
+            "semantic_segment_duration_p95": _percentile(0.95),
+            "segmentation_repair_rate": float(result.metrics.get("repair_count", 0.0)) / max(1.0, float(count)),
+            "segmentation_failure_rate": float(result.metrics.get("failure_count", 0.0)) / max(1.0, float(count)),
+        })
+        context.artifacts.semantic_segments = result.artifact
+        if self._repository is not None:
+            video = context.state.get("video")
+            video_id = getattr(video, "video_id", None)
+            if not video_id:
+                raise ValueError(
+                    "semantic segment persistence requires the authoritative current context.state.video.video_id"
+                )
+            self._repository.save(result.artifact, video_id=video_id)
+        return _stage_result(context, "semantic_segments")
+
+
+class SemanticContextStage:
+    name = "semantic_context"
+    required_inputs = ("transcript", "semantic_segments")
+    output_types = ()
+
+    def __init__(self, builder: SemanticContextBuilder | None = None, padding_ms: int = 4000) -> None:
+        self._builder = builder or SemanticContextBuilder(padding_ms=padding_ms)
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        semantic_artifact = context.artifacts.semantic_segments
+        if transcript is None or semantic_artifact is None:
+            raise ValueError("semantic context requires transcript and semantic segments")
+        contexts = [
+            self._builder.build(
+                segment,
+                transcript,
+                context.artifacts.frames,
+                context.artifacts.ocr,
+                context.artifacts.vision,
+                context.state.get("temporal_windows") or (),
+            )
+            for segment in context.state.get("semantic_segments") or ()
+        ]
+        context.state["semantic_contexts"] = contexts
+        return _stage_result(context)
+
+
+class AtomicClaimExtractionStage:
+    name = "atomic_claim_extraction"
+    required_inputs = ("semantic_segments",)
+    output_types = ()
+
+    def __init__(self, extractor: AtomicClaimExtractor | None = None, model_gateway=None) -> None:
+        self._extractor = extractor or AtomicClaimExtractor(model_gateway)
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        drafts: list[ClaimOccurrenceDraft] = []
+        fixture = context.options.get("claim_drafts")
+        fixture_by_segment: dict[str, list[Any]] = {}
+        for item in fixture or ():
+            value = item if isinstance(item, dict) else item.model_dump(mode="json")
+            fixture_by_segment.setdefault(str(value.get("semantic_segment_id") or ""), []).append(value)
+        for semantic_context in context.state.get("semantic_contexts") or ():
+            drafts.extend(
+                self._extractor.extract(
+                    semantic_context,
+                    metadata=context.state.get("metadata") or {},
+                    fixture_drafts=fixture_by_segment.get(semantic_context.semantic_segment_id)
+                    if fixture is not None
+                    else None,
+                    offline_fixture=bool(
+                        context.options.get("offline_fixture")
+                        or "transcript" in context.options
+                        or "segments" in context.options
+                    ),
+                )
+            )
+        context.state["claim_drafts"] = drafts
+        context.runtime.metrics["claim_count"] = float(len(drafts))
+        context.runtime.metrics["zero_claim_context_count"] = float(
+            sum(not any(item.semantic_segment_id == c.semantic_segment_id for item in drafts)
+                for c in context.state.get("semantic_contexts") or ())
+        )
+        segment_count = len(context.state.get("semantic_segments") or ())
+        zero_claim_count = sum(
+            not any(item.semantic_segment_id == segment.semantic_segment_id for item in drafts)
+            for segment in context.state.get("semantic_segments") or ()
+        )
+        context.runtime.metrics["claims_per_semantic_segment"] = len(drafts) / max(1.0, float(segment_count))
+        context.runtime.metrics["zero_claim_segment_ratio"] = zero_claim_count / max(1.0, float(segment_count))
+        return _stage_result(context)
+
+
+class EvidenceGroundingStage:
+    name = "evidence_grounding"
+    required_inputs = ("transcript", "semantic_segments")
+    output_types = ("evidence",)
+
+    def __init__(self, grounder: ClaimDraftGrounder | None = None) -> None:
+        self._grounder = grounder or ClaimDraftGrounder()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        if transcript is None:
+            raise ValueError("evidence grounding requires transcript")
+        by_id = {item.semantic_segment_id: item for item in context.state.get("semantic_segments") or ()}
+        drafts = list(context.state.get("claim_drafts") or ())
+        try:
+            grounded = [
+                self._grounder.ground(draft, transcript, by_id[draft.semantic_segment_id])
+                for draft in drafts
+                if draft.semantic_segment_id in by_id
+            ]
+        except ValueError as exc:
+            context.runtime.metrics["claim_grounding_reject_rate"] = 1.0
+            if "temporal expression" in str(exc):
+                context.runtime.metrics["temporal_expression_grounding_reject_rate"] = 1.0
+            raise
+        rejected = len(drafts) - len(grounded)
+        context.runtime.metrics["claim_grounding_reject_rate"] = rejected / max(1.0, float(len(drafts)))
+        context.runtime.metrics["temporal_expression_grounding_reject_rate"] = 0.0
+        evidence_items = []
+        for item in grounded:
+            evidence_items.extend(item.evidences)
+        unique = {item.evidence_id: item for item in evidence_items}
+        evidence_artifact = EvidenceArtifact(
+            artifact_id="evidence-pending",
+            artifact_type="evidence",
+            producer_stage=self.name,
+            transcript_artifact_id=transcript.artifact_id,
+            evidences=list(unique.values()),
+            source_artifact_ids=(transcript.artifact_id,),
+            # Semantic segmentation is the authoritative boundary producer;
+            # transcript remains an explicit compatibility reference.
+            parent_artifact_ids=tuple(
+                item.artifact_id
+                for item in (context.artifacts.semantic_segments, transcript)
+                if item is not None
+            ),
+        )
+        context.artifacts.evidence = EvidenceArtifact(
+            **{**evidence_artifact.__dict__, "artifact_id": artifact_id_of(evidence_artifact)}
+        )
+        context.state["grounded_occurrences"] = grounded
+        context.state.evidence = list(unique.values())
+        context.runtime.metrics["grounding_reject_count"] = 0.0
+        return _stage_result(context, "evidence")
+
+
+class TemporalNormalizationStage:
+    name = "temporal_normalization"
+    required_inputs = ("evidence",)
+    output_types = ()
+
+    def __init__(
+        self,
+        normalizer: TemporalNormalizer | None = None,
+        normalization_version: str = "temporal-normalization.final.v1",
+    ) -> None:
+        self._normalizer = normalizer or TemporalNormalizer(normalization_version=normalization_version)
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        bindings_by_draft: dict[int, list[Any]] = {}
+        anchor = context.options.get("temporal_anchor") or context.options.get("as_of")
+        if isinstance(anchor, str):
+            anchor = datetime.fromisoformat(anchor.replace("Z", "+00:00"))
+        as_of = context.options.get("as_of")
+        if isinstance(as_of, str):
+            as_of = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        evidence_by_segment = {
+            int(item.locator["segment_index"]): item.evidence_id
+            for item in context.state.get("evidence") or ()
+            if item.locator.get("segment_index") is not None
+        }
+        for draft_index, draft in enumerate(context.state.get("claim_drafts") or ()):
+            draft_bindings = []
+            for expression in draft.temporal_expressions:
+                try:
+                    role = TemporalRole(expression.role)
+                except ValueError as exc:
+                    raise ValueError(f"unknown temporal role: {expression.role}") from exc
+                scope_hint = TemporalScope(expression.scope_hint) if expression.scope_hint else None
+                expression_anchor = expression.anchor
+                if isinstance(expression_anchor, str):
+                    symbolic_anchor = expression_anchor.strip().upper()
+                    if symbolic_anchor == "SOURCE_PUBLISH_TIME":
+                        expression_anchor = (
+                            _resolved_datetime(context.state.video.published_at, "video.published_at")
+                            if context.state.video
+                            else None
+                        )
+                        if expression_anchor is None:
+                            expression_anchor = _resolved_datetime(
+                                (context.state.get("metadata") or {}).get("published_at"),
+                                "metadata.published_at",
+                            )
+                        if expression_anchor is None:
+                            raise ValueError("SOURCE_PUBLISH_TIME anchor is unavailable")
+                    else:
+                        try:
+                            expression_anchor = datetime.fromisoformat(expression_anchor.replace("Z", "+00:00"))
+                        except ValueError:
+                            try:
+                                expression_anchor = date.fromisoformat(expression_anchor)
+                            except ValueError as exc:
+                                # Do not silently convert an unknown symbolic
+                                # anchor into the task-level as_of timestamp.
+                                raise ValueError(
+                                    f"unknown temporal anchor: {expression.anchor}"
+                                ) from exc
+                draft_text = " ".join((draft.conclusion or "", draft.condition_text or ""))
+                normalized_words = "".join(draft_text.split()).casefold()
+                assertion_status = None
+                if any(token in normalized_words for token in ("下修", "上修", "修订", "修正", "改到", "revised")):
+                    assertion_status = TemporalAssertionStatus.REVISED
+                elif any(token in normalized_words for token in ("计划", "拟", "planned")):
+                    assertion_status = TemporalAssertionStatus.PLANNED
+                elif any(token in normalized_words for token in ("预计", "预期", "expected", "estimate")):
+                    assertion_status = TemporalAssertionStatus.EXPECTED
+                metric_nature = None
+                expression_text = expression.raw_expression.upper()
+                if draft.claim_type == "FINANCIAL_METRIC":
+                    if any(marker in expression_text for marker in ("YTD", "TTM", "LTM", "NTM")):
+                        metric_nature = None  # let the normalizer's exact labels win
+                    elif any(
+                        marker in expression_text
+                        for marker in ("期末", "余额", "截至", "END", "ENDING", "AS OF")
+                    ):
+                        metric_nature = MetricTemporalNature.INSTANT
+                    elif (
+                        scope_hint is TemporalScope.INTERVAL
+                        or expression.scope_hint == "INTERVAL"
+                        or any(marker in expression_text for marker in ("Q", "季度", "FY", "年", "月"))
+                    ):
+                        metric_nature = MetricTemporalNature.DURATION
+                elif draft.claim_type in {"PRICE", "VALUATION"} and scope_hint in {
+                    None, TemporalScope.POINT
+                }:
+                    metric_nature = MetricTemporalNature.SNAPSHOT
+                draft_bindings.append(
+                    self._normalizer.normalize(
+                        expression.raw_expression,
+                        role=role,
+                        anchor=expression_anchor or anchor,
+                        as_of=as_of,
+                        subject_key=draft.subject_key,
+                        scope_hint=scope_hint,
+                        evidence_refs=[
+                            evidence_by_segment[index]
+                            for index in expression.evidence_segment_indices
+                            if index in evidence_by_segment
+                        ],
+                        assertion_status=assertion_status,
+                        metric_temporal_nature=metric_nature,
+                    )
+                )
+            bindings_by_draft[draft_index] = draft_bindings
+        context.state["temporal_bindings"] = [item for values in bindings_by_draft.values() for item in values]
+        context.state["temporal_bindings_by_draft"] = bindings_by_draft
+        context.runtime.metrics["temporal_normalized_count"] = float(
+            sum(item.normalization_status == "NORMALIZED" for item in context.state["temporal_bindings"])
+        )
+        context.runtime.metrics["temporal_partial_count"] = float(
+            sum(item.normalization_status == "PARTIAL" for item in context.state["temporal_bindings"])
+        )
+        context.runtime.metrics["temporal_unresolved_count"] = float(
+            sum(item.normalization_status == "UNRESOLVED" for item in context.state["temporal_bindings"])
+        )
+        bindings = list(context.state["temporal_bindings"])
+        binding_count = len(bindings)
+        context.runtime.metrics.update({
+            "temporal_binding_count": float(binding_count),
+            "temporal_normalization_success_rate": sum(
+                item.normalization_status == "NORMALIZED" for item in bindings
+            ) / max(1.0, float(binding_count)),
+            "temporal_normalization_partial_rate": sum(
+                item.normalization_status == "PARTIAL" for item in bindings
+            ) / max(1.0, float(binding_count)),
+            "temporal_normalization_unresolved_rate": sum(
+                item.normalization_status == "UNRESOLVED" for item in bindings
+            ) / max(1.0, float(binding_count)),
+            "temporal_partial_rate": sum(
+                item.normalization_status == "PARTIAL" for item in bindings
+            ) / max(1.0, float(binding_count)),
+            "temporal_unresolved_rate": sum(
+                item.normalization_status == "UNRESOLVED" for item in bindings
+            ) / max(1.0, float(binding_count)),
+            "temporal_role_distribution": {
+                str(getattr(item.role, "value", item.role)): sum(
+                    getattr(other.role, "value", other.role) == getattr(item.role, "value", item.role)
+                    for other in bindings
+                )
+                for item in sorted(bindings, key=lambda value: str(getattr(value.role, "value", value.role)))
+            },
+        })
+        unresolved = [item.expression_key for item in bindings if item.normalization_status == "UNRESOLVED"]
+        context.runtime.metrics["unresolved_expression_collision_rate"] = (
+            len(unresolved) - len(set(unresolved))
+        ) / max(1.0, float(len(unresolved)))
+        forecast_drafts = [item for item in context.state.get("claim_drafts") or () if item.claim_type == "FORECAST"]
+        forecast_with_target = {
+            index for index, values in bindings_by_draft.items()
+            if any(getattr(binding, "role", None) is TemporalRole.FORECAST_TARGET for binding in values)
+        }
+        context.runtime.metrics["forecast_target_missing_rate"] = (
+            sum(index not in forecast_with_target for index, item in enumerate(context.state.get("claim_drafts") or ())
+                if item.claim_type == "FORECAST")
+            / max(1.0, float(len(forecast_drafts)))
+        )
+        fiscal = [item for item in bindings if getattr(item.calendar_type, "value", item.calendar_type) == "FISCAL"]
+        context.runtime.metrics["fiscal_period_unresolved_rate"] = sum(
+            item.normalization_status in {"PARTIAL", "UNRESOLVED"} for item in fiscal
+        ) / max(1.0, float(len(fiscal)))
+        market = [
+            item
+            for item in bindings
+            if item.market_session
+            or getattr(item.calendar_type, "value", item.calendar_type) == "EXCHANGE"
+        ]
+        context.runtime.metrics["market_session_unresolved_rate"] = sum(
+            not item.market_session for item in market
+        ) / max(1.0, float(len(market)))
+        metric_drafts = [
+            item
+            for item in context.state.get("claim_drafts") or ()
+            if item.claim_type == "FINANCIAL_METRIC"
+        ]
+        metric_binding_items = [
+            binding for index, values in bindings_by_draft.items()
+            if index < len(context.state.get("claim_drafts") or ())
+            and context.state["claim_drafts"][index].claim_type == "FINANCIAL_METRIC"
+            for binding in values
+        ]
+        context.runtime.metrics["metric_temporal_nature_unknown_rate"] = sum(
+            getattr(item.metric_temporal_nature, "value", item.metric_temporal_nature) in {None, "UNKNOWN"}
+            for item in metric_binding_items
+        ) / max(1.0, float(len(metric_binding_items) or len(metric_drafts)))
+        planned = sum(
+            getattr(item.assertion_status, "value", item.assertion_status) == "PLANNED" for item in bindings
+        )
+        actual = sum(
+            getattr(item.assertion_status, "value", item.assertion_status) == "ACTUAL" for item in bindings
+        )
+        context.runtime.metrics["planned_vs_actual_ratio"] = planned / max(1.0, float(actual))
+        return _stage_result(context)
+
+
+class ClaimCanonicalizationStage:
+    name = "claim_canonicalization"
+    required_inputs = ("evidence",)
+    output_types = ("claims",)
+
+    def __init__(self, canonicalizer: ClaimCanonicalizer | None = None) -> None:
+        self._canonicalizer = canonicalizer or ClaimCanonicalizer()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        config = dict(context.options.get("pipeline_config") or {})
+        configured_normalization_version = config.get("temporal_normalization_version")
+        claims = [
+            self._canonicalizer.canonicalize(
+                draft,
+                temporal_bindings=(context.state.get("temporal_bindings_by_draft") or {}).get(index, []),
+                evidence_refs=[],
+                normalization_version=str(configured_normalization_version)
+                if configured_normalization_version else None,
+            )
+            for index, draft in enumerate(context.state.get("claim_drafts") or ())
+        ]
+        context.state.claims = claims
+        evidence_artifact = context.artifacts.evidence
+        claim_artifact = ClaimArtifact(
+            artifact_id="claims-pending",
+            artifact_type="claims",
+            producer_stage=self.name,
+            evidence_artifact_id=evidence_artifact.artifact_id if evidence_artifact else "",
+            claims=[claim.claim_id for claim in claims],
+            parent_artifact_ids=(evidence_artifact.artifact_id,) if evidence_artifact else (),
+        )
+        context.artifacts.claims = ClaimArtifact(
+            **{**claim_artifact.__dict__, "artifact_id": artifact_id_of(claim_artifact)}
+        )
+        return _stage_result(context, "claims")
+
+
+def _stage_timestamp(context: PipelineContext) -> datetime:
+    # Replay's fallback claim timestamp may be an old wall-clock value from a
+    # legacy fixture.  Lifecycle projection must use the same deterministic
+    # transcript boundary as the source run unless an explicit replay clock
+    # was supplied.
+    replay_without_explicit_clock = context.options.get("replay_lifecycle_timestamp") == "derive_transcript_boundary"
+    value = None if replay_without_explicit_clock else (
+        context.options.get("snapshot_commit_candidate")
+        or context.options.get("available_from")
+        or context.options.get("as_of")
+    )
+    if value is None and not (
+        context.options.get("offline_fixture") or "transcript" in context.options or "segments" in context.options
+    ):
+        return datetime.now(UTC)
+    if value is None:
+        # A missing fixture clock is represented by the transcript boundary,
+        # keeping this stage deterministic and avoiding a wall-clock identity.
+        end_ms = max((item.end_ms for item in context.artifacts.transcript.segments), default=0)
+        return datetime.fromtimestamp(end_ms / 1000, UTC)
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+class ClaimOccurrencePersistenceStage:
+    name = "claim_occurrence_persistence"
+    required_inputs = ("semantic_segments", "evidence", "claims")
+    output_types = ("occurrences", "claims")
+
+    def __init__(self, repository=None) -> None:
+        self._repository = repository
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        semantic_artifact = context.artifacts.semantic_segments
+        evidence_artifact = context.artifacts.evidence
+        if transcript is None or semantic_artifact is None:
+            raise ValueError("occurrence persistence requires transcript and semantic segments")
+        timestamp = _stage_timestamp(context)
+        def _time(name: str, fallback: datetime | None = None) -> datetime | None:
+            value = context.options.get(name, fallback)
+            return _resolved_datetime(value, name)
+        fixture_clock = bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+        )
+        # Production clocks describe actual processing events.  ``as_of`` is
+        # a business/query clock and must never become a Unix-epoch-like
+        # ingestion timestamp.  Fixture runs are the sole deterministic
+        # exception, where the transcript boundary is an explicit clock.
+        ingested = _time("ingested_at") or (timestamp if fixture_clock else datetime.now(UTC))
+        extracted = _time("extraction_completed_at") or (timestamp if fixture_clock else datetime.now(UTC))
+        source_available = _time("source_available_at")
+        if source_available is None and not fixture_clock:
+            source_available = ingested
+        binding_available = [
+            item.reference_available_at
+            for item in context.state.get("temporal_bindings") or ()
+            if getattr(item, "reference_available_at", None) is not None
+        ]
+        reference_available = max(
+            [item for item in [_time("reference_available_at"), *binding_available] if item],
+            default=None,
+        )
+        external_available = _time("external_available_at")
+        candidate = choose_snapshot_commit_candidate(
+            ingested_at=ingested,
+            extraction_completed_at=extracted,
+            source_available_at=source_available,
+            reference_available_at=reference_available,
+            external_available_at=external_available,
+            candidate=_time("snapshot_commit_candidate"),
+        )
+        context.options["snapshot_commit_candidate"] = candidate
+        claims = list(context.state.get("claims") or ())
+        drafts = list(context.state.get("claim_drafts") or ())
+        grounded = list(context.state.get("grounded_occurrences") or ())
+        occurrences = []
+        for draft_index, (claim, draft, relation) in enumerate(zip(claims, drafts, grounded)):
+            refs = sorted(set(relation.primary_evidence_refs))
+            source_published_at = _time("source_published_at")
+            if source_published_at is None and context.state.video:
+                source_published_at = _resolved_datetime(
+                    context.state.video.published_at,
+                    "video.published_at",
+                )
+            if source_published_at is None:
+                source_published_at = _resolved_datetime(
+                    (context.state.get("metadata") or {}).get("published_at"),
+                    "metadata.published_at",
+                )
+            times = OccurrenceTimes(
+                asserted_at=_time("asserted_at"),
+                source_published_at=source_published_at,
+                source_available_at=source_available,
+                source_availability_quality=str(context.options.get("source_availability_quality", "UNKNOWN")),
+                ingested_at=ingested,
+                extraction_completed_at=extracted,
+                snapshot_committed_at=candidate,
+                available_from=candidate,
+            )
+            occurrences.append(
+                ClaimOccurrence(
+                    claim_id=claim.claim_id,
+                    source_artifact_id=(
+                        context.artifacts.source.artifact_id
+                        if context.artifacts.source
+                        else transcript.artifact_id
+                    ),
+                    transcript_artifact_id=transcript.artifact_id,
+                    semantic_segment_id=draft.semantic_segment_id,
+                    evidence_refs=refs,
+                    condition_evidence_refs=list(relation.condition_evidence_refs),
+                    invalidation_evidence_refs=list(relation.invalidation_evidence_refs),
+                    temporal_evidence_refs=list(relation.temporal_evidence_refs),
+                    times=times,
+                    raw_temporal_expressions=[
+                        {
+                            "role": expression.role,
+                            "raw_expression": expression.raw_expression,
+                            "scope_hint": expression.scope_hint,
+                            "anchor": expression.anchor,
+                            "confidence": expression.confidence,
+                            "evidence_segment_indices": list(expression.evidence_segment_indices),
+                            "grounded_evidence_refs": list(next(
+                                (
+                                    binding.source_evidence_refs
+                                    for binding in context.state.get("temporal_bindings_by_draft", {}).get(
+                                        draft_index, []
+                                    )
+                                    if getattr(binding, "raw_expression", None) == expression.raw_expression
+                                ),
+                                [],
+                            )),
+                        }
+                        for expression in draft.temporal_expressions
+                    ],
+                    provenance={
+                        "model_id": draft.extraction_model_id,
+                        "prompt_version": draft.extraction_prompt_version,
+                    },
+                )
+            )
+        occurrence_artifact = ClaimOccurrenceArtifact(
+            artifact_id="occurrences-pending",
+            artifact_type="occurrences",
+            producer_stage=self.name,
+            semantic_segment_artifact_id=semantic_artifact.artifact_id,
+            evidence_artifact_id=evidence_artifact.artifact_id if evidence_artifact else "",
+            occurrence_ids=[item.occurrence_id for item in occurrences],
+            parent_artifact_ids=tuple(
+                item.artifact_id for item in (semantic_artifact, evidence_artifact) if item is not None
+            ),
+        )
+        context.artifacts.occurrences = ClaimOccurrenceArtifact(
+            **{**occurrence_artifact.__dict__, "artifact_id": artifact_id_of(occurrence_artifact)}
+        )
+        # The final canonical claim artifact is downstream of the occurrence
+        # artifact.  Keep the evidence field for compatibility, but make the
+        # parent edge authoritative for the Evidence -> Occurrence -> Claim
+        # lineage required by the final design.
+        if context.artifacts.claims is not None:
+            claim_artifact = ClaimArtifact(
+                artifact_id="claims-final-pending",
+                artifact_type="claims",
+                producer_stage=self.name,
+                evidence_artifact_id=evidence_artifact.artifact_id if evidence_artifact else "",
+                claims=[item.claim_id for item in claims],
+                parent_artifact_ids=(context.artifacts.occurrences.artifact_id,),
+            )
+            context.artifacts.claims = ClaimArtifact(
+                **{**claim_artifact.__dict__, "artifact_id": artifact_id_of(claim_artifact)}
+            )
+        context.state["occurrences"] = occurrences
+        # Durable occurrence rows are committed together with the snapshot at
+        # the snapshot boundary; this stage only materializes immutable state.
+        context.runtime.metrics["occurrence_count"] = float(len(occurrences))
+        context.runtime.metrics["occurrences_per_claim"] = len(occurrences) / max(1.0, float(len(claims)))
+        context.runtime.metrics["dependency_availability_delay_ms"] = max(
+            0.0,
+            (candidate - min(ingested, extracted)).total_seconds() * 1000.0,
+        )
+        return _stage_result(context, "occurrences", "claims")
+
+
+class LifecycleProjectionStage:
+    name = "lifecycle_projection"
+    # Lifecycle is a projection of both immutable occurrence rows and the
+    # verification decision available at this point in the graph.  Requiring
+    # the verification artifact prevents publishing a historical lifecycle
+    # closure that silently omits its verification lineage.
+    required_inputs = ("occurrences", "verification")
+    output_types = ("lifecycle", "knowledge")
+
+    def __init__(self, repository=None) -> None:
+        self._repository = repository
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        fixture_clock = bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+        )
+        # A fixture without an explicit business clock must be replayable.  The
+        # download compatibility adapter may expose a wall-clock source
+        # availability timestamp for PUBLIC_STRICT search, but that timestamp
+        # is not a lifecycle business clock.  Use the immutable transcript
+        # boundary for both the initial run and replay.
+        if fixture_clock and not any(
+            context.options.get(key)
+            for key in ("as_of", "available_from", "replay_lifecycle_timestamp")
+        ):
+            end_ms = max(
+                (item.end_ms for item in context.artifacts.transcript.segments),
+                default=0,
+            )
+            timestamp = datetime.fromtimestamp(end_ms / 1000, UTC)
+        else:
+            timestamp = _stage_timestamp(context)
+        claims = list(context.state.get("claims") or ())
+        occurrences = list(context.state.get("occurrences") or ())
+        events = []
+        for target_type, target_id in [
+            *(('CLAIM', item.claim_id) for item in claims),
+            *(('OCCURRENCE', item.occurrence_id) for item in occurrences),
+        ]:
+            events.append(
+                KnowledgeLifecycleEvent(
+                    target_type=target_type,
+                    target_id=target_id,
+                    to_status="ACTIVE",
+                    effective_at=timestamp,
+                    recorded_at=timestamp,
+                    reason_code="INITIAL_EXTRACTION",
+                    policy_version="lifecycle.v1",
+                )
+            )
+        occurrence_artifact = context.artifacts.occurrences
+        lifecycle_artifact = LifecycleArtifact(
+            artifact_id="lifecycle-pending",
+            artifact_type="lifecycle",
+            producer_stage=self.name,
+            claim_lifecycle_event_ids=[
+                item.lifecycle_event_id for item in events if item.target_type.value == "CLAIM"
+            ],
+            occurrence_lifecycle_event_ids=[
+                item.lifecycle_event_id for item in events if item.target_type.value == "OCCURRENCE"
+            ],
+            lifecycle_business_as_of=timestamp,
+            lifecycle_knowledge_as_of=timestamp,
+            policy_version="lifecycle.v1",
+            parent_artifact_ids=tuple(
+                item.artifact_id
+                for item in (occurrence_artifact, context.artifacts.verification)
+                if item is not None
+            ),
+        )
+        context.artifacts.lifecycle = LifecycleArtifact(
+            **{**lifecycle_artifact.__dict__, "artifact_id": artifact_id_of(lifecycle_artifact)}
+        )
+        context.state["lifecycle_events"] = events
+        # Rebuild the final knowledge projection after lifecycle assignment so
+        # the authoritative chain is Verification -> Lifecycle -> Knowledge.
+        # The verification id remains as an explicit compatibility field.
+        lifecycle_id = context.artifacts.lifecycle.artifact_id
+        for unit in context.state.get("knowledge") or ():
+            attributes = dict(unit.attributes or {})
+            attributes["lifecycle_status"] = "ACTIVE"
+            attributes["lifecycle_artifact_id"] = lifecycle_id
+            unit.attributes = attributes
+        if context.artifacts.knowledge is not None:
+            knowledge_artifact = KnowledgeArtifact(
+                artifact_id="knowledge-final-pending",
+                artifact_type="knowledge",
+                producer_stage="knowledge_projection",
+                verification_artifact_id=(
+                    context.artifacts.verification.artifact_id
+                    if context.artifacts.verification else ""
+                ),
+                knowledge_units=[unit.knowledge_uid for unit in context.state.get("knowledge") or ()],
+                parent_artifact_ids=(lifecycle_id,),
+            )
+            context.artifacts.knowledge = KnowledgeArtifact(
+                **{**knowledge_artifact.__dict__, "artifact_id": artifact_id_of(knowledge_artifact)}
+            )
+        # Durable event inserts are deferred to the snapshot commit boundary.
+        context.runtime.metrics["lifecycle_event_count"] = float(len(events))
+        context.runtime.metrics["lifecycle_transition_count"] = float(len(events))
+        correction_count = float(sum(
+            str(item.reason_code).upper() in {"CORRECTION", "CORRECTED", "REVISED"}
+            for item in events
+        ))
+        context.runtime.metrics["correction_count"] = correction_count
+        context.runtime.metrics["lifecycle_correction_count"] = correction_count
+        return _stage_result(context, "lifecycle", "knowledge")
+
+
 class KnowledgeExtractionStage:
     name = "knowledge"
     required_inputs = ("transcript",)
     output_types = ("evidence", "claims", "verification", "knowledge")
+    optional_output_types = ("evidence", "claims")
 
     def __init__(
         self,
         model_client: ContentModelClient | None = None,
         fixture_extractor: KnowledgeExtractor | None = None,
         external_verifier: ExternalFactVerifier | None = None,
+        authoritative_only: bool = False,
     ) -> None:
         self._model_client = model_client or ContentModelClient()
         self._structured_extractor = KnowledgeUnitExtractor(self._model_client)
@@ -632,6 +1453,7 @@ class KnowledgeExtractionStage:
         self._deduplicator = KnowledgeDeduplicator()
         self._external = external_verifier or ExternalFactVerifier()
         self._fixture_extractor = fixture_extractor or KnowledgeExtractor()
+        self._authoritative_only = authoritative_only
 
     @staticmethod
     def _timestamp(value: object) -> datetime:
@@ -771,6 +1593,14 @@ class KnowledgeExtractionStage:
                 {
                     "knowledge_uid": unit.knowledge_uid,
                     "statement": unit.statement,
+                    "claim_type": (
+                        "FINANCIAL_METRIC"
+                        if any(
+                            term in unit.statement
+                            for term in ("营收", "收入", "利润", "业绩", "毛利率")
+                        )
+                        else "INDUSTRY_RELATION"
+                    ),
                     "knowledge_kind": "STATE",
                     "subject_key": unit.ticker or unit.subject,
                     "subject_name": unit.subject,
@@ -908,6 +1738,15 @@ class KnowledgeExtractionStage:
                 + [item.artifact_id for item in context.artifacts.vision],
             )
         )
+        evidence_parent_ids = tuple(
+            dict.fromkeys(
+                [
+                    *source_ids,
+                    context.artifacts.semantic_segments.artifact_id
+                    if context.artifacts.semantic_segments else "",
+                ]
+            )
+        )
         evidence = EvidenceArtifact(
             artifact_id="evidence-pending",
             artifact_type="evidence",
@@ -915,7 +1754,7 @@ class KnowledgeExtractionStage:
             transcript_artifact_id=transcript.artifact_id if transcript else "",
             evidences=evidence_items,
             source_artifact_ids=source_ids,
-            parent_artifact_ids=source_ids,
+            parent_artifact_ids=tuple(item for item in evidence_parent_ids if item),
         )
         context.artifacts.evidence = EvidenceArtifact(
             **{**evidence.__dict__, "artifact_id": artifact_id_of(evidence)}
@@ -1040,11 +1879,111 @@ class KnowledgeExtractionStage:
         context.artifacts.verification = VerificationArtifact(
             **{**verification.__dict__, "artifact_id": artifact_id_of(verification)}
         )
+        if context.artifacts.lifecycle is not None:
+            lifecycle = LifecycleArtifact(
+                artifact_id="lifecycle-chain-pending",
+                artifact_type="lifecycle",
+                producer_stage="lifecycle_projection",
+                claim_lifecycle_event_ids=list(context.artifacts.lifecycle.claim_lifecycle_event_ids or ()),
+                occurrence_lifecycle_event_ids=list(
+                    context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ()
+                ),
+                lifecycle_business_as_of=context.artifacts.lifecycle.lifecycle_business_as_of,
+                lifecycle_knowledge_as_of=context.artifacts.lifecycle.lifecycle_knowledge_as_of,
+                policy_version=context.artifacts.lifecycle.policy_version,
+                parent_artifact_ids=tuple(
+                    item.artifact_id
+                    for item in (context.artifacts.occurrences, context.artifacts.verification)
+                    if item is not None
+                ),
+            )
+            context.artifacts.lifecycle = LifecycleArtifact(
+                **{**lifecycle.__dict__, "artifact_id": artifact_id_of(lifecycle)}
+            )
+
+    @staticmethod
+    def _overlay_fixture_lineage(
+        records: list[dict],
+        claims: list[FinancialClaim],
+        occurrences: list[ClaimOccurrence],
+    ) -> bool:
+        """Attach canonical IDs to offline read projections without replacing them.
+
+        The semantic stages are the source of truth for claims and occurrences.
+        Fixture extraction only supplies the legacy read-model shape (including
+        stable fixture knowledge UIDs), so a cardinality mismatch is rejected
+        by returning ``False`` to the authoritative projection fallback.
+        """
+        if not (len(records) == len(claims) == len(occurrences)):
+            return False
+        for record, claim, occurrence in zip(records, claims, occurrences):
+            record["claim_type"] = claim.claim_type
+            attributes = dict(record.get("attributes") or {})
+            attributes.update({
+                "claim_id": claim.claim_id,
+                "occurrence_id": occurrence.occurrence_id,
+                "semantic_segment_id": occurrence.semantic_segment_id,
+                "asserted_at": occurrence.times.asserted_at.isoformat()
+                if occurrence.times.asserted_at else None,
+                "source_published_at": occurrence.times.source_published_at.isoformat()
+                if occurrence.times.source_published_at else None,
+                "source_available_at": occurrence.times.source_available_at.isoformat()
+                if occurrence.times.source_available_at else None,
+                "source_availability_quality": occurrence.times.source_availability_quality.value,
+                "ingested_at": occurrence.times.ingested_at.isoformat(),
+                "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
+                "available_from": occurrence.times.available_from.isoformat(),
+            })
+            record["attributes"] = attributes
+            record["_claim_id"] = claim.claim_id
+        return True
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         available_from = self._timestamp(context.options.get("available_from") or context.options.get("as_of"))
-        if context.options.get("offline_fixture") is True:
+        fixture = bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+        )
+        if self._authoritative_only and not fixture:
+            return self._project_authoritative(context, available_from)
+        if fixture and self._authoritative_only:
             records = self._fixture_records(context, available_from)
+            # Offline fixtures are a read-model compatibility overlay.  Never
+            # synthesize or replace the canonical semantic claim/occurrence
+            # objects already produced by the preceding stages.
+            if not self._overlay_fixture_lineage(
+                records,
+                list(context.state.get("claims") or ()),
+                list(context.state.get("occurrences") or ()),
+            ):
+                return self._project_authoritative(context, available_from)
+            claim_artifact = context.artifacts.claims
+            results = [
+                VerificationResult(
+                    claim_id=claim.claim_id,
+                    status=(
+                        "VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED"
+                    ),
+                )
+                for claim in context.state.get("claims") or ()
+            ]
+            verification = VerificationArtifact(
+                artifact_id="verification-pending",
+                artifact_type="verification",
+                producer_stage="verification",
+                claim_artifact_id=claim_artifact.artifact_id if claim_artifact else "",
+                results=results,
+                parent_artifact_ids=(claim_artifact.artifact_id,) if claim_artifact else (),
+            )
+            context.artifacts.verification = VerificationArtifact(
+                **{**verification.__dict__, "artifact_id": artifact_id_of(verification)}
+            )
+        elif fixture:
+            # Legacy/chapter-only configurations still rely on the fixture
+            # extractor to materialize their compatibility claim chain.
+            records = self._fixture_records(context, available_from)
+            self._register_claim_chain(context, records)
         else:
             metadata = dict(context.state["metadata"])
             metadata.setdefault("platform", context.source["type"])
@@ -1056,10 +1995,53 @@ class KnowledgeExtractionStage:
             records = self._external.verify_many(records)
             records = self._temporal.apply(records, available_from)
             records = self._deduplicator.deduplicate(records)
-        self._register_claim_chain(context, records)
+        if not fixture:
+            self._register_claim_chain(context, records)
+        # Close the active semantic -> evidence -> occurrence -> claim chain
+        # after the legacy-compatible extractor has produced final claims.
+        if not fixture and context.artifacts.occurrences is not None:
+            occurrence = ClaimOccurrenceArtifact(
+                artifact_id="occurrences-chain-pending",
+                artifact_type="occurrences",
+                producer_stage="claim_occurrence_persistence",
+                semantic_segment_artifact_id=(
+                    context.artifacts.semantic_segments.artifact_id
+                    if context.artifacts.semantic_segments
+                    else ""
+                ),
+                evidence_artifact_id=(
+                    context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""
+                ),
+                occurrence_ids=list(context.artifacts.occurrences.occurrence_ids or ()),
+                parent_artifact_ids=tuple(
+                    item.artifact_id
+                    for item in (context.artifacts.semantic_segments, context.artifacts.evidence)
+                    if item is not None
+                ),
+            )
+            context.artifacts.occurrences = ClaimOccurrenceArtifact(
+                **{**occurrence.__dict__, "artifact_id": artifact_id_of(occurrence)}
+            )
+            claim_artifact = ClaimArtifact(
+                artifact_id="claims-fixture-chain-pending",
+                artifact_type="claims",
+                producer_stage="claim_occurrence_persistence",
+                evidence_artifact_id=(
+                    context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""
+                ),
+                claims=[claim.claim_id for claim in context.state.claims],
+                parent_artifact_ids=(context.artifacts.occurrences.artifact_id,),
+            )
+            context.artifacts.claims = ClaimArtifact(
+                **{**claim_artifact.__dict__, "artifact_id": artifact_id_of(claim_artifact)}
+            )
         context.state["knowledge"] = self._to_domain(context.state["video"].video_id, records, available_from)
+        claims_by_id = {claim.claim_id: claim for claim in context.state.claims}
         claims_by_uid = {
-            str(record.get("knowledge_uid")): claim
+            str(record.get("knowledge_uid")): (
+                claims_by_id.get(str(record.get("_claim_id")))
+                or claim
+            )
             for record, claim in zip(records, context.state.claims)
         }
         for unit in context.state.knowledge:
@@ -1094,6 +2076,105 @@ class KnowledgeExtractionStage:
             **{**knowledge.__dict__, "artifact_id": artifact_id_of(knowledge)}
         )
         return _stage_result(context, "evidence", "claims", "verification", "knowledge")
+
+    def _project_authoritative(self, context: PipelineContext, available_from: datetime) -> PipelineContext:
+        """Build the read model from the semantic canonical chain only.
+
+        This branch deliberately does not call the legacy extractor or replace
+        evidence/claims/occurrence/lifecycle slots.  It is a projection for
+        search/read consumers, not another source of truth.
+        """
+        claims = list(context.state.get("claims") or ())
+        occurrences = list(context.state.get("occurrences") or ())
+        verification_results = [
+            VerificationResult(
+                claim_id=claim.claim_id,
+                status="VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED",
+            )
+            for claim in claims
+        ]
+        claim_artifact = context.artifacts.claims
+        verification = VerificationArtifact(
+            artifact_id="verification-pending",
+            artifact_type="verification",
+            producer_stage="verification",
+            claim_artifact_id=claim_artifact.artifact_id if claim_artifact else "",
+            results=verification_results,
+            parent_artifact_ids=(claim_artifact.artifact_id,) if claim_artifact else (),
+        )
+        context.artifacts.verification = VerificationArtifact(
+            **{**verification.__dict__, "artifact_id": artifact_id_of(verification)}
+        )
+        if context.artifacts.lifecycle is not None:
+            lifecycle = LifecycleArtifact(
+                artifact_id="lifecycle-chain-pending",
+                artifact_type="lifecycle",
+                producer_stage="lifecycle_projection",
+                claim_lifecycle_event_ids=list(context.artifacts.lifecycle.claim_lifecycle_event_ids),
+                occurrence_lifecycle_event_ids=list(context.artifacts.lifecycle.occurrence_lifecycle_event_ids),
+                lifecycle_business_as_of=context.artifacts.lifecycle.lifecycle_business_as_of,
+                lifecycle_knowledge_as_of=context.artifacts.lifecycle.lifecycle_knowledge_as_of,
+                policy_version=context.artifacts.lifecycle.policy_version,
+                parent_artifact_ids=tuple(
+                    item.artifact_id for item in (context.artifacts.occurrences, context.artifacts.verification) if item
+                ),
+            )
+            context.artifacts.lifecycle = LifecycleArtifact(
+                **{**lifecycle.__dict__, "artifact_id": artifact_id_of(lifecycle)}
+            )
+        occurrences_by_claim: dict[str, list[ClaimOccurrence]] = {}
+        for item in occurrences:
+            occurrences_by_claim.setdefault(item.claim_id, []).append(item)
+        records: list[dict[str, Any]] = []
+        for claim in claims:
+            occurrence = (occurrences_by_claim.get(claim.claim_id) or [None]).pop(0)
+            projection = KnowledgeProjectionBuilder().build(claim, occurrence, verification_results[len(records)])
+            projected_attributes = dict(projection.get("attributes", {}))
+            if occurrence is not None:
+                projected_attributes.update({
+                    "source_available_at": (
+                        occurrence.times.source_available_at.isoformat()
+                        if occurrence.times.source_available_at else None
+                    ),
+                    "source_availability_quality": occurrence.times.source_availability_quality.value,
+                    "ingested_at": occurrence.times.ingested_at.isoformat(),
+                    "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
+                    "available_from": occurrence.times.available_from.isoformat(),
+                })
+            records.append({
+                "knowledge_uid": projection["knowledge_uid"],
+                "statement": str(claim.value if isinstance(claim.value, str) else claim.predicate),
+                "knowledge_kind": claim.fact_category,
+                "subject_key": claim.subject_id,
+                "ticker": claim.ticker,
+                "sentiment": "NEUTRAL",
+                "support_status": {
+                    "SUPPORTED": "SOURCE_SUPPORTED",
+                    "PARTIALLY_SUPPORTED": "SOURCE_PARTIAL",
+                }.get(claim.source_support_status, "SOURCE_UNSUPPORTED"),
+                "truth_status": "NOT_CHECKED",
+                "lifecycle_status": "ACTIVE",
+                "support_score": claim.source_confidence,
+                "extraction_confidence": claim.extractor_confidence,
+                "as_of_time": available_from,
+                "attributes": projected_attributes,
+                "extractor_version": claim.extraction_prompt_version,
+                "schema_version": claim.claim_schema_version,
+                "semantic_hash": claim.claim_id,
+            })
+        context.state["knowledge"] = self._to_domain(context.state["video"].video_id, records, available_from)
+        knowledge = KnowledgeArtifact(
+            artifact_id="knowledge-pending",
+            artifact_type="knowledge",
+            producer_stage="knowledge_projection",
+            verification_artifact_id=context.artifacts.verification.artifact_id,
+            knowledge_units=[unit.knowledge_uid for unit in context.state["knowledge"]],
+            parent_artifact_ids=(context.artifacts.verification.artifact_id,),
+        )
+        context.artifacts.knowledge = KnowledgeArtifact(
+            **{**knowledge.__dict__, "artifact_id": artifact_id_of(knowledge)}
+        )
+        return _stage_result(context, "verification", "knowledge")
 
 
 class VerificationStage:
@@ -1215,11 +2296,23 @@ class SnapshotRecordingStage:
     """
 
     name = "content_snapshot"
-    required_inputs = ("source", "media", "transcript", "evidence", "claims", "verification", "knowledge", "summary")
+    required_inputs = (
+        "source", "media", "transcript", "semantic_segments", "evidence", "claims", "occurrences",
+        "verification", "lifecycle", "knowledge", "summary",
+    )
     output_types = ()
 
-    def __init__(self, snapshot_service: SnapshotService) -> None:
+    def __init__(
+        self,
+        snapshot_service: SnapshotService,
+        artifact_repository=None,
+        occurrence_repository=None,
+        lifecycle_repository=None,
+    ) -> None:
         self._snapshots = snapshot_service
+        self._artifact_repository = artifact_repository
+        self._occurrence_repository = occurrence_repository
+        self._lifecycle_repository = lifecycle_repository
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         registry = context.artifacts
@@ -1228,18 +2321,55 @@ class SnapshotRecordingStage:
             "evidence": registry.evidence, "claims": registry.claims, "verification": registry.verification,
             "knowledge": registry.knowledge, "summary": registry.summary,
         }
+        semantic_enabled = bool((context.options.get("pipeline_config") or {}).get(
+            "semantic_segmentation_enabled", True
+        ))
+        if semantic_enabled:
+            mandatory.update({
+                "semantic_segments": registry.semantic_segments,
+                "occurrences": registry.occurrences,
+                "lifecycle": registry.lifecycle,
+            })
         missing = [slot for slot, artifact in mandatory.items() if artifact is None]
         if missing:
             raise ContentSnapshotPersistError(
                 f"CONTENT_SNAPSHOT_PERSIST_FAILED: mandatory artifact missing: {sorted(missing)}"
             )
+        if self._artifact_repository is not None:
+            for artifact in registry.artifacts():
+                self._artifact_repository.put(artifact)
         source_content_hash = str(registry.source.raw_content_hash or registry.source.source_content_hash or "")
         if not source_content_hash:
             raise ContentSnapshotPersistError("CONTENT_SNAPSHOT_PERSIST_FAILED: source raw hash missing")
         try:
+            if self._occurrence_repository is not None:
+                for occurrence in context.state.get("occurrences") or ():
+                    validator = getattr(self._occurrence_repository, "validate_immutable", None)
+                    if validator is not None:
+                        validator(occurrence)
             producer_manifest = _producer_manifest(context)
+            reference_records = []
+            reference_snapshot_ids = set()
+            for binding in context.state.get("temporal_bindings") or ():
+                snapshot_id = getattr(binding, "reference_snapshot_id", None)
+                if not snapshot_id:
+                    continue
+                reference_snapshot_ids.add(str(snapshot_id))
+                reference_records.append({
+                    "snapshot_id": str(snapshot_id),
+                    "data_version": getattr(binding, "reference_data_version", None),
+                    "available_at": (
+                        binding.reference_available_at.isoformat()
+                        if getattr(binding, "reference_available_at", None) is not None else None
+                    ),
+                })
+            reference_records.sort(key=lambda item: (
+                item["snapshot_id"], item.get("data_version") or "", item.get("available_at") or ""
+            ))
+            if reference_records:
+                producer_manifest["reference_data"] = reference_records
             manifest_models = dict(producer_manifest.get("models") or {})
-            snapshot = self._snapshots.record_from_artifacts(
+            snapshot = self._snapshots.record_bundle_from_artifacts(
                 source_type=context.source["type"],
                 source_ref=context.source["ref"],
                 source_content_hash=source_content_hash,
@@ -1270,9 +2400,17 @@ class SnapshotRecordingStage:
                     **dict(context.options.get("pipeline_config") or {}),
                 },
                 external_snapshots=tuple(
-                    context.options.get("external_snapshot_ids")
-                    or context.options.get("quant_market_snapshot_ids")
-                    or ()
+                    sorted(
+                        reference_snapshot_ids
+                        | {
+                            str(item)
+                            for item in (
+                                context.options.get("external_snapshot_ids")
+                                or context.options.get("quant_market_snapshot_ids")
+                                or ()
+                            )
+                        }
+                    )
                 ),
                 policy_versions={
                     "claim": context.options.get("claim_policy_version", "claim_policy.v1"),
@@ -1281,16 +2419,34 @@ class SnapshotRecordingStage:
                     ),
                     "signal": context.options.get("signal_policy_version", "signal_policy.v1"),
                 },
-                quant_market_snapshot_ids=list(context.options.get("quant_market_snapshot_ids") or []),
+                quant_market_snapshot_ids=sorted({
+                    str(item) for item in (context.options.get("quant_market_snapshot_ids") or ())
+                } | reference_snapshot_ids),
                 config_hash=str(producer_manifest["configs"]["config_hash"]),
                 snapshot_kind=str(context.options.get("replay_snapshot_kind") or "INITIAL"),
                 parent_snapshot_id=context.options.get("replay_parent_snapshot_id"),
                 supersedes_snapshot_id=context.options.get("replay_supersedes_snapshot_id"),
                 pipeline_version=str(context.options.get("replay_pipeline_version") or "pipeline.v3"),
+                created_at=(
+                    context.state.occurrences[0].times.snapshot_committed_at
+                    if context.state.get("occurrences") else _stage_timestamp(context)
+                ),
+                occurrences=tuple(context.state.get("occurrences") or ()),
+                lifecycle_events=tuple(context.state.get("lifecycle_events") or ()),
             )
         except Exception as exc:  # noqa: BLE001 - 显式失败，绝不静默
             raise ContentSnapshotPersistError(f"CONTENT_SNAPSHOT_PERSIST_FAILED: {exc}") from exc
         context.state["content_snapshot_id"] = snapshot.content_snapshot_id
+        # ``record_bundle_from_artifacts`` commits occurrence/lifecycle rows
+        # with the snapshot for SQL stores.  Keep the explicit repositories as
+        # a compatibility fallback for custom stores without that capability.
+        if not hasattr(getattr(self._snapshots, "_store", None), "save_bundle"):
+            if self._occurrence_repository is not None:
+                for occurrence in context.state.get("occurrences") or ():
+                    self._occurrence_repository.save(occurrence)
+            if self._lifecycle_repository is not None:
+                for event in context.state.get("lifecycle_events") or ():
+                    self._lifecycle_repository.append(event)
         # snapshot identity 回填知识 attributes，供 signal v3 透传 content_snapshot_id。
         for unit in context.state.get("knowledge") or []:
             attributes = dict(unit.attributes or {})
@@ -1339,9 +2495,52 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     models.setdefault("ocr", context.options.get("ocr_model") or "fixture")
     models.setdefault("ocr_version", context.options.get("ocr_model_version") or "1")
     models.setdefault("vision", context.options.get("vision_model") or "unknown")
-    models.setdefault("llm", context.options.get("llm_model") or "unknown")
+    pipeline_config = dict(context.options.get("pipeline_config") or {})
+    models.setdefault(
+        "segmentation",
+        context.options.get("segmentation_model") or pipeline_config.get("segmentation_model") or "unknown",
+    )
+    models.setdefault(
+        "extraction",
+        context.options.get("extraction_model") or pipeline_config.get("extraction_model") or "unknown",
+    )
+    models.setdefault("llm", context.options.get("llm_model") or models.get("extraction") or "unknown")
     models.setdefault("embedding", context.options.get("embedding_model") or "unknown")
     manifest["models"] = models
+    semantic_artifact = context.artifacts.semantic_segments
+    manifest.setdefault(
+        "semantic_segmentation",
+        {
+            "model": getattr(semantic_artifact, "model_id", None) or models.get("segmentation", "unknown"),
+            "prompt": getattr(semantic_artifact, "prompt_version", None)
+            or (context.options.get("pipeline_config") or {}).get(
+                "segmentation_prompt_version", "semantic-segmentation.prompt.v1"
+            ),
+            "schema": getattr(semantic_artifact, "segmentation_schema_version", None)
+            or "semantic-segment.v1",
+        },
+    )
+    manifest.setdefault(
+        "atomic_claim_extraction",
+        {
+            "model": pipeline_config.get("extraction_model")
+            or context.options.get("llm_model") or models.get("llm", "unknown"),
+            "prompt": context.options.get("atomic_claim_prompt_version")
+            or (context.options.get("pipeline_config") or {}).get(
+                "extraction_prompt_version", "atomic-claim-extraction.prompt.v1"
+            ),
+            "schema": "claim-occurrence-draft.v1",
+        },
+    )
+    manifest.setdefault(
+        "temporal_normalization",
+        {
+            "version": (context.options.get("pipeline_config") or {}).get(
+                "temporal_normalization_version", "temporal-normalization.final.v1"
+            ),
+            "deterministic": True,
+        },
+    )
     prompts = dict(manifest.get("prompts") or {})
     prompts.setdefault("extraction", context.options.get("extraction_prompt_version", "extraction.v1"))
     prompts.setdefault("normalization", context.options.get("normalization_prompt_version", "normalization.v1"))
@@ -1376,8 +2575,15 @@ class ClaimPersistenceStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         if self._artifacts is not None and context.artifacts.evidence is not None:
             self._artifacts.put(context.artifacts.evidence)
+        occurrence_refs = {
+            item.claim_id: list(item.evidence_refs)
+            for item in context.state.get("occurrences") or ()
+        }
         for claim in context.state.claims:
-            self._claims.save(claim)
+            self._claims.save(
+                claim,
+                compatibility_evidence_refs=occurrence_refs.get(claim.claim_id),
+            )
         if self._artifacts is not None and context.artifacts.claims is not None:
             self._artifacts.put(context.artifacts.claims)
             if hasattr(self._artifacts, "put_claim_members"):
@@ -1456,9 +2662,6 @@ class PersistStage:
                         result.model_dump(mode="json") | {"provider": "none"},
                         verification_artifact_id=context.artifacts.verification.artifact_id,
                         trace_id=context.trace.get("trace_id"),
-                        producer={
-                            "decision_id": context.trace.get("decision_id")
-                        } if context.trace.get("decision_id") else None,
                         decision_id=context.trace.get("decision_id"),
                     )
         if self._artifacts and context.artifacts.claims is not None and hasattr(
@@ -1513,7 +2716,28 @@ class BuildVideoStage:
     output_types = ()
 
     def execute(self, context: PipelineContext) -> PipelineContext:
-        metadata = context.state["metadata"]
+        metadata = context.state.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            raise ValueError("source metadata must be an object")
+        def _resolved_value(name: str) -> Any:
+            # Explicit options are the caller-visible resolution override;
+            # otherwise use the authoritative adapter metadata unchanged.
+            if context.options.get(name) is not None:
+                return context.options[name]
+            return metadata.get(name)
+
+        published_at = _resolved_datetime(_resolved_value("published_at"), "published_at")
+        resolved_at = _resolved_datetime(_resolved_value("resolved_at"), "resolved_at")
+        canonical_url = _resolved_value("canonical_url")
+        if canonical_url is None:
+            candidate_url = metadata.get("source_ref")
+            if isinstance(candidate_url, str) and candidate_url.startswith(("http://", "https://")):
+                canonical_url = candidate_url
+        if canonical_url is not None and not isinstance(canonical_url, str):
+            raise ValueError("invalid canonical_url: expected string")
+        source_version = _resolved_value("source_version")
+        if source_version is not None and not isinstance(source_version, str):
+            raise ValueError("invalid source_version: expected string")
         source_key = f"{context.source['type']}:{context.source['ref']}"
         video_id = hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:32]
         transcript = context.state["transcript"]
@@ -1526,5 +2750,10 @@ class BuildVideoStage:
             duration_seconds=metadata.get("duration_seconds"),
             transcript_text=transcript,
             source_hash=(context.artifacts.source.raw_content_hash if context.artifacts.source else ""),
+            canonical_url=canonical_url,
+            published_at=published_at,
+            source_version=source_version,
+            metadata=dict(metadata),
+            resolved_at=resolved_at,
         )
         return _stage_result(context)

@@ -12,6 +12,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .temporal_identity import canonical_bindings, canonical_relations
+from .temporal_semantics import ClaimTemporalBinding, ClaimTemporalRelation
+
 ClaimType = Literal[
     "PRICE",
     "RETURN",
@@ -74,6 +77,7 @@ class FinancialClaim(BaseModel):
 
     subject_type: str
     subject_id: str
+    ticker: str | None = None
 
     predicate: str
     value: Any = None
@@ -96,6 +100,9 @@ class FinancialClaim(BaseModel):
     extraction_prompt_version: str = "unknown"
     condition_text: str | None = None
     invalidation_text: str | None = None
+    condition_key: str | None = None
+    temporal_bindings: list[ClaimTemporalBinding] = Field(default_factory=list)
+    temporal_relations: list[ClaimTemporalRelation] = Field(default_factory=list)
     claim_schema_version: str = "claim.v2"
     normalization_version: str = "normalization.v1"
 
@@ -114,7 +121,7 @@ class FinancialClaim(BaseModel):
     @model_validator(mode="after")
     def _invariants(self) -> "FinancialClaim":
         # 所有 claim 必须有 evidence（最终验收标准）。
-        if not self.evidence_refs:
+        if not self.evidence_refs and self.claim_schema_version != "claim.final.v1":
             raise ValueError("claim requires at least one evidence_ref")
         if not self.fact_category:
             self.fact_category = CLAIM_CATEGORY[self.claim_type]
@@ -123,7 +130,7 @@ class FinancialClaim(BaseModel):
         return self
 
     def content_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "claim_type": self.claim_type,
             "subject_type": self.subject_type,
             "subject_id": self.subject_id,
@@ -137,6 +144,18 @@ class FinancialClaim(BaseModel):
             "claim_schema_version": self.claim_schema_version,
             "normalization_version": self.normalization_version,
         }
+        if self.condition_key or self.temporal_bindings or self.temporal_relations:
+            # Legacy fact_time/period fields are compatibility projections and
+            # cannot alter identity once temporal bindings are authoritative.
+            payload.pop("fact_time", None)
+            payload.pop("period_start", None)
+            payload.pop("period_end", None)
+            payload.update({
+                "condition_key": self.condition_key,
+                "temporal_bindings": [x.temporal_binding_id for x in canonical_bindings(self.temporal_bindings)],
+                "temporal_relations": [x.temporal_relation_id for x in canonical_relations(self.temporal_relations)],
+            })
+        return payload
 
 
 def claim_id_of(claim: FinancialClaim) -> str:

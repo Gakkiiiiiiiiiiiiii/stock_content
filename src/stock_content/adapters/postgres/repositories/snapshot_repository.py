@@ -489,6 +489,7 @@ class SqlSnapshotStore:
                 "parent_snapshot_id": snapshot.parent_snapshot_id,
                 "supersedes_snapshot_id": snapshot.supersedes_snapshot_id,
                 "producer_manifest": dict(snapshot.producer_manifest),
+                "lifecycle_artifact_id": (snapshot.artifact_ids or {}).get("lifecycle"),
                 "created_at": snapshot.created_at,
             }
             _validate_snapshot_artifacts(
@@ -519,6 +520,7 @@ class SqlSnapshotStore:
                         "content_snapshot_id": snapshot.content_snapshot_id,
                         "artifact_id": artifact_id,
                         "slot": slot,
+                        "artifact_role": slot.upper(),
                     },
                     [ContentSnapshotArtifactRow.member_id],
                 )
@@ -534,6 +536,93 @@ class SqlSnapshotStore:
                     created_at=snapshot.created_at,
                 )
         return snapshot
+
+    def save_bundle(self, snapshot: ContentSnapshot, occurrences=(), lifecycle_events=()) -> ContentSnapshot:
+        """Commit snapshot and its immutable dependent ledgers as one SQL unit.
+
+        The normal repositories intentionally expose small independent writes
+        for compatibility.  Publication is different: an occurrence or
+        lifecycle row without the snapshot is not an authoritative state, so
+        this boundary keeps all three writes on the same Session/transaction.
+        """
+        from stock_content.adapters.postgres.repositories.claim_occurrence_repository import (
+            ClaimOccurrenceRepository,
+        )
+        from stock_content.adapters.postgres.repositories.lifecycle_repository import LifecycleRepository
+
+        payload = _validate_snapshot_candidate(snapshot)
+        occurrence_writer = ClaimOccurrenceRepository(self._sessions)
+        lifecycle_writer = LifecycleRepository(self._sessions)
+        with self._sessions.begin() as session:
+            self._save_in_session(session, snapshot, payload)
+            for occurrence in occurrences:
+                occurrence_writer.save_in_session(session, occurrence)
+            for event in lifecycle_events:
+                lifecycle_writer.append_in_session(session, event)
+        return snapshot
+
+    def _save_in_session(self, session, snapshot: ContentSnapshot, payload: dict) -> None:
+        """Snapshot insert equivalent of :meth:`save`, on an existing session."""
+        values = {
+            "content_snapshot_id": snapshot.content_snapshot_id,
+            "source_type": snapshot.source_type,
+            "source_ref": snapshot.source_ref,
+            "source_content_hash": snapshot.source_content_hash,
+            "identity": payload,
+            "artifact_ids": dict(snapshot.artifact_ids),
+            "quant_market_snapshot_ids": list(snapshot.quant_market_snapshot_ids),
+            "pipeline_version": snapshot.pipeline_version,
+            "schema_version": snapshot.schema_version,
+            "code_sha": snapshot.code_sha,
+            "config_hash": snapshot.config_hash,
+            "source_artifact_id": snapshot.source_artifact_id,
+            "artifact_root_hash": snapshot.artifact_root_hash,
+            "snapshot_kind": snapshot.snapshot_kind,
+            "parent_snapshot_id": snapshot.parent_snapshot_id,
+            "supersedes_snapshot_id": snapshot.supersedes_snapshot_id,
+            "producer_manifest": dict(snapshot.producer_manifest),
+            "lifecycle_artifact_id": (snapshot.artifact_ids or {}).get("lifecycle"),
+            "created_at": snapshot.created_at,
+        }
+        _validate_snapshot_artifacts(
+            session,
+            artifact_ids=dict(snapshot.artifact_ids),
+            schema_version=snapshot.schema_version,
+            snapshot_id=snapshot.content_snapshot_id,
+        )
+        inserted = _insert_ignore(session, ContentSnapshotRow, values, [ContentSnapshotRow.content_snapshot_id])
+        row = session.get(ContentSnapshotRow, snapshot.content_snapshot_id)
+        if row is None:
+            raise RuntimeError("snapshot disappeared after a unique-key conflict")
+        if not inserted:
+            _validate_snapshot_row(session, row)
+            existing = dict(row.identity or {})
+            _compare_existing_identity(existing, payload, snapshot_id=snapshot.content_snapshot_id)
+            _compare_candidate_to_existing_row(snapshot, row, existing)
+        for slot, artifact_id in snapshot.artifact_ids.items():
+            member_id = hashlib.sha256(f"{snapshot.content_snapshot_id}:{slot}:{artifact_id}".encode()).hexdigest()
+            _insert_ignore(
+                session,
+                ContentSnapshotArtifactRow,
+                {
+                    "member_id": member_id,
+                    "content_snapshot_id": snapshot.content_snapshot_id,
+                    "artifact_id": artifact_id,
+                    "slot": slot,
+                    "artifact_role": slot.upper(),
+                },
+                [ContentSnapshotArtifactRow.member_id],
+            )
+        session.flush()
+        _validate_snapshot_row(session, row)
+        source_identity_hash = hashlib.sha256(f"{snapshot.source_type}:{snapshot.source_ref}".encode()).hexdigest()
+        if inserted or session.get(ContentSourceHeadRow, source_identity_hash) is None:
+            _upsert_source_head(
+                session,
+                source_identity_hash=source_identity_hash,
+                snapshot_id=snapshot.content_snapshot_id,
+                created_at=snapshot.created_at,
+            )
 
     def get(self, content_snapshot_id: str) -> ContentSnapshot | None:
         with self._sessions() as session:

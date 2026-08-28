@@ -33,7 +33,7 @@ def test_ingest_worker_persists_searchable_knowledge_and_factor_signal(tmp_path)
     assert video["title"] == "新能源行业分析"
     assert len(video["segments"]) == 1
 
-    search = application.search_knowledge("毛利率", {"ticker": "300750"}, 10)
+    search = application.search_knowledge("毛利率", {"ticker": "300750", "pit_mode": "SYSTEM"}, 10)
     assert len(search) == 1
     assert search[0]["support_status"] == "SOURCE_SUPPORTED"
     signals = application.factor_signals(
@@ -41,6 +41,48 @@ def test_ingest_worker_persists_searchable_knowledge_and_factor_signal(tmp_path)
     )
     assert len(signals) == 2
     assert all(item["symbol"] == "300750" for item in signals)
+
+
+def test_build_application_authoritative_ingest_emits_complete_v5_lineage(tmp_path):
+    """Production application wiring must retain occurrence-scoped lineage."""
+    application = build_application(f"sqlite:///{tmp_path / 'authoritative.db'}", enable_qdrant=False)
+    as_of = datetime.now(UTC).replace(microsecond=0)
+    application.enqueue(
+        "bilibili",
+        "BV1authoritative",
+        {
+            "metadata": {
+                "title": "权威财务指标",
+                "canonical_url": "https://example.test/video/authoritative",
+                "published_at": (as_of.replace(hour=max(0, as_of.hour - 1))).isoformat(),
+            },
+            "transcript": "宁德时代300750营收增长，毛利率改善。",
+            "as_of": as_of.isoformat(),
+            "offline_fixture": True,
+        },
+    )
+
+    result = application.process_next("test-worker")
+    assert result is not None
+    assert result["status"] == "SUCCEEDED"
+    video = application.get_video(result["video_id"])
+    assert video["canonical_url"] == "https://example.test/video/authoritative"
+    assert video["published_at"] is not None
+
+    signals = application.factor_signals_v5(
+        ["300750"],
+        as_of - timedelta(seconds=1),
+        as_of + timedelta(seconds=1),
+        "SOURCE_SUPPORTED",
+        pit_mode="SYSTEM",
+    )
+    assert signals
+    signal = signals[0]
+    assert signal["claim_id"]
+    assert signal["occurrence_id"]
+    assert signal["semantic_segment_id"]
+    assert signal["lifecycle"]["lifecycle_artifact_id"]
+    assert signal["content_snapshot_id"]
 
 
 def test_snapshot_store_healthy_yields_content_snapshot_id(tmp_path):
@@ -74,7 +116,9 @@ def test_snapshot_store_failure_never_silently_succeeds(tmp_path, monkeypatch):
     def _broken_save(*args, **kwargs):
         raise RuntimeError("snapshot store unavailable")
 
-    monkeypatch.setattr(application._snapshots._store, "save", _broken_save)  # noqa: SLF001
+    # SQL publication uses the atomic snapshot/occurrence/lifecycle bundle;
+    # patch that boundary so the regression exercises the production path.
+    monkeypatch.setattr(application._snapshots._store, "save_bundle", _broken_save)  # noqa: SLF001
 
     task = application.enqueue(
         "bilibili",

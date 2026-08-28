@@ -15,6 +15,7 @@ from stock_content.adapters.postgres.legacy_ids import (
     legacy_verification_id,
 )
 from stock_content.adapters.postgres.models import Base
+from stock_content.domain.artifacts import legacy_transcript_segment_id
 
 
 class Database:
@@ -46,6 +47,7 @@ class Database:
                 "resolved_at": "TIMESTAMP",
             },
             "video_segment": {
+                "segment_id": "VARCHAR(128)",
                 "raw_text": "TEXT",
                 "normalized_text": "TEXT",
                 "speaker_id": "VARCHAR(64)",
@@ -82,6 +84,10 @@ class Database:
                 "parent_snapshot_id": "VARCHAR(80)",
                 "supersedes_snapshot_id": "VARCHAR(80)",
                 "producer_manifest": json_declaration,
+                "lifecycle_artifact_id": "VARCHAR(128)",
+            },
+            "content_snapshot_artifact": {
+                "artifact_role": "VARCHAR(40)",
             },
             "financial_claim": {
                 "currency": "VARCHAR(16)",
@@ -136,6 +142,9 @@ class Database:
                 "uq_claim_evidence_claim_evidence "
                 "ON claim_evidence (claim_id, evidence_id)"
             )
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_video_segment_segment_id ON video_segment (segment_id)"
+            )
 
             # Some application-created PostgreSQL databases received these
             # columns as JSON before migration 015. Normalize them here too,
@@ -178,6 +187,35 @@ class Database:
             # deliberately done here as well as in the PostgreSQL migration so
             # SQLite development databases have the same upgrade semantics.
             self._upgrade_legacy_claims(connection)
+            self._upgrade_legacy_segments(connection)
+
+    @staticmethod
+    def _upgrade_legacy_segments(connection) -> None:
+        """Backfill legacy rows without using video/index as authoritative ID."""
+        inspector = inspect(connection)
+        if "video_segment" not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns("video_segment")}
+        if "segment_id" not in columns:
+            return
+        rows = connection.execute(
+            text(
+                "SELECT id, video_id, segment_index, start_seconds, end_seconds, text, raw_text "
+                "FROM video_segment WHERE segment_id IS NULL OR segment_id = ''"
+            )
+        ).mappings()
+        for row in rows:
+            segment_id = legacy_transcript_segment_id(
+                int(row["segment_index"]),
+                float(row["start_seconds"]),
+                float(row["end_seconds"]),
+                row["raw_text"] if row["raw_text"] is not None else row["text"],
+                legacy_namespace=row["video_id"],
+            )
+            connection.execute(
+                text("UPDATE video_segment SET segment_id = :segment_id WHERE id = :id"),
+                {"segment_id": segment_id, "id": row["id"]},
+            )
 
     @staticmethod
     def _upgrade_legacy_claims(connection) -> None:

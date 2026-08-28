@@ -252,6 +252,7 @@ def build_content_snapshot(
     prompt_versions: dict[str, str] | None = None,
     configuration: dict[str, Any] | None = None,
     external_snapshots: list[str] | tuple[str, ...] = (),
+    created_at: datetime | None = None,
 ) -> ContentSnapshot:
     normalized_artifact_ids = dict(artifact_ids or {})
     computed_root_hash = compute_artifact_root_hash(normalized_artifact_ids)
@@ -320,6 +321,7 @@ def build_content_snapshot(
         configuration=dict(configuration or {}),
         external_snapshots=tuple(sorted(set(external_snapshots))),
         policy_versions=dict(policy_versions or {}),
+        created_at=created_at or datetime.now(UTC),
     )
 
 

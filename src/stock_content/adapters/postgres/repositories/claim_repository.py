@@ -19,16 +19,27 @@ from stock_content.adapters.postgres.models import (
     ClaimVerificationJobRow,
     ClaimVerificationResultRow,
     FinancialClaimRow,
+    TemporalBindingRow,
+    TemporalRelationRow,
 )
+from stock_content.domain.artifacts import canonical_json
 from stock_content.domain.claims import FinancialClaim
+from stock_content.domain.temporal_semantics import (
+    ClaimTemporalBinding,
+    ClaimTemporalRelation,
+    temporal_binding_identity_payload,
+)
 
 
 class SqlClaimRepository:
     def __init__(self, session_factory: sessionmaker) -> None:
         self._sessions = session_factory
 
-    def save(self, claim: FinancialClaim) -> FinancialClaim:
+    def save(self, claim: FinancialClaim, *, compatibility_evidence_refs: list[str] | None = None) -> FinancialClaim:
         payload = claim.model_dump(mode="json")
+        storage_payload = dict(payload)
+        if compatibility_evidence_refs:
+            storage_payload["evidence_refs"] = sorted(set(compatibility_evidence_refs))
 
         with self._sessions.begin() as session:
             row = session.get(FinancialClaimRow, claim.claim_id)
@@ -62,7 +73,7 @@ class SqlClaimRepository:
                     "claim_schema_version": claim.claim_schema_version,
                     "normalization_version": claim.normalization_version,
                     "source_support_status": claim.source_support_status,
-                    "payload": payload,
+                    "payload": storage_payload,
                 }
                 _insert_ignore(session, FinancialClaimRow, values, [FinancialClaimRow.claim_id])
                 row = session.get(FinancialClaimRow, claim.claim_id)
@@ -71,7 +82,7 @@ class SqlClaimRepository:
                 existing_claim = FinancialClaim.model_validate(_payload_from_row(session, row))
                 if existing_claim.content_payload() != claim.content_payload():
                     raise ValueError(f"claim id {claim.claim_id} already stores a different payload")
-            for evidence_id in claim.evidence_refs:
+            for evidence_id in (compatibility_evidence_refs or claim.evidence_refs):
                 member_id = legacy_evidence_member_id(claim.claim_id, evidence_id)
                 _insert_ignore(
                     session,
@@ -79,6 +90,48 @@ class SqlClaimRepository:
                     {"member_id": member_id, "claim_id": claim.claim_id, "evidence_id": evidence_id},
                     [ClaimEvidenceRow.claim_id, ClaimEvidenceRow.evidence_id],
                 )
+            for binding in claim.temporal_bindings:
+                existing_binding = session.get(
+                    TemporalBindingRow,
+                    (claim.claim_id, binding.temporal_binding_id),
+                )
+                binding_values = binding.model_dump(mode="python")
+                if existing_binding is not None:
+                    existing_domain = ClaimTemporalBinding.model_validate(_temporal_row_payload(existing_binding))
+                    if canonical_json(temporal_binding_identity_payload(existing_domain)) != canonical_json(
+                        temporal_binding_identity_payload(binding)
+                    ):
+                        raise ValueError(
+                            f"temporal binding id {binding.temporal_binding_id} already stores different payload"
+                        )
+                else:
+                    session.add(
+                        TemporalBindingRow(
+                            temporal_binding_id=binding.temporal_binding_id,
+                            claim_id=claim.claim_id,
+                            **{key: value for key, value in binding_values.items() if key != "temporal_binding_id"},
+                        )
+                    )
+            for relation in claim.temporal_relations:
+                existing_relation = session.get(
+                    TemporalRelationRow,
+                    (claim.claim_id, relation.temporal_relation_id),
+                )
+                relation_values = relation.model_dump(mode="python")
+                if existing_relation is not None:
+                    existing_identity = _relation_identity_payload(_relation_row_payload(existing_relation))
+                    if canonical_json(existing_identity) != canonical_json(_relation_identity_payload(relation_values)):
+                        raise ValueError(
+                            f"temporal relation id {relation.temporal_relation_id} already stores different payload"
+                        )
+                else:
+                    session.add(
+                        TemporalRelationRow(
+                            temporal_relation_id=relation.temporal_relation_id,
+                            claim_id=claim.claim_id,
+                            **{key: value for key, value in relation_values.items() if key != "temporal_relation_id"},
+                        )
+                    )
         return claim
 
     def get(self, claim_id: str) -> FinancialClaim | None:
@@ -169,6 +222,24 @@ class SqlClaimRepository:
             )
         return [claim for claim_id in ids if (claim := self.get(claim_id)) is not None]
 
+    def temporal_bindings(self, claim_id: str) -> list[dict]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(TemporalBindingRow)
+                .where(TemporalBindingRow.claim_id == claim_id)
+                .order_by(TemporalBindingRow.temporal_binding_id)
+            ).all()
+        return [_temporal_row_payload(row) for row in rows]
+
+    def temporal_relations(self, claim_id: str) -> list[dict]:
+        with self._sessions() as session:
+            rows = session.scalars(
+                select(TemporalRelationRow)
+                .where(TemporalRelationRow.claim_id == claim_id)
+                .order_by(TemporalRelationRow.temporal_relation_id)
+            ).all()
+        return [_relation_row_payload(row) for row in rows]
+
     def enqueue_verification_jobs(self, claims: Iterable[FinancialClaim], trace_id: str | None = None) -> None:
         from stock_content.adapters.postgres.repositories.verification_job_repository import (
             PostgresVerificationJobRepository,
@@ -183,6 +254,42 @@ ClaimRepository = SqlClaimRepository
 PostgresClaimRepository = SqlClaimRepository
 
 __all__ = ["ClaimRepository", "PostgresClaimRepository", "SqlClaimRepository"]
+
+
+def _temporal_row_payload(row: TemporalBindingRow) -> dict:
+    return {key: getattr(row, key) for key in (
+        "temporal_binding_id", "role", "scope", "value_type", "start_time", "end_time",
+        "earliest_start_time", "latest_start_time", "earliest_end_time", "latest_end_time",
+        "start_date", "end_date", "earliest_start_date", "latest_start_date",
+        "earliest_end_date", "latest_end_date", "period_label", "raw_expression", "expression_key",
+        "precision", "granularity", "assertion_status", "metric_temporal_nature", "confidence",
+        "timezone", "calendar_type", "calendar_id", "market_session", "recurrence",
+        "normalization_status", "normalization_reason", "normalization_version", "source_evidence_refs",
+        "reference_snapshot_id", "reference_data_version", "reference_available_at",
+    )}
+
+
+def _relation_row_payload(row: TemporalRelationRow) -> dict:
+    return {key: getattr(row, key) for key in (
+        "temporal_relation_id", "relation_type", "from_binding_id", "to_binding_id", "lag_value",
+        "lag_unit", "lag_min", "lag_max", "confidence",
+    )}
+
+
+def _relation_identity_payload(relation: ClaimTemporalRelation | dict) -> dict:
+    values = relation.model_dump(mode="json") if isinstance(relation, ClaimTemporalRelation) else relation
+    return {
+        key: values.get(key)
+        for key in (
+            "relation_type",
+            "from_binding_id",
+            "to_binding_id",
+            "lag_value",
+            "lag_unit",
+            "lag_min",
+            "lag_max",
+        )
+    }
 
 
 def _insert_ignore(session, model, values: dict, conflict_columns: list) -> bool:
