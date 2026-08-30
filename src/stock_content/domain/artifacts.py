@@ -522,9 +522,35 @@ def deserialize_artifact(payload: dict[str, Any]) -> ArtifactBase:
         if key == "evidences" and cls is EvidenceArtifact:
             value = [EvidenceItem(**item) if isinstance(item, dict) else item for item in value]
         if key == "results" and cls is VerificationArtifact:
-            from stock_content.domain.claims import VerificationResult
+            from stock_content.domain.claims import VerificationArtifactEntry, VerificationResult
 
-            value = [VerificationResult.model_validate(item) if isinstance(item, dict) else item for item in value]
+            converted = []
+            for item in value:
+                if isinstance(item, dict) and (
+                    item.get("verification_id") is not None
+                    or item.get("verification_job_id") is not None
+                    or item.get("provider") is not None
+                ):
+                    # ``VerificationArtifactEntry.model_dump`` deliberately
+                    # flattens the nested result for legacy consumers.  Put
+                    # that exact result back during hydration so the
+                    # content-addressed artifact hash is stable across a
+                    # persist/reload cycle.
+                    entry_payload = dict(item)
+                    # Pending entries intentionally carry only the exact job
+                    # reference; hydrating a synthetic pending result changes
+                    # the content-addressed artifact hash on reload.
+                    entry_payload["result"] = (
+                        None
+                        if item.get("status") == "VERIFICATION_PENDING"
+                        and "verification_rule_version" not in item
+                        and "available_at" not in item
+                        else VerificationResult.model_validate(item)
+                    )
+                    converted.append(VerificationArtifactEntry.model_validate(entry_payload))
+                else:
+                    converted.append(VerificationResult.model_validate(item) if isinstance(item, dict) else item)
+            value = converted
         if key == "created_at" and isinstance(value, str):
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if key in {

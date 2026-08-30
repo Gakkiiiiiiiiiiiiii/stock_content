@@ -58,6 +58,27 @@ jobs:
           pytest tests/test_artifact_contracts.py tests/test_content_factor_signal_v3.py
           tests/test_support_status_contract.py -q
 
+  p0-final-closure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: P0 final deterministic closure
+        run: >
+          pytest
+          tests/test_final_claim_evidence_ownership.py
+          tests/test_cross_source_snapshot_replay.py
+          tests/test_temporal_reference_production.py
+          tests/test_temporal_reference_exact_replay.py
+          tests/test_initial_verification_requirement.py
+          tests/test_initial_verification_atomicity.py
+          tests/test_initial_verification_reuse.py
+          tests/test_verification_historical_pending.py
+          tests/test_verification_concurrency.py
+          -q
+
   golden-content:
     runs-on: ubuntu-latest
     steps:

@@ -7,6 +7,11 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from stock_content.ports.temporal_reference import (
+    TemporalReferenceAsOfViolationError,
+    TemporalReferenceNotFoundError,
+)
+
 from .temporal_semantics import (
     CalendarType,
     ClaimTemporalBinding,
@@ -85,6 +90,15 @@ class TemporalNormalizer:
             if binding.normalization_status.upper() in {"PARTIAL", "UNRESOLVED"}:
                 updates["expression_key"] = expression_key_of(text, role, binding.scope)
         enriched = binding.model_copy(update=updates)
+        available = getattr(enriched, "reference_available_at", None)
+        if available is not None and as_of is not None:
+            comparable_as_of = as_of
+            if comparable_as_of.tzinfo is None and available.tzinfo is not None:
+                comparable_as_of = comparable_as_of.replace(tzinfo=available.tzinfo)
+            if available > comparable_as_of:
+                raise TemporalReferenceAsOfViolationError(
+                    "reference available_at is after normalization as_of"
+                )
         enriched = enriched.model_copy(update={"temporal_binding_id": temporal_binding_id_of(enriched)})
         return validate_temporal_binding(enriched)
 
@@ -250,9 +264,15 @@ class TemporalNormalizer:
             fiscal_ref = None
             if self.reference_provider and base is not None:
                 resolver = getattr(self.reference_provider, "resolve_fiscal_calendar", None)
-                fiscal_ref = resolver(subject_key, base) if resolver else None
+                try:
+                    fiscal_ref = resolver(subject_key, base) if resolver else None
+                except TemporalReferenceNotFoundError:
+                    fiscal_ref = None
                 period_resolver = getattr(self.reference_provider, "resolve_period", None)
-                resolved = period_resolver(subject_key, text, as_of or base) if period_resolver else None
+                try:
+                    resolved = period_resolver(subject_key, text, as_of or base) if period_resolver else None
+                except TemporalReferenceNotFoundError:
+                    resolved = None
                 if resolved:
                     return self._resolved_period(text, resolved, role, evidence_refs)
             return self._unresolved(
@@ -262,6 +282,7 @@ class TemporalNormalizer:
                 evidence_refs,
                 period_label=text,
                 normalization_status="PARTIAL",
+                normalization_reason="REFERENCE_NOT_FOUND" if self.reference_provider else None,
                 reference_snapshot_id=getattr(fiscal_ref, "reference_snapshot_id", None),
                 reference_data_version=getattr(fiscal_ref, "data_version", None),
                 reference_available_at=getattr(fiscal_ref, "available_at", None),
@@ -522,9 +543,18 @@ class TemporalNormalizer:
     ) -> ClaimTemporalBinding:
         if not self.reference_provider or base is None:
             return binding
-        reference = self.reference_provider.resolve_exchange_calendar(subject_key, base)
+        try:
+            reference = self.reference_provider.resolve_exchange_calendar(subject_key, base)
+        except TemporalReferenceNotFoundError:
+            return binding.model_copy(update={
+                "normalization_status": "PARTIAL",
+                "normalization_reason": "REFERENCE_NOT_FOUND",
+            })
         if not reference:
-            return binding
+            return binding.model_copy(update={
+                "normalization_status": "PARTIAL",
+                "normalization_reason": "REFERENCE_NOT_FOUND",
+            })
         return binding.model_copy(
             update={
                 "calendar_type": CalendarType.EXCHANGE,
@@ -603,6 +633,7 @@ class TemporalNormalizer:
         *,
         period_label=None,
         normalization_status="UNRESOLVED",
+        normalization_reason=None,
         reference_snapshot_id=None,
         reference_data_version=None,
         reference_available_at=None,
@@ -621,6 +652,7 @@ class TemporalNormalizer:
                 TemporalAssertionStatus.EXPECTED if scope is TemporalScope.FORECAST else TemporalAssertionStatus.UNKNOWN
             ),
             normalization_status=normalization_status,
+            normalization_reason=normalization_reason,
             normalization_version=self.normalization_version,
             raw_expression=raw,
             expression_key=expression_key_of(raw, role, scope),

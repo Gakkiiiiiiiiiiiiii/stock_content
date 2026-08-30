@@ -22,6 +22,7 @@ from stock_content.adapters.postgres.repositories import (
     PostgresKnowledgeRepository,
     PostgresMultimodalRepository,
     PostgresSummaryRepository,
+    PostgresVerificationJobRepository,
     PostgresVerificationRepository,
     PostgresVideoRepository,
     SemanticSegmentRepository,
@@ -31,6 +32,7 @@ from stock_content.adapters.postgres.repositories import (
     SqlSnapshotStore,
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
+from stock_content.adapters.reference import QuantTemporalReferenceAdapter
 from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter
 from stock_content.application.pipeline import ContentPipeline
 from stock_content.application.service import ContentApplication
@@ -121,7 +123,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def pipeline_config_from_env() -> dict[str, object]:
     """Read the semantic pipeline's complete, reproducible configuration."""
-    return {
+    config = {
         "semantic_segmentation_enabled": _env_bool("CONTENT_SEMANTIC_SEGMENTATION_ENABLED", True),
         "segmentation_model": os.getenv("CONTENT_SEGMENTATION_MODEL", ""),
         "segmentation_prompt_version": os.getenv(
@@ -150,14 +152,72 @@ def pipeline_config_from_env() -> dict[str, object]:
         "semantic_padding_ms": int(os.getenv("CONTENT_SEMANTIC_PADDING_MS", "4000")),
         "atomic_claim_extraction_enabled": _env_bool("CONTENT_ATOMIC_CLAIM_EXTRACTION_ENABLED", True),
     }
+    # Keep the disabled/offline configuration byte-for-byte compatible with
+    # historical snapshot identities.  Reference settings enter the config
+    # hash only when the feature is explicitly configured.
+    if _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False) or any(os.getenv(name) is not None for name in (
+        "CONTENT_TEMPORAL_REFERENCE_REQUIRED", "CONTENT_TEMPORAL_REFERENCE_URL", "CONTENT_TEMPORAL_REFERENCE_API_KEY",
+        "CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS",
+    )):
+        config.update({
+            "temporal_reference_enabled": _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False),
+            "temporal_reference_required": _env_bool("CONTENT_TEMPORAL_REFERENCE_REQUIRED", False),
+            "temporal_reference_url": os.getenv("CONTENT_TEMPORAL_REFERENCE_URL", ""),
+            "temporal_reference_timeout_seconds": os.getenv(
+                "CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS", "10"
+            ),
+        })
+    return config
 
 
-def build_application(database_url: str | None = None, enable_qdrant: bool | None = None) -> ContentApplication:
+def build_application(
+    database_url: str | None = None,
+    enable_qdrant: bool | None = None,
+    *,
+    reference_provider=None,
+    reference_snapshot_provider=None,
+    temporal_reference_provider=None,
+    temporal_reference_snapshot_provider=None,
+) -> ContentApplication:
     # Validate release identity before opening a database or constructing any
     # external client.  Development/test environments retain the historical
     # ``unknown`` fallback through the domain policy.
     default_code_sha()
     config = pipeline_config_from_env()
+    # Explicit aliases keep test/application factories compatible with both
+    # the short port names and the fully-qualified configuration vocabulary.
+    reference_provider = reference_provider or temporal_reference_provider
+    reference_snapshot_provider = reference_snapshot_provider or temporal_reference_snapshot_provider
+    if reference_provider is None and bool(config.get("temporal_reference_enabled", False)):
+        url = str(config.get("temporal_reference_url", "") or "").strip()
+        if not url:
+            raise ValueError(
+                "CONTENT_TEMPORAL_REFERENCE_URL is required when temporal reference provider is enabled"
+            )
+        try:
+            timeout = float(config.get("temporal_reference_timeout_seconds", "10"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS must be a positive number") from exc
+        if timeout <= 0:
+            raise ValueError("CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS must be a positive number")
+        reference_provider = QuantTemporalReferenceAdapter(
+            url,
+            api_key=os.getenv("CONTENT_TEMPORAL_REFERENCE_API_KEY") or None,
+            timeout=timeout,
+        )
+    if reference_snapshot_provider is None and reference_provider is not None:
+        if all(hasattr(reference_provider, name) for name in (
+            "get_exchange_calendar_snapshot", "get_fiscal_calendar_snapshot", "get_period_snapshot"
+        )):
+            reference_snapshot_provider = reference_provider
+    if bool(config.get("temporal_reference_required", False)) and reference_provider is None:
+        raise ValueError(
+            "CONTENT_TEMPORAL_REFERENCE_REQUIRED=true requires an enabled or injected temporal reference provider"
+        )
+    if bool(config.get("temporal_reference_required", False)) and reference_snapshot_provider is None:
+        raise ValueError(
+            "CONTENT_TEMPORAL_REFERENCE_REQUIRED=true requires an exact temporal reference snapshot provider"
+        )
     database = Database(database_url)
     database.create_schema()
     tasks = PostgresContentTaskRepository(database.session_factory)
@@ -170,6 +230,7 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
     verifications = PostgresVerificationRepository(database.session_factory)
     artifacts = SqlArtifactRepository(database.session_factory)
     claims = SqlClaimRepository(database.session_factory)
+    verification_jobs = PostgresVerificationJobRepository(database.session_factory)
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
     index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
@@ -213,7 +274,10 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
         AtomicClaimExtractionStage(extractor=atomic_extractor),
         EvidenceGroundingStage(),
-        TemporalNormalizationStage(normalization_version=str(config["temporal_normalization_version"])),
+        TemporalNormalizationStage(
+            normalization_version=str(config["temporal_normalization_version"]),
+            reference_provider=reference_provider,
+        ),
         ClaimCanonicalizationStage(),
         ClaimOccurrencePersistenceStage(occurrences),
     ] if semantic_enabled else []
@@ -246,7 +310,11 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         LifecycleProjectionStage(lifecycle),
         SummaryStage(SummaryGenerator()),
         ClaimPersistenceStage(claims, artifacts),
-        SnapshotRecordingStage(snapshot_service, artifacts, occurrences, lifecycle),
+        SnapshotRecordingStage(
+            snapshot_service, artifacts, occurrences, lifecycle,
+            verification_repository=verification_jobs,
+            verification_job_repository=verification_jobs,
+        ),
         PersistStage(
             videos,
             chapters,
@@ -286,7 +354,9 @@ def build_application(database_url: str | None = None, enable_qdrant: bool | Non
         artifact_repository=artifacts,
         claim_repository=claims,
         signal_outbox=signal_outbox,
+        verification_job_repository=verification_jobs,
         occurrence_repository=occurrences,
         lifecycle_repository=lifecycle,
         pipeline_config=config,
+        temporal_reference_snapshot_provider=reference_snapshot_provider,
     )

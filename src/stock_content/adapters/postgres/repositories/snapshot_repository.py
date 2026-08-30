@@ -25,6 +25,9 @@ from stock_content.adapters.postgres.repositories.artifact_repository import (
     _validate_row_payload,
 )
 from stock_content.domain.artifacts import canonical_json, deserialize_artifact
+from stock_content.domain.initial_verification import (
+    verify_initial_verification_closure,
+)
 from stock_content.domain.lineage import ContentSnapshot, compute_artifact_root_hash
 
 
@@ -537,7 +540,16 @@ class SqlSnapshotStore:
                 )
         return snapshot
 
-    def save_bundle(self, snapshot: ContentSnapshot, occurrences=(), lifecycle_events=()) -> ContentSnapshot:
+    def save_bundle(
+        self,
+        snapshot: ContentSnapshot,
+        occurrences=(),
+        lifecycle_events=(),
+        verification_results=(),
+        verification_jobs=(),
+        failure_hook=None,
+        session=None,
+    ) -> ContentSnapshot:
         """Commit snapshot and its immutable dependent ledgers as one SQL unit.
 
         The normal repositories intentionally expose small independent writes
@@ -553,13 +565,111 @@ class SqlSnapshotStore:
         payload = _validate_snapshot_candidate(snapshot)
         occurrence_writer = ClaimOccurrenceRepository(self._sessions)
         lifecycle_writer = LifecycleRepository(self._sessions)
-        with self._sessions.begin() as session:
-            self._save_in_session(session, snapshot, payload)
+        def write(active_session):
+            self._save_in_session(active_session, snapshot, payload)
             for occurrence in occurrences:
-                occurrence_writer.save_in_session(session, occurrence)
+                occurrence_writer.save_in_session(active_session, occurrence)
             for event in lifecycle_events:
-                lifecycle_writer.append_in_session(session, event)
+                lifecycle_writer.append_in_session(active_session, event)
+            if failure_hook is not None:
+                failure_hook("snapshot")
+            self._save_verification_bundle(
+                active_session, verification_results, verification_jobs, failure_hook
+            )
+            self._validate_verification_closure(active_session, snapshot)
+
+        if session is not None:
+            write(session)
+        else:
+            with self._sessions.begin() as owned_session:
+                write(owned_session)
         return snapshot
+
+    @staticmethod
+    def _validate_verification_closure(session, snapshot: ContentSnapshot) -> None:
+        """Check every planner-produced artifact reference inside the UoW."""
+        verification_id = str((snapshot.artifact_ids or {}).get("verification") or "")
+        if not verification_id:
+            return
+        row = session.get(ContentArtifactRow, verification_id)
+        if row is None:
+            return
+        artifact = deserialize_artifact(dict(row.payload or {}))
+        entries = [item for item in (getattr(artifact, "results", ()) or ()) if hasattr(item, "provider")]
+        if not entries:
+            return
+        job_ids = {str(item.verification_job_id) for item in entries if item.verification_job_id}
+        result_ids = {str(item.verification_id) for item in entries if item.verification_id}
+        jobs = {}
+        results = {}
+        if job_ids:
+            from stock_content.adapters.postgres.models import ClaimVerificationJobRow, ClaimVerificationResultRow
+            jobs = {
+                item.job_id: item
+                for item in session.scalars(
+                    select(ClaimVerificationJobRow).where(ClaimVerificationJobRow.job_id.in_(job_ids))
+                ).all()
+            }
+        if result_ids:
+            from stock_content.adapters.postgres.models import ClaimVerificationResultRow
+            results = {
+                item.verification_id: item
+                for item in session.scalars(
+                    select(ClaimVerificationResultRow).where(
+                        ClaimVerificationResultRow.verification_id.in_(result_ids)
+                    )
+                ).all()
+            }
+        verify_initial_verification_closure(
+            artifact_results=entries,
+            jobs=jobs,
+            results=results,
+            snapshot_committed_at=snapshot.created_at,
+        )
+
+    @staticmethod
+    def _save_verification_bundle(session, verification_results, verification_jobs, failure_hook=None) -> None:
+        from stock_content.adapters.postgres.models import ClaimVerificationJobRow
+        from stock_content.adapters.postgres.repositories.verification_job_repository import (
+            _insert_ignore,
+            persist_verification_result,
+        )
+
+        for item in verification_jobs:
+            if failure_hook is not None:
+                failure_hook("job")
+            values = item if isinstance(item, dict) else {
+                "job_id": item.job_id, "claim_id": item.claim_id, "provider": item.provider,
+                "status": item.status, "retry_count": 0, "max_retries": 5,
+                "next_retry_at": item.created_at, "trace_id": item.trace_id,
+                "created_at": item.created_at,
+            }
+            _insert_ignore(
+                session,
+                ClaimVerificationJobRow,
+                values,
+                [ClaimVerificationJobRow.claim_id, ClaimVerificationJobRow.provider],
+            )
+        for item in verification_results:
+            if failure_hook is not None:
+                failure_hook("result")
+            if isinstance(item, dict):
+                values = item
+            else:
+                result = item.result
+                values = {
+                    "verification_id": item.verification_id, "claim_id": item.claim_id,
+                    "provider": item.provider, "status": result.status,
+                    "market_snapshot_id": result.market_snapshot_id,
+                    "market_data_version": result.market_data_version,
+                    "result_payload": result.model_dump(mode="json"), "trace_id": None,
+                    "fact_date": result.fact_date, "adjustment": result.adjustment,
+                    "verification_timestamp": result.verification_timestamp,
+                    "verification_rule_version": result.verification_rule_version,
+                    "verified_at": result.verification_timestamp,
+                    "available_at": item.available_at, "created_at": item.available_at,
+                }
+            persist_verification_result(session, values)
 
     def _save_in_session(self, session, snapshot: ContentSnapshot, payload: dict) -> None:
         """Snapshot insert equivalent of :meth:`save`, on an existing session."""

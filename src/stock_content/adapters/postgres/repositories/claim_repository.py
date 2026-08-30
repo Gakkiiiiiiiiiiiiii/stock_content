@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -16,6 +16,8 @@ from stock_content.adapters.postgres.legacy_ids import (
 )
 from stock_content.adapters.postgres.models import (
     ClaimEvidenceRow,
+    ClaimOccurrenceEvidenceRow,
+    ClaimOccurrenceRow,
     ClaimVerificationJobRow,
     ClaimVerificationResultRow,
     FinancialClaimRow,
@@ -38,7 +40,13 @@ class SqlClaimRepository:
     def save(self, claim: FinancialClaim, *, compatibility_evidence_refs: list[str] | None = None) -> FinancialClaim:
         payload = claim.model_dump(mode="json")
         storage_payload = dict(payload)
-        if compatibility_evidence_refs:
+        is_final = claim.claim_schema_version == "claim.final.v1"
+        if is_final:
+            # The canonical claim is source-independent.  Keep even a stale
+            # caller-supplied evidence list out of its persisted projection;
+            # source evidence belongs to ClaimOccurrenceEvidenceRow.
+            storage_payload["evidence_refs"] = []
+        elif compatibility_evidence_refs:
             storage_payload["evidence_refs"] = sorted(set(compatibility_evidence_refs))
 
         with self._sessions.begin() as session:
@@ -82,14 +90,15 @@ class SqlClaimRepository:
                 existing_claim = FinancialClaim.model_validate(_payload_from_row(session, row))
                 if existing_claim.content_payload() != claim.content_payload():
                     raise ValueError(f"claim id {claim.claim_id} already stores a different payload")
-            for evidence_id in (compatibility_evidence_refs or claim.evidence_refs):
-                member_id = legacy_evidence_member_id(claim.claim_id, evidence_id)
-                _insert_ignore(
-                    session,
-                    ClaimEvidenceRow,
-                    {"member_id": member_id, "claim_id": claim.claim_id, "evidence_id": evidence_id},
-                    [ClaimEvidenceRow.claim_id, ClaimEvidenceRow.evidence_id],
-                )
+            if not is_final:
+                for evidence_id in (compatibility_evidence_refs or claim.evidence_refs):
+                    member_id = legacy_evidence_member_id(claim.claim_id, evidence_id)
+                    _insert_ignore(
+                        session,
+                        ClaimEvidenceRow,
+                        {"member_id": member_id, "claim_id": claim.claim_id, "evidence_id": evidence_id},
+                        [ClaimEvidenceRow.claim_id, ClaimEvidenceRow.evidence_id],
+                    )
             for binding in claim.temporal_bindings:
                 existing_binding = session.get(
                     TemporalBindingRow,
@@ -140,12 +149,20 @@ class SqlClaimRepository:
             if row is None:
                 return None
             payload = _payload_from_row(session, row)
-            refs = _membership_evidence_refs(session, claim_id)
-        payload["evidence_refs"] = refs or list(payload.get("evidence_refs") or [])
+            is_final = (
+                row.claim_schema_version == "claim.final.v1"
+                or payload.get("claim_schema_version") == "claim.final.v1"
+            )
+            # Final claims must never hydrate the legacy membership table.
+            refs = [] if is_final else _membership_evidence_refs(session, claim_id)
+        payload["evidence_refs"] = refs if not is_final else []
         return FinancialClaim.model_validate(payload)
 
     def evidence(self, claim_id: str) -> list[str]:
         with self._sessions() as session:
+            row = session.get(FinancialClaimRow, claim_id)
+            if row is None or _row_is_final(row):
+                return []
             return _membership_evidence_refs(session, claim_id)
 
     def verifications(self, claim_id: str) -> list[dict]:
@@ -215,12 +232,56 @@ class SqlClaimRepository:
 
     def claims_for_evidence(self, evidence_id: str) -> list[FinancialClaim]:
         with self._sessions() as session:
-            ids = list(
+            # Authoritative reverse ownership is occurrence -> claim.  The
+            # legacy table is consulted only for pre-final claims.
+            tables = set(inspect(session.get_bind()).get_table_names())
+            occurrence_ids = []
+            if {"claim_occurrence", "claim_occurrence_evidence"} <= tables:
+                occurrence_ids = list(
+                    session.scalars(
+                        select(FinancialClaimRow.claim_id)
+                        .join(
+                            ClaimOccurrenceRow,
+                            ClaimOccurrenceRow.claim_id == FinancialClaimRow.claim_id,
+                        )
+                        .join(
+                            ClaimOccurrenceEvidenceRow,
+                            ClaimOccurrenceEvidenceRow.occurrence_id == ClaimOccurrenceRow.occurrence_id,
+                        )
+                        .where(ClaimOccurrenceEvidenceRow.evidence_id == evidence_id)
+                        .order_by(FinancialClaimRow.claim_id)
+                        .distinct()
+                    ).all()
+                )
+            legacy_ids = list(
                 session.scalars(
-                    select(ClaimEvidenceRow.claim_id).where(ClaimEvidenceRow.evidence_id == evidence_id)
+                    select(ClaimEvidenceRow.claim_id)
+                    .join(FinancialClaimRow, FinancialClaimRow.claim_id == ClaimEvidenceRow.claim_id)
+                    .where(
+                        ClaimEvidenceRow.evidence_id == evidence_id,
+                        or_(
+                            FinancialClaimRow.claim_schema_version.is_(None),
+                            FinancialClaimRow.claim_schema_version != "claim.final.v1",
+                        ),
+                    )
+                    .order_by(ClaimEvidenceRow.claim_id)
+                    .distinct()
                 ).all()
+                if "claim_evidence" in tables
+                else []
             )
-        return [claim for claim_id in ids if (claim := self.get(claim_id)) is not None]
+        ids = list(dict.fromkeys([*occurrence_ids, *legacy_ids]))
+        result = []
+        for claim_id in ids:
+            claim = self.get(claim_id)
+            if claim is None:
+                continue
+            # A row whose schema column is stale but whose payload is final
+            # must not leak through the legacy fallback either.
+            if claim.claim_schema_version == "claim.final.v1" and claim_id not in occurrence_ids:
+                continue
+            result.append(claim)
+        return result
 
     def temporal_bindings(self, claim_id: str) -> list[dict]:
         with self._sessions() as session:
@@ -339,6 +400,17 @@ def _legacy_evidence_refs(session, claim_id: str) -> list[str]:
     return [str(item) for item in value]
 
 
+def _row_is_final(row: FinancialClaimRow) -> bool:
+    payload = _json_value(row.payload)
+    return (
+        row.claim_schema_version == "claim.final.v1"
+        or (
+            isinstance(payload, dict)
+            and payload.get("claim_schema_version") == "claim.final.v1"
+        )
+    )
+
+
 def _membership_evidence_refs(session, claim_id: str) -> list[str]:
     """Prefer normalized memberships, with a direct 013 fallback."""
     if inspect(session.get_bind()).has_table("claim_evidence"):
@@ -358,6 +430,10 @@ def _payload_from_row(session, row: FinancialClaimRow) -> dict:
     payload = _json_value(row.payload)
     if not isinstance(payload, dict):
         payload = {}
+    is_final = (
+        row.claim_schema_version == "claim.final.v1"
+        or payload.get("claim_schema_version") == "claim.final.v1"
+    )
     values = {
         "claim_id": row.claim_id,
         "claim_type": row.claim_type,
@@ -384,7 +460,11 @@ def _payload_from_row(session, row: FinancialClaimRow) -> dict:
     }
     for key, value in values.items():
         payload.setdefault(key, value)
-    payload.setdefault("evidence_refs", _legacy_evidence_refs(session, row.claim_id))
+    # Do not even read the legacy evidence projection for canonical claims.
+    # This keeps the final read path fail-closed if an old database still has
+    # a denormalized evidence_refs column or claim_evidence rows.
+    if not is_final:
+        payload.setdefault("evidence_refs", _legacy_evidence_refs(session, row.claim_id))
     return payload
 
 

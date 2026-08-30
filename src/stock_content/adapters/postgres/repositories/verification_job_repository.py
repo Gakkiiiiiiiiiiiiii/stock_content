@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Iterable
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +22,7 @@ from stock_content.adapters.postgres.models import (
     ClaimVerificationResultRow,
 )
 from stock_content.domain.claims import FinancialClaim, VerificationResult, is_quant_verifiable
+from stock_content.domain.initial_verification import VerificationCoordination
 
 RETRY_SCHEDULE_SECONDS: tuple[int, ...] = (60, 300, 1800, 7200, 43200)
 PENDING = "VERIFICATION_PENDING"
@@ -37,7 +39,10 @@ def verification_id_of(
 ) -> str:
     identity = {"claim_id": claim_id, "provider": provider}
     if result is not None:
-        identity["result"] = result.model_dump(mode="json")
+        result_payload = result.model_dump(mode="json")
+        # Availability is a PIT envelope, not semantic result identity.
+        result_payload.pop("available_at", None)
+        identity["result"] = result_payload
     digest = hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()[:32]
@@ -80,6 +85,7 @@ class PostgresVerificationJobRepository:
                             "verification_timestamp": result.verification_timestamp,
                             "verification_rule_version": result.verification_rule_version,
                             "verified_at": result.verification_timestamp,
+                            "available_at": current,
                             "created_at": current,
                         },
                         [ClaimVerificationResultRow.verification_id],
@@ -125,6 +131,104 @@ class PostgresVerificationJobRepository:
     def get_job(self, job_id: str) -> ClaimVerificationJobRow | None:
         with self._sessions() as session:
             return session.get(ClaimVerificationJobRow, job_id)
+
+    @contextmanager
+    def planning_uow(self, keys: Iterable[tuple[str, str]]):
+        """Hold all claim/provider coordination locks through publication.
+
+        The planner must not resolve PIT state on short-lived sessions and then
+        publish later: a competing worker could change the decision in between.
+        This UoW owns one SQL transaction, takes deterministic keyed locks on
+        that same connection, and yields its session to all subsequent writes.
+        """
+        normalized = sorted({(str(claim_id), str(provider)) for claim_id, provider in keys})
+        with self._sessions.begin() as session:
+            with ExitStack() as stack:
+                for claim_id, provider in normalized:
+                    stack.enter_context(self.coordination_lock(claim_id, provider, session=session))
+                yield session
+
+    @contextmanager
+    def coordination_lock(self, claim_id: str, provider: str, session=None):
+        """Acquire the planner/worker claim-provider lock for one UoW.
+
+        SQLite has no transaction advisory locks, so the domain keyed lock is
+        held for the duration of the caller's transaction.  PostgreSQL adds a
+        transaction-scoped advisory lock on the same key; callers must pass
+        their active Session so the lock is released exactly at commit/rollback.
+        """
+        with VerificationCoordination.lock(claim_id, provider):
+            if session is not None and session.get_bind().dialect.name == "postgresql":
+                key = f"verification:{claim_id}:{provider}"
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                    {"key": key},
+                )
+            yield
+
+    def find_active_as_of(self, *, claim_id: str, provider: str, as_of: datetime, session=None):
+        """Return an active job that existed at the candidate snapshot time."""
+        candidate = _as_utc(as_of)
+        def query(active_session):
+            return active_session.scalar(
+                select(ClaimVerificationJobRow)
+                .where(
+                    ClaimVerificationJobRow.claim_id == claim_id,
+                    ClaimVerificationJobRow.provider == provider,
+                    ClaimVerificationJobRow.created_at <= candidate,
+                    ClaimVerificationJobRow.status.in_((PENDING, LEASED, "RETRYABLE")),
+                )
+                .order_by(ClaimVerificationJobRow.created_at, ClaimVerificationJobRow.job_id)
+            )
+        if session is not None:
+            return query(session)
+        with self._sessions() as session:
+            return query(session)
+
+    def get_result(self, verification_id: str, session=None) -> ClaimVerificationResultRow | None:
+        if session is not None:
+            return session.get(ClaimVerificationResultRow, verification_id)
+        with self._sessions() as session:
+            return session.get(ClaimVerificationResultRow, verification_id)
+
+    def latest_terminal_as_of(
+        self, *, claim_id: str, provider: str, as_of: datetime, policy_version: str | None = None,
+        session=None,
+    ):
+        """Read the newest *available* compatible immutable result at PIT."""
+        candidate = _as_utc(as_of)
+        terminal = (
+            "VERIFIED", "CONTRADICTED", "PARTIALLY_VERIFIED", "NOT_VERIFIABLE",
+            "NOT_REQUIRED", "EXPIRED", "MANUAL_REVIEW",
+        )
+        def query(active_session):
+            rows = active_session.scalars(
+                select(ClaimVerificationResultRow)
+                .where(
+                    ClaimVerificationResultRow.claim_id == claim_id,
+                    ClaimVerificationResultRow.provider == provider,
+                    ClaimVerificationResultRow.status.in_(terminal),
+                    ClaimVerificationResultRow.available_at.is_not(None),
+                    ClaimVerificationResultRow.available_at <= candidate,
+                )
+                .order_by(
+                    ClaimVerificationResultRow.available_at.desc(),
+                    ClaimVerificationResultRow.created_at.desc(),
+                    ClaimVerificationResultRow.verification_id.desc(),
+                )
+            ).all()
+            for row in rows:
+                if policy_version:
+                    payload = dict(row.result_payload or {})
+                    version = payload.get("verification_rule_version") or row.verification_rule_version
+                    if version != policy_version:
+                        continue
+                return row
+            return None
+        if session is not None:
+            return query(session)
+        with self._sessions() as session:
+            return query(session)
 
     def claim_due(
         self,
@@ -242,39 +346,23 @@ class PostgresVerificationJobRepository:
         current = now or datetime.now(UTC)
         if result.status in {PENDING, LEASED, MANUAL_REVIEW}:
             raise VerificationJobIntegrityError("completion requires a terminal verification result")
+        result = result.model_copy(update={"available_at": _result_available_at(result, current)})
         with self._sessions.begin() as session:
             job = session.get(ClaimVerificationJobRow, job_id)
             if job is None:
                 raise KeyError("verification job not found")
-            if result.claim_id != job.claim_id:
-                raise VerificationJobIntegrityError("result claim does not match leased job")
-            verification_id = verification_id_of(job.claim_id, job.provider, result)
-            payload = result.model_dump(mode="json")
-            existing = session.get(ClaimVerificationResultRow, verification_id)
-            if existing is not None:
-                return persist_verification_result(
-                    session,
-                    {
-                        "verification_id": verification_id,
-                        "claim_id": job.claim_id,
-                        "provider": job.provider,
-                        "status": result.status,
-                        "market_snapshot_id": result.market_snapshot_id,
-                        "market_data_version": result.market_data_version,
-                        "result_payload": payload,
-                        "trace_id": job.trace_id,
-                        "fact_date": result.fact_date,
-                        "adjustment": result.adjustment,
-                        "verification_timestamp": result.verification_timestamp,
-                        "verification_rule_version": result.verification_rule_version,
-                        "verified_at": result.verification_timestamp,
-                        "created_at": current,
-                    },
-                )
-            self._assert_owner(job, worker_id, current)
-            row = persist_verification_result(
-                session,
-                {
+            with self.coordination_lock(job.claim_id, job.provider, session):
+                # Re-read after acquiring the lock: a planner or another
+                # worker may have completed this canonical claim meanwhile.
+                job = session.get(ClaimVerificationJobRow, job_id)
+                if job is None:
+                    raise KeyError("verification job not found")
+                if result.claim_id != job.claim_id:
+                    raise VerificationJobIntegrityError("result claim does not match leased job")
+                verification_id = verification_id_of(job.claim_id, job.provider, result)
+                payload = result.model_dump(mode="json")
+                existing = session.get(ClaimVerificationResultRow, verification_id)
+                values = {
                     "verification_id": verification_id,
                     "claim_id": job.claim_id,
                     "provider": job.provider,
@@ -287,15 +375,30 @@ class PostgresVerificationJobRepository:
                     "adjustment": result.adjustment,
                     "verification_timestamp": result.verification_timestamp,
                     "verification_rule_version": result.verification_rule_version,
-                    "verified_at": result.verification_timestamp,
+                        "verified_at": result.verification_timestamp,
+                        "available_at": _result_available_at(result, current),
                     "created_at": current,
-                },
-            )
-            job.status = result.status
-            job.lease_owner = None
-            job.lease_expires_at = None
-            job.next_retry_at = None
-            return row
+                }
+                if existing is not None:
+                    # Deterministic IDs intentionally omit the PIT envelope.
+                    # A retry at a later wall-clock time must preserve the
+                    # first completion's immutable payload/visibility rather
+                    # than attempting to move ``available_at`` forward.
+                    values["available_at"] = existing.available_at
+                    values["result_payload"] = dict(existing.result_payload or {})
+                    row = persist_verification_result(session, values)
+                    job.status = result.status
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    job.next_retry_at = None
+                    return row
+                self._assert_owner(job, worker_id, current)
+                row = persist_verification_result(session, values)
+                job.status = result.status
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.next_retry_at = None
+                return row
 
     def read_result(
         self, claim_id: str, provider: str = "quant"
@@ -311,7 +414,13 @@ class PostgresVerificationJobRepository:
             ).all()
             if not rows:
                 return None
-            return VerificationResult.model_validate(dict(rows[0].result_payload or {}))
+            # ``available_at`` is the persistence/PIT envelope.  Preserve the
+            # historical read API, where provider result semantics did not
+            # expose this operational timestamp; PIT callers use the row
+            # repository methods directly.
+            payload = dict(rows[0].result_payload or {})
+            payload.pop("available_at", None)
+            return VerificationResult.model_validate(payload)
 
     @staticmethod
     def _assert_owner(row: ClaimVerificationJobRow | None, worker_id: str, now: datetime) -> None:
@@ -390,6 +499,7 @@ def persist_verification_result(session, values: dict) -> ClaimVerificationResul
         "verification_timestamp",
         "verification_rule_version",
         "verified_at",
+        "available_at",
     )
     for field in immutable_fields:
         if _canonical_immutable(getattr(row, field), field) != _canonical_immutable(values.get(field), field):
@@ -409,3 +519,14 @@ def _canonical_immutable(value, field: str | None = None):
     if isinstance(value, date):
         return value.isoformat()
     return value
+
+
+def _as_utc(value: datetime) -> datetime:
+    return (value if value.tzinfo is not None else value.replace(tzinfo=UTC)).astimezone(UTC)
+
+
+def _result_available_at(result: VerificationResult, fallback: datetime) -> datetime:
+    values = [_as_utc(result.available_at or fallback), _as_utc(fallback)]
+    if result.verification_timestamp is not None:
+        values.append(_as_utc(result.verification_timestamp))
+    return max(values)

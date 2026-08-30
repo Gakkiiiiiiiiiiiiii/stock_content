@@ -52,6 +52,7 @@ class ContentApplication:
         occurrence_repository: Any | None = None,
         lifecycle_repository: Any | None = None,
         pipeline_config: dict[str, Any] | None = None,
+        temporal_reference_snapshot_provider: Any | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
@@ -110,6 +111,8 @@ class ContentApplication:
             claim_repository=self._claim_repository,
             occurrence_repository=self._occurrence_repository,
             lifecycle_repository=self._lifecycle_repository,
+            verification_repository=self._verification_jobs,
+            temporal_reference_snapshot_provider=temporal_reference_snapshot_provider,
         )
         # §5 P1-2/P1-4：Claim 验证生命周期与知识冲突（内存注册表，生产由 worker+DB 驱动）。
         self._verification_lifecycle = VerificationService()
@@ -440,8 +443,22 @@ class ContentApplication:
         return payload or None
 
     def get_claim_evidence(self, claim_id: str) -> list[str] | None:
-        if self._claim_repository is None or self._claim_repository.get(claim_id) is None:
+        if self._claim_repository is None:
             return None
+        claim = self._claim_repository.get(claim_id)
+        if claim is None:
+            return None
+        if claim.claim_schema_version == "claim.final.v1":
+            if self._occurrence_repository is None:
+                return []
+            evidence_ids: set[str] = set()
+            for occurrence in self._occurrence_repository.list_for_claim(claim_id):
+                for role in (
+                    "evidence_refs", "condition_evidence_refs",
+                    "invalidation_evidence_refs", "temporal_evidence_refs",
+                ):
+                    evidence_ids.update(str(item) for item in (getattr(occurrence, role, ()) or ()))
+            return sorted(evidence_ids)
         return list(self._claim_repository.evidence(claim_id))
 
     def get_claim_verifications(self, claim_id: str) -> list[dict] | None:
@@ -559,8 +576,12 @@ class ContentApplication:
         snapshot_id = str(row.content_snapshot_id or payload.get("content_snapshot_id") or "")
         claim_id = str(row.claim_id or payload.get("claim_id") or "")
         snapshot_lineage = self.get_snapshot_lineage(snapshot_id) if snapshot_id else None
+        snapshot = self._snapshots.get(snapshot_id) if snapshot_id else None
         claim = self._claim_repository.get(claim_id) if self._claim_repository and claim_id else None
-        evidence = self.get_claim_evidence(claim_id) if claim_id else None
+        # Final claims intentionally do not own source evidence.  For signal
+        # lineage, resolve evidence from the exact snapshot's immutable
+        # occurrence membership instead of the global/latest claim projection.
+        evidence = self._snapshot_claim_evidence(snapshot, claim_id) if claim_id and snapshot else None
         artifact_items = list((snapshot_lineage or {}).get("artifacts") or [])
         artifacts_by_slot = {str(item.get("slot")): item.get("artifact") for item in artifact_items}
         return {
@@ -572,6 +593,31 @@ class ContentApplication:
             "source": artifacts_by_slot.get("source"),
             "artifacts": artifact_items,
         }
+
+    def _snapshot_claim_evidence(self, snapshot: Any, claim_id: str) -> list[str] | None:
+        """Return role evidence owned by ``claim_id`` in one snapshot only."""
+        if self._artifact_repository is None or self._occurrence_repository is None:
+            return None
+        mapping = dict(getattr(snapshot, "artifact_ids", {}) or {})
+        occurrence_artifact = self._artifact_repository.get(str(mapping.get("occurrences") or ""))
+        evidence_artifact = self._artifact_repository.get(str(mapping.get("evidence") or ""))
+        if occurrence_artifact is None or evidence_artifact is None:
+            return []
+        allowed = {
+            str(item.evidence_id)
+            for item in (getattr(evidence_artifact, "evidences", ()) or ())
+        }
+        refs: set[str] = set()
+        for occurrence_id in getattr(occurrence_artifact, "occurrence_ids", ()) or ():
+            occurrence = self._occurrence_repository.get(str(occurrence_id))
+            if occurrence is None or str(occurrence.claim_id) != str(claim_id):
+                continue
+            for role in (
+                "evidence_refs", "condition_evidence_refs",
+                "invalidation_evidence_refs", "temporal_evidence_refs",
+            ):
+                refs.update(str(item) for item in (getattr(occurrence, role, ()) or ()))
+        return sorted(refs & allowed)
 
     def get_snapshot_signals(self, content_snapshot_id: str, claim_id: str | None = None) -> list[dict]:
         if self._signal_outbox is None:

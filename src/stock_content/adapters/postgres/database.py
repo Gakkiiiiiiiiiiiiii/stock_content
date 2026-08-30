@@ -108,6 +108,7 @@ class Database:
                 "verification_timestamp": "TIMESTAMP",
                 "verification_rule_version": "VARCHAR(64)",
                 "verified_at": "TIMESTAMP",
+                "available_at": "TIMESTAMP",
             },
             "content_signal_outbox": {
                 "content_snapshot_id": "VARCHAR(80)",
@@ -145,6 +146,19 @@ class Database:
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_video_segment_segment_id ON video_segment (segment_id)"
             )
+            # P0-3 PIT lookup and one durable job per canonical claim/provider.
+            # Base.metadata covers fresh databases; these additive statements
+            # also upgrade databases created before migration 025.
+            if "claim_verification_result" in inspector.get_table_names():
+                connection.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_verification_result_claim_provider_available "
+                    "ON claim_verification_result (claim_id, provider, available_at DESC)"
+                )
+            if "claim_verification_job" in inspector.get_table_names():
+                connection.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_verification_job_claim_provider "
+                    "ON claim_verification_job (claim_id, provider)"
+                )
 
             # Some application-created PostgreSQL databases received these
             # columns as JSON before migration 015. Normalize them here too,
@@ -297,7 +311,26 @@ class Database:
                      "claim_id": row["claim_id"]},
                 )
 
+            is_final = (
+                canonical.get("claim_schema_version") == "claim.final.v1"
+                or row.get("claim_schema_version") == "claim.final.v1"
+            )
+            if is_final and canonical.get("evidence_refs"):
+                # Final claims do not own source evidence.  Normalize an old
+                # payload projection during bootstrap; authoritative evidence
+                # remains in claim_occurrence_evidence.
+                canonical = {**canonical, "evidence_refs": []}
+                connection.execute(
+                    text("UPDATE financial_claim SET payload = :payload WHERE claim_id = :claim_id"),
+                    {"payload": json.dumps(canonical, ensure_ascii=False, separators=(",", ":"), default=str),
+                     "claim_id": row["claim_id"]},
+                )
             evidence_refs = canonical.get("evidence_refs") or []
+            if is_final:
+                # Do not recreate claim_evidence for final claims while
+                # upgrading a legacy database.  Migration 024 performs the
+                # guarded cleanup and installs the PostgreSQL trigger.
+                continue
             if "claim_evidence" not in tables or not isinstance(evidence_refs, list):
                 continue
             for evidence_id in evidence_refs:

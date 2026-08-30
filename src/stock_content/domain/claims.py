@@ -190,6 +190,10 @@ class VerificationResult(BaseModel):
     adjustment: str | None = None  # 复权口径：NONE / FORWARD / BACKWARD
     verification_timestamp: datetime | None = None
     verification_rule_version: str = "verification_rule.v1"
+    # PIT envelope: a result is not visible to a newly-created snapshot
+    # before this timestamp.  ``None`` is retained for legacy rows and is
+    # intentionally fail-closed by the persistence query.
+    available_at: datetime | None = None
 
     reference_value: Any = None
     deviation: float | None = None
@@ -208,6 +212,61 @@ class VerificationResult(BaseModel):
         return self
 
 
+class VerificationArtifactEntry(BaseModel):
+    """Immutable verification view stored in a content snapshot artifact.
+
+    The result row is mutable operational state only through its job; the
+    artifact stores the exact durable identifier that was observed while the
+    snapshot was being committed.  Legacy artifacts continue to contain a
+    bare :class:`VerificationResult` and are accepted by deserializers.
+    """
+
+    claim_id: str
+    provider: str
+    status: str
+    verification_id: str | None = None
+    verification_job_id: str | None = None
+    result: VerificationResult | None = None
+
+    @model_validator(mode="after")
+    def _lineage(self) -> "VerificationArtifactEntry":
+        pending = self.status == "VERIFICATION_PENDING"
+        if pending and not self.verification_job_id:
+            raise ValueError("pending verification artifact entry requires verification_job_id")
+        if not pending and not self.verification_id:
+            raise ValueError("terminal verification artifact entry requires verification_id")
+        if self.result is not None:
+            if self.result.claim_id != self.claim_id or self.result.status != self.status:
+                raise ValueError("verification artifact entry result does not match lineage")
+        return self
+
+    @classmethod
+    def from_result(
+        cls,
+        result: VerificationResult,
+        *,
+        provider: str,
+        verification_id: str | None = None,
+        verification_job_id: str | None = None,
+    ) -> "VerificationArtifactEntry":
+        return cls(
+            claim_id=result.claim_id,
+            provider=provider,
+            status=result.status,
+            verification_id=verification_id,
+            verification_job_id=verification_job_id,
+            result=result,
+        )
+
+    def model_dump(self, *args, **kwargs):
+        """Expose result fields for legacy signal consumers as well as lineage."""
+        payload = super().model_dump(*args, **kwargs)
+        result = payload.pop("result", None)
+        if isinstance(result, dict):
+            payload.update(result)
+        return payload
+
+
 __all__ = [
     "CLAIM_CATEGORY",
     "CLAIM_TYPES",
@@ -217,6 +276,7 @@ __all__ = [
     "QUANT_VERIFIABLE_TYPES",
     "VERIFICATION_STATUSES",
     "VerificationResult",
+    "VerificationArtifactEntry",
     "claim_id_of",
     "is_quant_verifiable",
 ]

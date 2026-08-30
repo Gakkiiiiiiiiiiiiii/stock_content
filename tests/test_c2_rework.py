@@ -23,6 +23,7 @@ from stock_content.api.dependencies import build_application
 from stock_content.api.main import create_app
 from stock_content.application.verification_refresh import VerificationRefreshService
 from stock_content.application.verification_worker import VerificationWorkerApplication
+from stock_content.domain.claim_occurrence import ClaimOccurrence
 from stock_content.domain.claims import VerificationResult
 from stock_content.domain.signal_policy import SignalPolicy
 from stock_content.workers.signal_publisher_worker import HttpSignalPublisher
@@ -355,6 +356,24 @@ def test_refresh_signal_lineage_api_contains_source_claim_evidence_and_decision(
         parent_snapshot_id=initial["content_snapshot_id"],
         now=now,
     )
+    # Persist a later/source-external occurrence for the same claim, but do
+    # not attach it to this snapshot's occurrence/evidence artifacts.  The
+    # endpoint must never return it through a global/latest lookup.
+    future_ids = {"evidence-from-future-source"}
+    artifact_repo = app._pipeline._stages[0]._artifact_repository  # noqa: SLF001
+    current_snapshot = app._snapshots.get(refreshed["snapshot_id"])
+    exact_evidence = artifact_repo.get(current_snapshot.artifact_ids["evidence"])
+    exact_occurrences = artifact_repo.get(current_snapshot.artifact_ids["occurrences"])
+    exact_ids = {item.evidence_id for item in exact_evidence.evidences}
+    assert exact_ids.isdisjoint(future_ids)
+    source_occurrence = app._occurrence_repository.get(exact_occurrences.occurrence_ids[0])  # noqa: SLF001
+    external_occurrence = ClaimOccurrence.model_validate({**source_occurrence.model_dump(),
+        "occurrence_id": "", "source_artifact_id": "future-source-artifact",
+        "evidence_refs": sorted(future_ids), "condition_evidence_refs": [],
+        "invalidation_evidence_refs": [], "temporal_evidence_refs": [],
+        "assertion_locator_hash": "",
+    })
+    app._occurrence_repository.save(external_occurrence)  # noqa: SLF001
     signal_id = str(refreshed["signal_id"])
     response = client.get(f"/api/v1/signals/{signal_id}/lineage")
     assert response.status_code == 200
@@ -364,6 +383,8 @@ def test_refresh_signal_lineage_api_contains_source_claim_evidence_and_decision(
     assert data["snapshot"]["content_snapshot_id"] == refreshed["snapshot_id"]
     assert data["claim"]["claim_id"] == job.claim_id
     assert data["evidence_ids"]
+    assert set(data["evidence_ids"]) <= exact_ids
+    assert not set(data["evidence_ids"]) & future_ids
     assert data["source"]["artifact_type"] == "source"
 
 

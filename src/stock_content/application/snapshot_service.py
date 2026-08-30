@@ -161,13 +161,25 @@ class SnapshotService:
         *,
         occurrences=(),
         lifecycle_events=(),
+        verification_results=(),
+        verification_jobs=(),
+        failure_hook=None,
+        session=None,
         **kwargs: Any,
     ) -> ContentSnapshot:
         """Build and publish a snapshot plus dependent ledgers atomically."""
         snapshot = self.record_from_artifacts(_persist=False, **kwargs)
         saver = getattr(self._store, "save_bundle", None)
         if saver is not None:
-            return saver(snapshot, occurrences=occurrences, lifecycle_events=lifecycle_events)
+            return saver(
+                snapshot,
+                occurrences=occurrences,
+                lifecycle_events=lifecycle_events,
+                verification_results=verification_results,
+                verification_jobs=verification_jobs,
+                failure_hook=failure_hook,
+                **({"session": session} if session is not None else {}),
+            )
         return self._store.save(snapshot)
 
     def get(self, content_snapshot_id: str) -> ContentSnapshot | None:

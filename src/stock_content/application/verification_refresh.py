@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Callable
 
@@ -46,7 +47,8 @@ from stock_content.domain.artifacts import (
     deserialize_artifact,
     serialize_artifact,
 )
-from stock_content.domain.claims import FinancialClaim, VerificationResult
+from stock_content.domain.claims import FinancialClaim, VerificationArtifactEntry, VerificationResult
+from stock_content.domain.initial_verification import verify_initial_verification_closure
 from stock_content.domain.lineage import build_content_snapshot
 from stock_content.domain.signal_contract import validate_signal_v4
 
@@ -64,6 +66,16 @@ class VerificationRefreshService:
         self._claims = claims
         self._signals = signal_service or SignalService()
 
+    @contextmanager
+    def _transaction_lock(self, job_id: str):
+        """Serialize refresh completion with initial planning/worker writes."""
+        with self._sessions.begin() as session:
+            hint = session.get(ClaimVerificationJobRow, job_id)
+            if hint is None:
+                raise KeyError("verification job not found")
+            with self._jobs.coordination_lock(hint.claim_id, hint.provider, session):
+                yield session
+
     def complete(
         self,
         job_id: str,
@@ -79,31 +91,48 @@ class VerificationRefreshService:
                 "verification refresh requires a terminal external result"
             )
         current = now or datetime.now(UTC)
-        with self._sessions.begin() as session:
+        with self._transaction_lock(job_id) as session:
             job = session.get(ClaimVerificationJobRow, job_id)
             if job is None:
                 raise KeyError("verification job not found")
             if result.claim_id != job.claim_id:
                 raise VerificationJobIntegrityError("result claim does not match leased job")
-            result_id = verification_id_of(job.claim_id, job.provider, result)
-            payload = result.model_dump(mode="json")
+            effective_available_at = max(
+                _as_utc(result.available_at or current),
+                _as_utc(current),
+                _as_utc(result.verification_timestamp)
+                if result.verification_timestamp is not None else _as_utc(current),
+            )
+            effective_result = result.model_copy(update={"available_at": effective_available_at})
+            result_id = verification_id_of(job.claim_id, job.provider, effective_result)
+            payload = effective_result.model_dump(mode="json")
             existing_result = session.get(ClaimVerificationResultRow, result_id)
             result_values = {
                 "verification_id": result_id,
                 "claim_id": job.claim_id,
                 "provider": job.provider,
                 "status": result.status,
-                "market_snapshot_id": result.market_snapshot_id,
-                "market_data_version": result.market_data_version,
+                "market_snapshot_id": effective_result.market_snapshot_id,
+                "market_data_version": effective_result.market_data_version,
                 "result_payload": payload,
                 "trace_id": job.trace_id,
-                "fact_date": result.fact_date,
-                "adjustment": result.adjustment,
-                "verification_timestamp": result.verification_timestamp,
-                "verification_rule_version": result.verification_rule_version,
-                "verified_at": result.verification_timestamp,
+                "fact_date": effective_result.fact_date,
+                "adjustment": effective_result.adjustment,
+                "verification_timestamp": effective_result.verification_timestamp,
+                "verification_rule_version": effective_result.verification_rule_version,
+                "verified_at": effective_result.verification_timestamp,
+                "available_at": effective_available_at,
                 "created_at": current,
             }
+            if existing_result is not None and existing_result.available_at is not None:
+                # A retry may arrive with a later wall-clock ``now``.  The
+                # immutable result envelope is owned by the first completion;
+                # reuse it so idempotent completion cannot look like a payload
+                # conflict merely because the retry happened later.
+                effective_available_at = _as_utc(existing_result.available_at)
+                effective_result = result.model_copy(update={"available_at": effective_available_at})
+                result_values["result_payload"] = effective_result.model_dump(mode="json")
+                result_values["available_at"] = effective_available_at
             if existing_result is not None:
                 # Validate the row even when another completion path won the
                 # deterministic insert race.  If it already has a snapshot,
@@ -112,7 +141,7 @@ class VerificationRefreshService:
                 persist_verification_result(session, result_values)
                 prior = self._find_snapshot_for_result(session, result_id, job.claim_id)
                 if prior:
-                    job.status = result.status
+                    job.status = effective_result.status
                     job.lease_owner = None
                     job.lease_expires_at = None
                     job.next_retry_at = None
@@ -161,6 +190,7 @@ class VerificationRefreshService:
                 raise VerificationJobIntegrityError(
                     "parent snapshot does not contain the leased claim"
                 )
+            refresh_commit_at = max(_as_utc(current), _as_utc(parent.created_at))
             old_verification_id = str((parent.artifact_ids or {}).get("verification") or "")
             parent_artifact = None
             if old_verification_id:
@@ -175,12 +205,16 @@ class VerificationRefreshService:
             for prior_result in prior_results:
                 if getattr(prior_result, "claim_id", None) == result.claim_id:
                     if not replaced:
-                        merged_results.append(result)
+                        merged_results.append(VerificationArtifactEntry.from_result(
+                            effective_result, provider=job.provider, verification_id=result_id
+                        ))
                         replaced = True
                 else:
                     merged_results.append(prior_result)
             if not replaced:
-                merged_results.append(result)
+                merged_results.append(VerificationArtifactEntry.from_result(
+                    effective_result, provider=job.provider, verification_id=result_id
+                ))
             verification = VerificationArtifact(
                 artifact_id="verification-refresh-pending",
                 artifact_type="verification",
@@ -197,8 +231,8 @@ class VerificationRefreshService:
             artifact_ids = dict(parent.artifact_ids or {})
             artifact_ids["verification"] = verification.artifact_id
             external = list(parent.external_snapshots or parent.quant_market_snapshot_ids or ())
-            if result.market_snapshot_id and result.market_snapshot_id not in external:
-                external.append(result.market_snapshot_id)
+            if effective_result.market_snapshot_id and effective_result.market_snapshot_id not in external:
+                external.append(effective_result.market_snapshot_id)
             refreshed = build_content_snapshot(
                 source_type=parent.source_type,
                 source_ref=parent.source_ref,
@@ -226,11 +260,12 @@ class VerificationRefreshService:
                 prompt_versions=parent.prompt_versions,
                 configuration=parent.configuration,
                 external_snapshots=tuple(external),
+                created_at=refresh_commit_at,
             )
             self._hook(failure_hook, "snapshot")
             self._persist_snapshot(session, refreshed)
             self._hook(failure_hook, "snapshot_mapping")
-            verification_view = result.model_dump(mode="json") | {"provider": job.provider}
+            verification_view = effective_result.model_dump(mode="json") | {"provider": job.provider}
             signal = self._signals.build_signal(
                 refreshed,
                 claim,
@@ -249,7 +284,7 @@ class VerificationRefreshService:
                 signal_id = str(signal["signal_id"])
                 self._persist_outbox(session, signal, current)
             self._hook(failure_hook, "outbox")
-            job.status = result.status
+            job.status = effective_result.status
             job.lease_owner = None
             job.lease_expires_at = None
             job.next_retry_at = None
@@ -262,7 +297,7 @@ class VerificationRefreshService:
                     snapshot_id=refreshed.content_snapshot_id,
                     verified_snapshot_id=(
                         refreshed.content_snapshot_id
-                        if result.status in {"VERIFIED", "PARTIALLY_VERIFIED"}
+                        if effective_result.status in {"VERIFIED", "PARTIALLY_VERIFIED"}
                         else None
                     ),
                     updated_at=refreshed.created_at,
@@ -358,7 +393,10 @@ class VerificationRefreshService:
             if not any(
                 isinstance(item, dict)
                 and str(item.get("claim_id")) == claim_id
-                and canonical_json(item) == canonical_json(expected_result)
+                and canonical_json({
+                    key: value for key, value in item.items()
+                    if key not in {"provider", "verification_id", "verification_job_id"}
+                }) == canonical_json(expected_result)
                 for item in results
             ):
                 continue
@@ -450,6 +488,8 @@ class VerificationRefreshService:
                     slot=slot,
                 )
             )
+        session.flush()
+        _validate_refresh_verification_closure(session, snapshot)
 
     @staticmethod
     def _persist_outbox(session, payload: dict, now: datetime) -> None:
@@ -472,6 +512,43 @@ class VerificationRefreshService:
                 created_at=now,
             )
         )
+
+
+def _validate_refresh_verification_closure(session, snapshot) -> None:
+    """Validate every exact job/result reference in a refresh artifact."""
+    verification_id = str((snapshot.artifact_ids or {}).get("verification") or "")
+    if not verification_id:
+        return
+    row = session.get(ContentArtifactRow, verification_id)
+    if row is None:
+        return
+    artifact = deserialize_artifact(dict(row.payload or {}))
+    entries = [
+        item for item in (getattr(artifact, "results", ()) or ())
+        if isinstance(item, VerificationArtifactEntry)
+    ]
+    if not entries:
+        return
+    job_ids = {str(item.verification_job_id) for item in entries if item.verification_job_id}
+    result_ids = {str(item.verification_id) for item in entries if item.verification_id}
+    jobs = {
+        item.job_id: item
+        for item in session.scalars(
+            select(ClaimVerificationJobRow).where(ClaimVerificationJobRow.job_id.in_(job_ids))
+        ).all()
+    } if job_ids else {}
+    results = {
+        item.verification_id: item
+        for item in session.scalars(
+            select(ClaimVerificationResultRow).where(
+                ClaimVerificationResultRow.verification_id.in_(result_ids)
+            )
+        ).all()
+    } if result_ids else {}
+    verify_initial_verification_closure(
+        artifact_results=entries, jobs=jobs, results=results,
+        snapshot_committed_at=snapshot.created_at,
+    )
 
 
 def _upsert_source_head(
@@ -519,6 +596,8 @@ def _upsert_source_head(
             excluded.latest_snapshot_id > ContentSourceHeadRow.latest_snapshot_id,
         ),
     )
+
+
     verified_is_newer = and_(
         excluded.latest_verified_snapshot_id.is_not(None),
         or_(ContentSourceHeadRow.latest_verified_snapshot_id.is_(None), is_newer),
@@ -542,6 +621,12 @@ def _upsert_source_head(
             },
         )
     )
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _head_is_newer(

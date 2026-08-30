@@ -127,6 +127,33 @@ def test_result_snapshot_binding_and_duplicate_idempotency(tmp_path):
     assert jobs.read_result(claim.claim_id) == result
 
 
+def test_duplicate_completion_at_later_time_preserves_first_pit_envelope(tmp_path):
+    _, claims, jobs = _repos(tmp_path)
+    claim = _claim()
+    claims.save(claim)
+    first_time = datetime(2026, 1, 1, tzinfo=UTC)
+    second_time = first_time + timedelta(hours=2)
+    jobs.enqueue([claim], now=first_time)
+    job = jobs.claim_due("worker", now=first_time)[0]
+    result = VerificationResult(
+        claim_id=claim.claim_id,
+        status="VERIFIED",
+        market_snapshot_id="market-snapshot-1",
+        market_data_version="bars.v1",
+        fact_date=first_time.date(),
+        adjustment="NONE",
+        verification_timestamp=first_time,
+    )
+    first = jobs.complete_result(job.job_id, "worker", result, now=first_time)
+    first_payload = dict(first.result_payload)
+    first_available_at = first.available_at
+    second = jobs.complete_result(job.job_id, "other-worker", result, now=second_time)
+    assert second.verification_id == first.verification_id
+    assert second.available_at == first_available_at
+    assert dict(second.result_payload) == first_payload
+    assert jobs.get_job(job.job_id).status == "VERIFIED"
+
+
 def test_worker_recovers_after_provider_failure(tmp_path):
     _, claims, jobs = _repos(tmp_path)
     claim = _claim()

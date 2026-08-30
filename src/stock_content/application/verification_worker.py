@@ -105,6 +105,8 @@ class VerificationWorkerApplication:
         claim: FinancialClaim, outcome: VerificationResult | dict[str, Any], now: datetime
     ) -> VerificationResult:
         if isinstance(outcome, VerificationResult):
+            if outcome.available_at is None:
+                return outcome.model_copy(update={"available_at": now})
             return outcome
         payload = dict(outcome or {})
         status = str(payload.get("status") or "NOT_VERIFIABLE").upper()
@@ -128,6 +130,7 @@ class VerificationWorkerApplication:
             verification_rule_version=str(
                 payload.get("verification_rule_version") or "verification_rule.v1"
             ),
+            available_at=now,
             reference_value=market.get("close"),
             reason=payload.get("reason"),
         )

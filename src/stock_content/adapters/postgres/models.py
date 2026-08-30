@@ -641,6 +641,9 @@ class ClaimVerificationResultRow(Base):
     verification_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verification_rule_version: Mapped[str | None] = mapped_column(String(64))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # PIT visibility envelope.  NULL on migrated legacy rows is intentionally
+    # not eligible for historical reuse.
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

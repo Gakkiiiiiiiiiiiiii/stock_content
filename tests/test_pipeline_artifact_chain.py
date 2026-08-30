@@ -7,7 +7,7 @@ from sqlalchemy import select
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.models import (
     ClaimArtifactMemberRow,
-    ClaimEvidenceRow,
+    ClaimOccurrenceEvidenceRow,
     ClaimVerificationJobRow,
     ContentArtifactRow,
     ContentSnapshotRow,
@@ -58,7 +58,7 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
     with repo._sessions() as session:  # noqa: SLF001
         artifacts = session.scalars(select(ContentArtifactRow)).all()
         claims = session.scalars(select(FinancialClaimRow)).all()
-        evidence = session.scalars(select(ClaimEvidenceRow)).all()
+        evidence = session.scalars(select(ClaimOccurrenceEvidenceRow)).all()
         jobs = session.scalars(select(ClaimVerificationJobRow)).all()
         claim_members = session.scalars(select(ClaimArtifactMemberRow)).all()
         checkpoints = session.scalars(select(ContentStageCheckpointRow)).all()
@@ -279,7 +279,9 @@ def test_knowledge_units_keep_distinct_claim_links(tmp_path):
         knowledge_rows = session.scalars(select(KnowledgeUnitRow)).all()
     assert len(rows) >= 2
     claim_ids = {row.claim_id for row in rows}
-    assert all(row.payload.get("evidence_refs") for row in rows)
+    # Final canonical claims are deliberately source-independent; evidence
+    # is owned by occurrence role memberships instead of claim payloads.
+    assert all(not row.payload.get("evidence_refs") for row in rows)
     assert claim_ids
     distinct = {
         row.knowledge_uid: tuple((row.attributes or {}).get("claim_ids") or ())

@@ -1,12 +1,14 @@
 """ContentSnapshot Replay V2 and immutable lineage verification."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.domain.artifacts import ArtifactRegistry
+from stock_content.domain.initial_verification import TERMINAL_STATUSES
 from stock_content.domain.lineage import (
     compute_artifact_root_hash,
     compute_content_snapshot_id,
@@ -14,6 +16,17 @@ from stock_content.domain.lineage import (
     snapshot_identity_payload,
 )
 from stock_content.domain.models import ContentTask
+from stock_content.ports.temporal_reference import (
+    ExchangeCalendarRef,
+    FiscalCalendarRef,
+    ResolvedPeriod,
+    TemporalReferenceProviderUnavailableError,
+)
+from stock_content.ports.temporal_reference_snapshot import (
+    PinnedTemporalReferenceProvider,
+    TemporalReferenceSnapshotMismatchError,
+    TemporalReferenceSnapshotNotFoundError,
+)
 
 
 class ReplayIntegrityError(ValueError):
@@ -47,6 +60,7 @@ class ReplayService:
             "idempotency_key", "trace_id", "decision_id", "replay_raw_storage_uri",
             "replay_snapshot_kind", "replay_parent_snapshot_id", "replay_supersedes_snapshot_id",
             "replay_pipeline_version", "replay_lifecycle_timestamp",
+            "temporal_reference_provider",
         }
     )
 
@@ -54,7 +68,9 @@ class ReplayService:
                  signal_outbox: Any | None = None, task_repository: Any | None = None,
                  pipeline: Any | None = None, claim_repository: Any | None = None,
                  occurrence_repository: Any | None = None,
-                 lifecycle_repository: Any | None = None) -> None:
+                 lifecycle_repository: Any | None = None,
+                 verification_repository: Any | None = None,
+                 temporal_reference_snapshot_provider: Any | None = None) -> None:
         self._snapshots = snapshots
         self._artifacts = artifact_repository
         self._signal_outbox = signal_outbox
@@ -63,6 +79,8 @@ class ReplayService:
         self._claims = claim_repository
         self._occurrences = occurrence_repository
         self._lifecycle = lifecycle_repository
+        self._verification = verification_repository
+        self._reference_snapshots = temporal_reference_snapshot_provider
 
     def replay(self, content_snapshot_id: str, *, mode: str | None = None,
                pipeline_version: str | None = None,
@@ -104,6 +122,40 @@ class ReplayService:
         except ReplayIntegrityError as exc:
             return exc.to_dict(content_snapshot_id=content_snapshot_id)
 
+    def check_current_verification_liveness(self, snapshot: Any) -> dict[str, Any]:
+        """Check only the current source head, never historical closure.
+
+        A pending historical artifact is valid once its exact job row exists.
+        This opt-in check is for operational monitoring of a current head and
+        reports a dangling pending job when no active work or newer refresh is
+        available.
+        """
+        verification = self._verification
+        if verification is None or self._artifacts is None:
+            return {"checked": False}
+        if hasattr(self._snapshots, "list_for_source"):
+            siblings = self._snapshots.list_for_source(snapshot.source_type, snapshot.source_ref)
+            if siblings:
+                current = max(siblings, key=lambda item: (item.created_at, item.content_snapshot_id))
+                if current.content_snapshot_id != snapshot.content_snapshot_id:
+                    return {"checked": False, "status": "NOT_CURRENT_HEAD"}
+        verification_id = str((snapshot.artifact_ids or {}).get("verification") or "")
+        artifact = self._artifacts.get(verification_id) if verification_id else None
+        pending = [
+            item for item in (getattr(artifact, "results", ()) or ())
+            if getattr(item, "status", None) == "VERIFICATION_PENDING"
+        ]
+        if not pending:
+            return {"checked": True, "status": "NOT_PENDING"}
+        for item in pending:
+            job = verification.get_job(str(getattr(item, "verification_job_id", "")))
+            if job is None:
+                return {"checked": True, "error": "DANGLING_CURRENT_VERIFICATION_PENDING"}
+            if str(job.status) in {"VERIFICATION_PENDING", "PENDING", "LEASED", "RETRYABLE"}:
+                continue
+            return {"checked": True, "error": "DANGLING_CURRENT_VERIFICATION_PENDING"}
+        return {"checked": True, "status": "LIVE"}
+
     def _verify_lineage(self, snapshot: Any) -> dict[str, Any]:
         identity = snapshot_identity_payload(
             source_content_hash=snapshot.source_content_hash, pipeline_version=snapshot.pipeline_version,
@@ -122,10 +174,124 @@ class ReplayService:
         )
         recomputed = f"cs-{compute_content_snapshot_id(identity)[:32]}"
         snapshot_validation = self._verify_snapshot_ancestry(snapshot)
+        self._validate_reference_closure(snapshot)
         return {"identity_match": recomputed == snapshot.content_snapshot_id,
                 "recomputed_snapshot_id": recomputed,
                 "artifact_validation": self._load_and_verify_artifacts(snapshot),
                 "snapshot_validation": snapshot_validation}
+
+    def _reference_records(self, snapshot: Any) -> list[dict[str, Any]]:
+        manifest = dict(getattr(snapshot, "producer_manifest", {}) or {})
+        records = manifest.get("reference_data") or []
+        if not isinstance(records, list):
+            raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference_data is not a list")
+        if any(not isinstance(item, dict) for item in records):
+            raise ReplayIntegrityError(
+                "REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference_data contains a non-object member"
+            )
+        return [dict(item) for item in records]
+
+    def _validate_reference_closure(self, snapshot: Any) -> None:
+        records = self._reference_records(snapshot)
+        if not records:
+            return
+        if self._reference_snapshots is None:
+            raise ReplayIntegrityError(
+                "REPLAY_REFERENCE_SNAPSHOT_MISSING", "historical reference snapshot provider is unavailable"
+            )
+        for record in records:
+            reference_id = str(record.get("reference_snapshot_id") or record.get("snapshot_id") or "")
+            reference_type = str(record.get("reference_type") or "")
+            subject_key = str(record.get("subject_key") or "")
+            period_label = str(record.get("period_label") or "")
+            required_fields = (
+                "reference_type", "subject_key", "binding_key", "reference_snapshot_id",
+                "data_version", "available_at",
+            )
+            missing_fields = [field for field in required_fields if not str(record.get(field) or "")]
+            if reference_type == "fiscal_period" and not period_label:
+                missing_fields.append("period_label")
+            if missing_fields:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISMATCH",
+                    "reference pin metadata is incomplete",
+                    missing_fields=sorted(set(missing_fields)),
+                )
+            try:
+                if reference_type == "exchange_calendar":
+                    value = self._reference_snapshots.get_exchange_calendar_snapshot(reference_id)
+                elif reference_type == "fiscal_calendar":
+                    value = self._reference_snapshots.get_fiscal_calendar_snapshot(reference_id)
+                elif reference_type == "fiscal_period":
+                    value = self._reference_snapshots.get_period_snapshot(
+                        reference_id, subject_key=subject_key, period_label=period_label
+                    )
+                else:
+                    raise TemporalReferenceSnapshotMismatchError(f"unknown reference type {reference_type}")
+            except TemporalReferenceSnapshotNotFoundError as exc:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISSING", str(exc), reference_snapshot_id=reference_id
+                ) from exc
+            except TemporalReferenceSnapshotMismatchError as exc:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISMATCH", str(exc), reference_snapshot_id=reference_id
+                ) from exc
+            except TemporalReferenceProviderUnavailableError as exc:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_PROVIDER_UNAVAILABLE", str(exc), reference_snapshot_id=reference_id
+                ) from exc
+            except (KeyError, LookupError) as exc:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISSING", str(exc), reference_snapshot_id=reference_id
+                ) from exc
+            except Exception as exc:  # provider protocol/transport errors fail closed
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISMATCH", str(exc), reference_snapshot_id=reference_id
+                ) from exc
+            if value is None:
+                raise ReplayIntegrityError(
+                    "REPLAY_REFERENCE_SNAPSHOT_MISSING", "reference snapshot payload is missing",
+                    reference_snapshot_id=reference_id,
+                )
+            if str(getattr(value, "reference_snapshot_id", "")) != reference_id:
+                raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference id mismatch")
+            expected_type = {
+                "exchange_calendar": ExchangeCalendarRef,
+                "fiscal_calendar": FiscalCalendarRef,
+                "fiscal_period": ResolvedPeriod,
+            }[reference_type]
+            if not isinstance(value, expected_type):
+                raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference type mismatch")
+            actual_subject = str(getattr(value, "subject_key", "") or "")
+            if actual_subject and actual_subject != subject_key:
+                raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference subject mismatch")
+            if reference_type == "fiscal_period" and str(getattr(value, "period_label", "") or "") != period_label:
+                raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference period mismatch")
+            if record.get("data_version") and str(getattr(value, "data_version", "")) != str(record["data_version"]):
+                raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference data version mismatch")
+            if record.get("available_at"):
+                available_at = getattr(value, "available_at", None)
+                try:
+                    expected_available = datetime.fromisoformat(str(record["available_at"]).replace("Z", "+00:00"))
+                    if expected_available.tzinfo is None:
+                        expected_available = expected_available.replace(tzinfo=timezone.utc)
+                    if available_at is not None and available_at.tzinfo is None:
+                        available_at = available_at.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError) as exc:
+                    raise ReplayIntegrityError(
+                        "REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference available_at is invalid"
+                    ) from exc
+                if available_at is None or available_at != expected_available:
+                    raise ReplayIntegrityError("REPLAY_REFERENCE_SNAPSHOT_MISMATCH", "reference available_at mismatch")
+                snapshot_created = snapshot.created_at
+                if snapshot_created.tzinfo is None:
+                    snapshot_created = snapshot_created.replace(tzinfo=timezone.utc)
+                if available_at > snapshot_created:
+                    raise ReplayIntegrityError(
+                        "REPLAY_REFERENCE_SNAPSHOT_MISMATCH",
+                        "reference snapshot was unavailable at historical snapshot creation",
+                        reference_snapshot_id=reference_id,
+                    )
 
     def _verify_snapshot_ancestry(self, snapshot: Any) -> dict[str, Any]:
         """Validate refresh/replay snapshot parents as a finite deterministic DAG."""
@@ -223,8 +389,6 @@ class ReplayService:
         evidence_artifact = loaded.get(str(mapping.get("evidence") or "")) or by_type.get("evidence")
         claim_artifact = loaded.get(str(mapping.get("claims") or "")) or by_type.get("claims")
         verification_artifact = loaded.get(str(mapping.get("verification") or "")) or by_type.get("verification")
-        evidence_ids = {str(getattr(item, "evidence_id", ""))
-                        for item in (getattr(evidence_artifact, "evidences", ()) or ())}
         loaded_evidence_parents = {
             str(item) for item in (getattr(evidence_artifact, "parent_artifact_ids", ()) or ())
         }
@@ -252,13 +416,10 @@ class ReplayService:
                 if isinstance(claim, str) and self._claims is not None and persisted_claim is None:
                     raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
                                                f"claim artifact references missing claim {claim}")
-                refs = getattr(persisted_claim or claim, "evidence_refs", None)
-                if refs is None and isinstance(claim, dict):
-                    refs = claim.get("evidence_refs")
-                for evidence_id in refs or ():
-                    if str(evidence_id) not in evidence_ids:
-                        raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
-                                                   f"claim references missing evidence {evidence_id}")
+                # Canonical claims intentionally have no source-specific
+                # evidence ownership.  Evidence closure is checked below
+                # through the fixed occurrence artifact and its role
+                # memberships, never through persisted_claim.evidence_refs.
 
         # Occurrence and lifecycle artifacts contain immutable row IDs.  A
         # replay must resolve exactly those IDs; reading a latest projection
@@ -467,6 +628,7 @@ class ReplayService:
                 if claim_id and claim_id not in claim_ids:
                     raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
                                                f"verification references missing claim {claim_id}")
+            self._validate_verification_closure(snapshot, verification_artifact)
         if self._signal_outbox is not None and hasattr(self._signal_outbox, "list_for_snapshot"):
             for row in self._signal_outbox.list_for_snapshot(snapshot.content_snapshot_id):
                 payload = dict(getattr(row, "payload", None) or {})
@@ -484,6 +646,79 @@ class ReplayService:
                     raise ReplayIntegrityError(
                         "REPLAY_LINEAGE_REFERENCE_INVALID", "signal verification artifact mismatch"
                     )
+
+    def _validate_verification_closure(self, snapshot: Any, verification_artifact: Any) -> None:
+        """Validate fixed historical Job/Result references without latest reads."""
+        entries = [
+            item for item in (getattr(verification_artifact, "results", ()) or ())
+            if hasattr(item, "provider")
+        ]
+        if not entries:
+            return  # legacy bare VerificationResult artifact
+        if self._verification is None:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_MISSING",
+                "verification repository is unavailable for exact closure",
+            )
+        candidate = snapshot.created_at
+        if candidate.tzinfo is None:
+            from datetime import UTC
+            candidate = candidate.replace(tzinfo=UTC)
+        for entry in entries:
+            if entry.status == "VERIFICATION_PENDING":
+                job_id = str(entry.verification_job_id or "")
+                job = self._verification.get_job(job_id) if job_id else None
+                if job is None:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_MISSING",
+                        f"verification job row {job_id} is missing",
+                    )
+                created_at = job.created_at
+                if created_at is None:
+                    raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID", f"job {job_id} has no created_at")
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=candidate.tzinfo)
+                if str(job.claim_id) != str(entry.claim_id) or str(job.provider) != str(entry.provider):
+                    raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID", f"job {job_id} lineage mismatch")
+                if created_at > candidate:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        f"job {job_id} was created after snapshot",
+                    )
+                # Intentionally do not inspect job.status: current execution
+                # state is not part of historical Snapshot truth.
+                continue
+            verification_id = str(entry.verification_id or "")
+            row = self._verification.get_result(verification_id) if verification_id else None
+            if row is None:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_MISSING",
+                    f"verification result row {verification_id} is missing",
+                )
+            if (
+                str(row.claim_id) != str(entry.claim_id)
+                or str(row.provider) != str(entry.provider)
+                or str(row.status) != str(entry.status)
+                or str(row.status) not in TERMINAL_STATUSES
+                or (
+                    entry.result is not None
+                    and dict(row.result_payload or {}) != entry.result.model_dump(mode="json")
+                )
+            ):
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID", f"verification result {verification_id} lineage mismatch"
+                )
+            available_at = row.available_at
+            if available_at is None:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID", f"verification result {verification_id} has no available_at"
+                )
+            if available_at.tzinfo is None:
+                available_at = available_at.replace(tzinfo=candidate.tzinfo)
+            if available_at > candidate:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID", f"verification result {verification_id} is future-dated"
+                )
 
     def _task_options(self, snapshot: Any) -> dict[str, Any] | None:
         if self._artifacts is not None and hasattr(self._artifacts, "find_task_options_for_snapshot"):
@@ -515,6 +750,17 @@ class ReplayService:
                                            "immutable task options are unavailable for this snapshot")
             options = {key: value for key, value in options.items() if key not in self._RUNTIME_OPTIONS}
             options.update(dict(overrides or {}))
+            records = self._reference_records(snapshot)
+            if records:
+                pins = {
+                    str(item.get("binding_key") or (
+                        f"{item.get('reference_type')}|{item.get('subject_key', '')}|{item.get('period_label', '')}"
+                    )): str(item.get("reference_snapshot_id") or item.get("snapshot_id") or "")
+                    for item in records
+                }
+                options["temporal_reference_provider"] = PinnedTemporalReferenceProvider(
+                    self._reference_snapshots, pins
+                )
             # Fixture extraction derives claim/knowledge availability from the
             # clock when no explicit timestamp was supplied.  Reuse the
             # immutable persisted claim timestamp so the golden replay has an
@@ -549,8 +795,11 @@ class ReplayService:
                 raise ReplayIntegrityError("INVALID_REPLAY_REQUEST", "MIGRATION_REPLAY requires pipeline_version")
             task_id = f"replay-{uuid4().hex}"
             if self._tasks is not None and hasattr(self._tasks, "create"):
+                persisted_options = {
+                    key: value for key, value in options.items() if key not in self._RUNTIME_OPTIONS
+                }
                 self._tasks.create(ContentTask(task_id=task_id, source_type=snapshot.source_type,
-                                               source_ref=snapshot.source_ref, options=options,
+                                               source_ref=snapshot.source_ref, options=persisted_options,
                                                status="RUNNING", max_retries=1))
             context = PipelineContext(task_id=task_id,
                                       source={"type": snapshot.source_type, "ref": snapshot.source_ref},

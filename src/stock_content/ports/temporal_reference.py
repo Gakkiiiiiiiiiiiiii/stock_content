@@ -7,6 +7,28 @@ from datetime import date, datetime
 from typing import Protocol
 
 
+class TemporalReferenceError(RuntimeError):
+    """Base error for a temporal reference dependency."""
+
+
+class TemporalReferenceNotFoundError(TemporalReferenceError):
+    """The reference service has no business data for the requested key."""
+
+
+class TemporalReferenceProviderUnavailableError(TemporalReferenceError):
+    """The reference service could not be reached or returned invalid data."""
+
+
+class TemporalReferenceAsOfViolationError(TemporalReferenceError):
+    """A reference was published after the requested point-in-time."""
+
+
+# Stable short names for callers that do not need the longer class prefix.
+ReferenceNotFoundError = TemporalReferenceNotFoundError
+ReferenceProviderUnavailableError = TemporalReferenceProviderUnavailableError
+ReferenceAsOfViolationError = TemporalReferenceAsOfViolationError
+
+
 @dataclass(frozen=True)
 class ExchangeCalendarRef:
     calendar_id: str
@@ -14,6 +36,7 @@ class ExchangeCalendarRef:
     reference_snapshot_id: str = ""
     data_version: str = ""
     available_at: datetime | None = None
+    subject_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -22,6 +45,7 @@ class FiscalCalendarRef:
     reference_snapshot_id: str = ""
     data_version: str = ""
     available_at: datetime | None = None
+    subject_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -34,6 +58,7 @@ class ResolvedPeriod:
     reference_snapshot_id: str | None = None
     data_version: str | None = None
     available_at: datetime | None = None
+    subject_key: str = ""
 
 
 class TemporalReferenceProvider(Protocol):
@@ -42,4 +67,9 @@ class TemporalReferenceProvider(Protocol):
     def resolve_period(self, subject_key: str, period_label: str, as_of: datetime) -> ResolvedPeriod | None: ...
 
 
-__all__ = ["ExchangeCalendarRef", "FiscalCalendarRef", "ResolvedPeriod", "TemporalReferenceProvider"]
+__all__ = [
+    "ExchangeCalendarRef", "FiscalCalendarRef", "ResolvedPeriod", "TemporalReferenceProvider",
+    "TemporalReferenceError", "TemporalReferenceNotFoundError",
+    "TemporalReferenceProviderUnavailableError", "TemporalReferenceAsOfViolationError",
+    "ReferenceNotFoundError", "ReferenceProviderUnavailableError", "ReferenceAsOfViolationError",
+]

@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import tempfile
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -45,6 +46,7 @@ from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenc
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.financial_event_extractor import FinancialEventExtractor
 from stock_content.domain.financial_numeric import parse_financial_numerics
+from stock_content.domain.initial_verification import build_initial_verification_plan
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
@@ -904,10 +906,25 @@ class TemporalNormalizationStage:
         self,
         normalizer: TemporalNormalizer | None = None,
         normalization_version: str = "temporal-normalization.final.v1",
+        reference_provider: Any | None = None,
     ) -> None:
-        self._normalizer = normalizer or TemporalNormalizer(normalization_version=normalization_version)
+        self._normalizer = normalizer or TemporalNormalizer(
+            reference_provider=reference_provider, normalization_version=normalization_version
+        )
+        self._normalization_version = normalization_version
+        self._reference_provider = reference_provider
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        # Replay can provide a snapshot-pinned provider per context.  This is
+        # intentionally an explicit adapter option; the production stage's
+        # default provider remains unchanged for offline fixtures.
+        normalizer = self._normalizer
+        context_provider = context.options.get("temporal_reference_provider")
+        if context_provider is not None and context_provider is not getattr(normalizer, "reference_provider", None):
+            normalizer = TemporalNormalizer(
+                reference_provider=context_provider,
+                normalization_version=getattr(normalizer, "normalization_version", self._normalization_version),
+            )
         bindings_by_draft: dict[int, list[Any]] = {}
         anchor = context.options.get("temporal_anchor") or context.options.get("as_of")
         if isinstance(anchor, str):
@@ -986,7 +1003,7 @@ class TemporalNormalizationStage:
                 }:
                     metric_nature = MetricTemporalNature.SNAPSHOT
                 draft_bindings.append(
-                    self._normalizer.normalize(
+                    normalizer.normalize(
                         expression.raw_expression,
                         role=role,
                         anchor=expression_anchor or anchor,
@@ -1003,6 +1020,20 @@ class TemporalNormalizationStage:
                     )
                 )
             bindings_by_draft[draft_index] = draft_bindings
+        # If a caller supplies the immutable snapshot candidate explicitly,
+        # references published after it are not visible and must fail closed.
+        candidate = context.options.get("snapshot_commit_candidate") or context.options.get(
+            "normalization_available_at"
+        )
+        if isinstance(candidate, str):
+            candidate = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        if candidate is not None:
+            for binding in (item for values in bindings_by_draft.values() for item in values):
+                available = getattr(binding, "reference_available_at", None)
+                if available is not None and available > candidate:
+                    raise ValueError(
+                        "REFERENCE_AS_OF_VIOLATION: reference available_at is after snapshot candidate"
+                    )
         context.state["temporal_bindings"] = [item for values in bindings_by_draft.values() for item in values]
         context.state["temporal_bindings_by_draft"] = bindings_by_draft
         context.runtime.metrics["temporal_normalized_count"] = float(
@@ -2308,13 +2339,32 @@ class SnapshotRecordingStage:
         artifact_repository=None,
         occurrence_repository=None,
         lifecycle_repository=None,
+        verification_repository=None,
+        verification_job_repository=None,
     ) -> None:
         self._snapshots = snapshot_service
         self._artifact_repository = artifact_repository
         self._occurrence_repository = occurrence_repository
         self._lifecycle_repository = lifecycle_repository
+        self._verification_repository = verification_repository or verification_job_repository
+        self._verification_jobs = verification_job_repository or verification_repository
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        """Plan and publish under one repository-owned verification UoW."""
+        keys = [
+            (claim.claim_id, str(context.options.get("verification_provider") or "quant"))
+            for claim in (context.state.get("claims") or ())
+        ]
+        planner_uow = getattr(self._verification_jobs, "planning_uow", None)
+        scope = (
+            planner_uow(keys)
+            if planner_uow is not None and keys
+            else nullcontext(None)
+        )
+        with scope as session:
+            return self._execute_in_uow(context, session=session)
+
+    def _execute_in_uow(self, context: PipelineContext, *, session=None) -> PipelineContext:
         registry = context.artifacts
         mandatory = {
             "source": registry.source, "media": registry.media, "transcript": registry.transcript,
@@ -2335,9 +2385,45 @@ class SnapshotRecordingStage:
             raise ContentSnapshotPersistError(
                 f"CONTENT_SNAPSHOT_PERSIST_FAILED: mandatory artifact missing: {sorted(missing)}"
             )
+        verification_plan = None
+        # Resolve initial verification immediately before publication.  This
+        # keeps the PIT candidate equal to the immutable snapshot clock and
+        # ensures the exact job/result lineage is what gets committed.
+        snapshot_candidate = (
+            context.state.occurrences[0].times.snapshot_committed_at
+            if context.state.get("occurrences") else _stage_timestamp(context)
+        )
+        for binding in context.state.get("temporal_bindings") or ():
+            available_at = getattr(binding, "reference_available_at", None)
+            if available_at is None:
+                continue
+            comparable_candidate = snapshot_candidate
+            if comparable_candidate.tzinfo is None and available_at.tzinfo is not None:
+                comparable_candidate = comparable_candidate.replace(tzinfo=available_at.tzinfo)
+            if available_at > comparable_candidate:
+                raise ContentSnapshotPersistError(
+                    "REFERENCE_AS_OF_VIOLATION: reference available_at is after snapshot candidate"
+                )
+        if self._verification_jobs is not None and context.state.get("claims"):
+            verification_plan = build_initial_verification_plan(
+                claims=list(context.state.claims),
+                provider=str(context.options.get("verification_provider") or "quant"),
+                snapshot_candidate_time=snapshot_candidate,
+                verification_repository=self._verification_repository or self._verification_jobs,
+                job_repository=self._verification_jobs,
+                current_policy_version=str(
+                    context.options.get("verification_rule_version") or "verification_rule.v1"
+                ),
+                trace_id=context.trace.get("trace_id"),
+                session=session,
+            )
+            self._replace_verification_lineage(context, verification_plan.artifact_results)
         if self._artifact_repository is not None:
             for artifact in registry.artifacts():
-                self._artifact_repository.put(artifact)
+                if session is not None and hasattr(self._artifact_repository, "put_in_session"):
+                    self._artifact_repository.put_in_session(session, artifact)
+                else:
+                    self._artifact_repository.put(artifact)
         source_content_hash = str(registry.source.raw_content_hash or registry.source.source_content_hash or "")
         if not source_content_hash:
             raise ContentSnapshotPersistError("CONTENT_SNAPSHOT_PERSIST_FAILED: source raw hash missing")
@@ -2350,22 +2436,47 @@ class SnapshotRecordingStage:
             producer_manifest = _producer_manifest(context)
             reference_records = []
             reference_snapshot_ids = set()
-            for binding in context.state.get("temporal_bindings") or ():
-                snapshot_id = getattr(binding, "reference_snapshot_id", None)
-                if not snapshot_id:
-                    continue
-                reference_snapshot_ids.add(str(snapshot_id))
-                reference_records.append({
-                    "snapshot_id": str(snapshot_id),
-                    "data_version": getattr(binding, "reference_data_version", None),
-                    "available_at": (
-                        binding.reference_available_at.isoformat()
-                        if getattr(binding, "reference_available_at", None) is not None else None
-                    ),
-                })
-            reference_records.sort(key=lambda item: (
-                item["snapshot_id"], item.get("data_version") or "", item.get("available_at") or ""
-            ))
+            drafts = list(context.state.get("claim_drafts") or ())
+            bindings_by_draft = context.state.get("temporal_bindings_by_draft") or {}
+            for draft_index, bindings in sorted(bindings_by_draft.items(), key=lambda item: int(item[0])):
+                draft = drafts[int(draft_index)] if int(draft_index) < len(drafts) else None
+                subject_key = str(getattr(draft, "subject_key", "") or "")
+                for binding in bindings:
+                    snapshot_id = getattr(binding, "reference_snapshot_id", None)
+                    if not snapshot_id:
+                        continue
+                    data_version = getattr(binding, "reference_data_version", None)
+                    available_at = getattr(binding, "reference_available_at", None)
+                    if not data_version or available_at is None:
+                        raise ContentSnapshotPersistError(
+                            "REFERENCE_SNAPSHOT_METADATA_MISSING: immutable reference requires version and available_at"
+                        )
+                    calendar = str(getattr(getattr(binding, "calendar_type", None), "value", "") or "").upper()
+                    has_resolved_period = (
+                        getattr(binding, "start_date", None) is not None
+                        and getattr(binding, "end_date", None) is not None
+                    )
+                    reference_type = "exchange_calendar" if calendar == "EXCHANGE" else (
+                        "fiscal_period" if has_resolved_period else "fiscal_calendar"
+                    )
+                    period_label = str(getattr(binding, "period_label", "") or "")
+                    binding_key = f"{reference_type}|{subject_key}|{period_label}"
+                    reference_snapshot_ids.add(str(snapshot_id))
+                    reference_records.append({
+                        "reference_type": reference_type,
+                        "subject_key": subject_key,
+                        "period_label": period_label,
+                        "binding_key": binding_key,
+                        "reference_snapshot_id": str(snapshot_id),
+                        "data_version": str(data_version),
+                        "available_at": available_at.isoformat(),
+                    })
+            # De-duplicate by the complete lookup contract, then sort to make
+            # manifest identity independent of draft/expression iteration.
+            reference_records = sorted({
+                tuple(sorted(item.items())) for item in reference_records
+            })
+            reference_records = [dict(item) for item in reference_records]
             if reference_records:
                 producer_manifest["reference_data"] = reference_records
             manifest_models = dict(producer_manifest.get("models") or {})
@@ -2421,18 +2532,24 @@ class SnapshotRecordingStage:
                 },
                 quant_market_snapshot_ids=sorted({
                     str(item) for item in (context.options.get("quant_market_snapshot_ids") or ())
-                } | reference_snapshot_ids),
+                }),
                 config_hash=str(producer_manifest["configs"]["config_hash"]),
                 snapshot_kind=str(context.options.get("replay_snapshot_kind") or "INITIAL"),
                 parent_snapshot_id=context.options.get("replay_parent_snapshot_id"),
                 supersedes_snapshot_id=context.options.get("replay_supersedes_snapshot_id"),
                 pipeline_version=str(context.options.get("replay_pipeline_version") or "pipeline.v3"),
-                created_at=(
-                    context.state.occurrences[0].times.snapshot_committed_at
-                    if context.state.get("occurrences") else _stage_timestamp(context)
-                ),
+                created_at=snapshot_candidate,
                 occurrences=tuple(context.state.get("occurrences") or ()),
                 lifecycle_events=tuple(context.state.get("lifecycle_events") or ()),
+                verification_results=(
+                    tuple(verification_plan.terminal_results_to_insert)
+                    if verification_plan is not None else ()
+                ),
+                verification_jobs=(
+                    tuple(verification_plan.pending_jobs_to_insert)
+                    if verification_plan is not None else ()
+                ),
+                session=session,
             )
         except Exception as exc:  # noqa: BLE001 - 显式失败，绝不静默
             raise ContentSnapshotPersistError(f"CONTENT_SNAPSHOT_PERSIST_FAILED: {exc}") from exc
@@ -2453,6 +2570,78 @@ class SnapshotRecordingStage:
             attributes["content_snapshot_id"] = snapshot.content_snapshot_id
             unit.attributes = attributes
         return _stage_result(context)
+
+    @staticmethod
+    def _replace_verification_lineage(context: PipelineContext, entries: list[Any]) -> None:
+        """Replace the provisional view and rehash its downstream parents."""
+        verification = context.artifacts.verification
+        if verification is None:
+            return
+        candidate = VerificationArtifact(
+            artifact_id="verification-initial-pending",
+            artifact_type="verification",
+            producer_stage=verification.producer_stage,
+            producer_version=verification.producer_version,
+            schema_version=verification.schema_version,
+            claim_artifact_id=verification.claim_artifact_id,
+            results=list(entries),
+            parent_artifact_ids=verification.parent_artifact_ids,
+        )
+        context.artifacts.verification = VerificationArtifact(
+            **{**candidate.__dict__, "artifact_id": artifact_id_of(candidate)}
+        )
+        lifecycle = context.artifacts.lifecycle
+        if lifecycle is not None:
+            rebuilt = LifecycleArtifact(
+                artifact_id="lifecycle-initial-pending",
+                artifact_type="lifecycle",
+                producer_stage=lifecycle.producer_stage,
+                producer_version=lifecycle.producer_version,
+                schema_version=lifecycle.schema_version,
+                claim_lifecycle_event_ids=list(lifecycle.claim_lifecycle_event_ids),
+                occurrence_lifecycle_event_ids=list(lifecycle.occurrence_lifecycle_event_ids),
+                lifecycle_business_as_of=lifecycle.lifecycle_business_as_of,
+                lifecycle_knowledge_as_of=lifecycle.lifecycle_knowledge_as_of,
+                policy_version=lifecycle.policy_version,
+                parent_artifact_ids=tuple(
+                    item.artifact_id for item in (context.artifacts.occurrences, context.artifacts.verification)
+                    if item is not None
+                ),
+            )
+            context.artifacts.lifecycle = LifecycleArtifact(
+                **{**rebuilt.__dict__, "artifact_id": artifact_id_of(rebuilt)}
+            )
+        knowledge = context.artifacts.knowledge
+        if knowledge is not None:
+            parent = context.artifacts.lifecycle or context.artifacts.verification
+            rebuilt = KnowledgeArtifact(
+                artifact_id="knowledge-initial-pending",
+                artifact_type="knowledge",
+                producer_stage=knowledge.producer_stage,
+                producer_version=knowledge.producer_version,
+                schema_version=knowledge.schema_version,
+                verification_artifact_id=context.artifacts.verification.artifact_id,
+                knowledge_units=list(knowledge.knowledge_units),
+                parent_artifact_ids=(parent.artifact_id,) if parent is not None else (),
+            )
+            context.artifacts.knowledge = KnowledgeArtifact(
+                **{**rebuilt.__dict__, "artifact_id": artifact_id_of(rebuilt)}
+            )
+        summary = context.artifacts.summary
+        if summary is not None and context.artifacts.knowledge is not None:
+            rebuilt = SummaryArtifact(
+                artifact_id="summary-initial-pending",
+                artifact_type="summary",
+                producer_stage=summary.producer_stage,
+                producer_version=summary.producer_version,
+                schema_version=summary.schema_version,
+                knowledge_artifact_id=context.artifacts.knowledge.artifact_id,
+                core_summary=summary.core_summary,
+                parent_artifact_ids=(context.artifacts.knowledge.artifact_id,),
+            )
+            context.artifacts.summary = SummaryArtifact(
+                **{**rebuilt.__dict__, "artifact_id": artifact_id_of(rebuilt)}
+            )
 
 
 def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
@@ -2575,15 +2764,11 @@ class ClaimPersistenceStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         if self._artifacts is not None and context.artifacts.evidence is not None:
             self._artifacts.put(context.artifacts.evidence)
-        occurrence_refs = {
-            item.claim_id: list(item.evidence_refs)
-            for item in context.state.get("occurrences") or ()
-        }
         for claim in context.state.claims:
-            self._claims.save(
-                claim,
-                compatibility_evidence_refs=occurrence_refs.get(claim.claim_id),
-            )
+            # Final canonical claims deliberately do not own source-specific
+            # evidence.  Occurrence role memberships are persisted by the
+            # occurrence stage and remain the sole evidence ownership path.
+            self._claims.save(claim)
         if self._artifacts is not None and context.artifacts.claims is not None:
             self._artifacts.put(context.artifacts.claims)
             if hasattr(self._artifacts, "put_claim_members"):
@@ -2645,9 +2830,9 @@ class PersistStage:
         if self._claims and not context.state.claims_persisted:
             for claim in context.state.claims:
                 self._claims.save(claim)
-        # Jobs are enqueued only after SnapshotRecordingStage has succeeded.
-        if self._claims and hasattr(self._claims, "enqueue_verification_jobs"):
-            self._claims.enqueue_verification_jobs(context.state.claims, context.trace.get("trace_id"))
+        # Initial verification jobs/results are part of SnapshotRecordingStage's
+        # bundle transaction.  Never enqueue after snapshot publication: that
+        # creates a crash window where a PENDING artifact has no durable job.
         if self._snapshot_service and self._signal_service and self._signal_outbox and context.artifacts.verification:
             snapshot = self._snapshot_service.get(context.state.get("content_snapshot_id", ""))
             if snapshot is not None:

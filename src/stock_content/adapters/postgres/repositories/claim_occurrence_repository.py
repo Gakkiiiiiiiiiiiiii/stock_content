@@ -120,6 +120,21 @@ class ClaimOccurrenceRepository:
             ).all())
         return [item for item in (self.get(identifier) for identifier in ids) if item is not None]
 
+    def list_by_evidence(self, evidence_id: str) -> list[ClaimOccurrence]:
+        """Return occurrences owning an evidence item through role membership.
+
+        This is the authoritative reverse lookup for final claims.  It never
+        consults the legacy claim_evidence compatibility table.
+        """
+        with self._sessions() as session:
+            ids = list(session.scalars(
+                select(ClaimOccurrenceEvidenceRow.occurrence_id)
+                .where(ClaimOccurrenceEvidenceRow.evidence_id == evidence_id)
+                .order_by(ClaimOccurrenceEvidenceRow.occurrence_id)
+                .distinct()
+            ).all())
+        return [item for item in (self.get(identifier) for identifier in ids) if item is not None]
+
 
 def _row_payload(row: ClaimOccurrenceRow) -> dict:
     return {

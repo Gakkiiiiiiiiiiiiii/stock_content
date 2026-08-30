@@ -102,6 +102,10 @@ class SqlArtifactRepository:
         with self._sessions.begin() as session:
             return _put_artifact_in_session(session, artifact)
 
+    def put_in_session(self, session, artifact: ArtifactBase) -> ArtifactBase:
+        """Persist an artifact in a caller-owned publication transaction."""
+        return _put_artifact_in_session(session, artifact)
+
     def put_with_checkpoint(self, artifacts: Iterable[ArtifactBase], task_id: str, checkpoint: Any) -> None:
         """Persist stage artifacts and checkpoint in one database transaction."""
         items = list(artifacts)
