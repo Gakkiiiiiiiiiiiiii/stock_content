@@ -1,9 +1,15 @@
 services:
   stock-content:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
     env_file:
       - path: .env
         required: false
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+      CONTENT_QDRANT_URL: http://qdrant:6333
+      CONTENT_QDRANT_COLLECTION: knowledge_v3
     ports:
       - "8100:8100"
     depends_on:
@@ -12,17 +18,79 @@ services:
       qdrant:
         condition: service_started
 
-  stock-content-worker:
-    build: .
+  stock-content-core-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core-worker
     env_file:
       - path: .env
         required: false
     command: ["stock-content-worker"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+      CONTENT_QDRANT_URL: http://qdrant:6333
+      CONTENT_QDRANT_COLLECTION: knowledge_v3
     depends_on:
       postgres:
         condition: service_healthy
       qdrant:
         condition: service_started
+
+  verification-worker:
+    profiles: [verification]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core-worker
+    command: ["stock-content-verification-worker"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  signal-publisher:
+    profiles: [publisher]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.core-worker
+    command: ["stock-content-signal-publisher"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  media-worker:
+    profiles: [media]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.media
+    command: ["stock-content-worker"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+      CONTENT_QDRANT_URL: http://qdrant:6333
+      CONTENT_QDRANT_COLLECTION: knowledge_v3
+      CONTENT_WORKER_PROFILE: media
+      CONTENT_WORKER_QUEUE: media
+
+  multimodal-worker:
+    profiles: [multimodal]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.multimodal
+    command: ["stock-content-worker"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+      CONTENT_QDRANT_URL: http://qdrant:6333
+      CONTENT_QDRANT_COLLECTION: knowledge_v3
+      CONTENT_WORKER_PROFILE: multimodal
+      CONTENT_WORKER_QUEUE: multimodal
 
   postgres:
     image: postgres:16-alpine

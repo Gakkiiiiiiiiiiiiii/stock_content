@@ -41,6 +41,7 @@ from stock_content.domain.claim_draft import ClaimOccurrenceDraft
 from stock_content.domain.claim_draft_grounder import ClaimDraftGrounder
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.claim_occurrence import ClaimOccurrence
+from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
@@ -194,6 +195,21 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
     source_type = existing.source_type if existing else str(context.source.get("type") or "")
     source_ref = existing.source_ref if existing else str(context.source.get("ref") or "")
     metadata = dict(existing.source_metadata if existing else context.state.metadata)
+    if context.options.get("source_artifact_metadata_required"):
+        required = {
+            "source_policy_version": context.options.get("source_policy_version"),
+            "retention_class": context.options.get("retention_class"),
+            "access_classification": context.options.get("access_classification"),
+        }
+        if any(not value for value in required.values()):
+            raise ValueError("source artifact policy metadata is required for new ingestion")
+        metadata.update(required)
+        metadata.update({
+            "source_content_hash": raw_hash,
+            "content_size": length,
+            "mime_type": context.options.get("mime_type") or "application/octet-stream",
+            "encryption_key_id": context.options.get("encryption_key_id"),
+        })
     identity_hash = hashlib.sha256(f"{source_type}:{source_ref}".encode()).hexdigest()
     source = SourceArtifact(
         artifact_id="source-pending",
@@ -2341,6 +2357,9 @@ class SnapshotRecordingStage:
         lifecycle_repository=None,
         verification_repository=None,
         verification_job_repository=None,
+        claim_event_repository=None,
+        signal_service=None,
+        publication_uow=None,
     ) -> None:
         self._snapshots = snapshot_service
         self._artifact_repository = artifact_repository
@@ -2348,6 +2367,9 @@ class SnapshotRecordingStage:
         self._lifecycle_repository = lifecycle_repository
         self._verification_repository = verification_repository or verification_job_repository
         self._verification_jobs = verification_job_repository or verification_repository
+        self._claim_events = claim_event_repository
+        self._signal_service = signal_service
+        self._publication_uow = publication_uow
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         """Plan and publish under one repository-owned verification UoW."""
@@ -2480,7 +2502,7 @@ class SnapshotRecordingStage:
             if reference_records:
                 producer_manifest["reference_data"] = reference_records
             manifest_models = dict(producer_manifest.get("models") or {})
-            snapshot = self._snapshots.record_bundle_from_artifacts(
+            snapshot = self._snapshots.record_from_artifacts(
                 source_type=context.source["type"],
                 source_ref=context.source["ref"],
                 source_content_hash=source_content_hash,
@@ -2539,18 +2561,146 @@ class SnapshotRecordingStage:
                 supersedes_snapshot_id=context.options.get("replay_supersedes_snapshot_id"),
                 pipeline_version=str(context.options.get("replay_pipeline_version") or "pipeline.v3"),
                 created_at=snapshot_candidate,
-                occurrences=tuple(context.state.get("occurrences") or ()),
-                lifecycle_events=tuple(context.state.get("lifecycle_events") or ()),
-                verification_results=(
+                _persist=False,
+            )
+            bundle = {
+                "occurrences": tuple(context.state.get("occurrences") or ()),
+                "lifecycle_events": tuple(context.state.get("lifecycle_events") or ()),
+                "verification_results": (
                     tuple(verification_plan.terminal_results_to_insert)
                     if verification_plan is not None else ()
                 ),
-                verification_jobs=(
+                "verification_jobs": (
                     tuple(verification_plan.pending_jobs_to_insert)
                     if verification_plan is not None else ()
                 ),
-                session=session,
-            )
+            }
+            if self._publication_uow is not None:
+                signals = []
+                if self._signal_service is not None and context.artifacts.verification is not None:
+                    for result in context.artifacts.verification.results:
+                        claim = next(
+                            (item for item in context.state.claims if item.claim_id == result.claim_id),
+                            None,
+                        )
+                        if claim is None or claim.claim_type in {
+                            "PRICE", "RETURN", "VALUATION", "FINANCIAL_METRIC"
+                        }:
+                            continue
+                        verification_view = result.model_dump(mode="json") | {"provider": "none"}
+                        payload = self._signal_service.build_signal(
+                            snapshot,
+                            claim,
+                            verification_view,
+                            verification_artifact_id=context.artifacts.verification.artifact_id,
+                            trace_id=context.trace.get("trace_id"),
+                            decision_id=context.trace.get("decision_id"),
+                        )
+                        if self._signal_service.policy.evaluate(
+                            claim, verification_view, snapshot=snapshot
+                        ).allowed:
+                            signals.append(payload)
+                publication_manifest = dict(snapshot.producer_manifest)
+                publication_manifest["artifact_membership"] = dict(snapshot.artifact_ids)
+                publication_manifest["sealed_signals"] = list(signals)
+                self._publication_uow.publish(
+                    content_snapshot_id=snapshot.content_snapshot_id,
+                    query_hash="ingest:" + snapshot.content_snapshot_id,
+                    signal_policy_version=str(
+                        context.options.get("signal_policy_version") or "signal-policy.v1"
+                    ),
+                    manifest=publication_manifest,
+                    signals=signals,
+                    outbox_events=signals,
+                    session=session,
+                    snapshot=snapshot,
+                    snapshot_bundle=bundle,
+                )
+            else:
+                # Preserve direct/custom stage compatibility while production
+                # uses the publication UoW above for the atomic boundary.
+                store = getattr(self._snapshots, "_store", None)
+                saver = getattr(store, "save_bundle", None)
+                if saver is not None:
+                    saver(snapshot, session=session, **bundle)
+                elif store is not None:
+                    store.save(snapshot)
+            if self._claim_events is not None and session is not None:
+                # Initial state events share the snapshot transaction. Missing
+                # historical timestamps are never backfilled with fabricated values.
+                occurrences = {str(item.claim_id): item for item in context.state.get("occurrences") or ()}
+                entries = list(getattr(verification_plan, "artifact_results", ()) or ())
+                by_claim = {str(item.claim_id): item for item in entries}
+                # A replay/new snapshot extends each claim's existing
+                # append-only chain.  Starting from an empty tail would make
+                # the second projection race the persisted history and fail
+                # even when the event itself is idempotent.
+                tails: dict[str, str] = {}
+                existing_ids: dict[str, set[str]] = {}
+                for claim_id in {str(item.claim_id) for item in context.state.get("claims") or ()}:
+                    existing_events = self._claim_events.list_for_claim(claim_id)
+                    existing_ids[claim_id] = {item.event_id for item in existing_events}
+                    if existing_events:
+                        tails[claim_id] = existing_events[-1].event_hash
+                pending_events: list[ClaimStateEvent] = []
+                for claim in context.state.get("claims") or ():
+                    occurrence = occurrences.get(str(claim.claim_id))
+                    known_from = getattr(occurrence, "times", None)
+                    known_from = getattr(known_from, "snapshot_committed_at", None)
+                    if known_from is None:
+                        continue
+                    entry = by_claim.get(str(claim.claim_id))
+                    status = getattr(getattr(entry, "result", None), "status", None) or "VERIFICATION_PENDING"
+                    producer_commit = str(
+                        getattr(snapshot, "code_sha", "")
+                        or (getattr(snapshot, "producer_manifest", {}) or {}).get("code_sha", "")
+                    )
+                    if not producer_commit:
+                        raise ContentSnapshotPersistError(
+                            "CONTENT_SNAPSHOT_PERSIST_FAILED: snapshot producer commit is missing"
+                        )
+                    state_payload = _claim_state_payload(
+                        claim, occurrence, entry, snapshot.content_snapshot_id, producer_commit
+                    )
+                    state_payload["status"] = status
+                    pending_events.append(ClaimStateEvent(
+                        claim_id=str(claim.claim_id), event_type="VERIFICATION_INITIAL",
+                        payload=state_payload,
+                        known_from=known_from,
+                        source_available_from=getattr(getattr(occurrence, "times", None), "available_from", None),
+                    ))
+                for event in context.state.get("lifecycle_events") or ():
+                    target_type = str(getattr(event, "target_type", ""))
+                    if target_type not in {"LifecycleTargetType.CLAIM", "CLAIM"}:
+                        continue
+                    pending_events.append(ClaimStateEvent(
+                        claim_id=str(event.target_id), event_type="LIFECYCLE",
+                        payload={"status": event.to_status, "artifact_id": event.lifecycle_event_id},
+                        known_from=event.recorded_at, business_valid_from=event.effective_at,
+                        source_available_from=event.recorded_at,
+                    ))
+                for state_event in sorted(
+                    pending_events,
+                    key=lambda item: (item.claim_id, item.known_from or snapshot.created_at, item.event_id),
+                ):
+                    # Re-projecting an unchanged lifecycle event is an
+                    # idempotent no-op.  Do not rewrite its original chain
+                    # predecessor when a later snapshot extends the chain.
+                    if state_event.event_id in existing_ids.get(state_event.claim_id, set()):
+                        continue
+                    prior = tails.get(state_event.claim_id)
+                    if prior:
+                        state_event = ClaimStateEvent(
+                            claim_id=state_event.claim_id, event_type=state_event.event_type,
+                            payload=dict(state_event.payload), known_from=state_event.known_from,
+                            business_valid_from=state_event.business_valid_from,
+                            business_valid_to=state_event.business_valid_to, known_to=state_event.known_to,
+                            source_available_from=state_event.source_available_from,
+                            previous_event_hash=prior,
+                            legacy_history_incomplete=state_event.legacy_history_incomplete,
+                        )
+                    committed = self._claim_events.append_in_session(session, state_event)
+                    tails[state_event.claim_id] = committed.event_hash
         except Exception as exc:  # noqa: BLE001 - 显式失败，绝不静默
             raise ContentSnapshotPersistError(f"CONTENT_SNAPSHOT_PERSIST_FAILED: {exc}") from exc
         context.state["content_snapshot_id"] = snapshot.content_snapshot_id
@@ -2788,6 +2938,53 @@ def _config_hash_of(config: dict | None) -> str:
     ).hexdigest()
 
 
+def _claim_state_payload(
+    claim: Any, occurrence: Any, entry: Any, snapshot_id: str, producer_commit: str
+) -> dict[str, Any]:
+    """Capture formal projection inputs in the immutable state event."""
+    times = getattr(occurrence, "times", None)
+    def value(item: Any) -> Any:
+        if item is None or isinstance(item, (str, int, float, bool)):
+            return item
+        if hasattr(item, "model_dump"):
+            return item.model_dump(mode="json")
+        if isinstance(item, (list, tuple)):
+            return [value(child) for child in item]
+        if hasattr(item, "isoformat"):
+            return item.isoformat()
+        return str(item)
+    support_status = str(getattr(claim, "source_support_status", "") or "UNSUPPORTED").upper()
+    support_count = {
+        # Formal min_support is a two-level source-support threshold:
+        # partially supported claims satisfy level 1, fully supported claims
+        # satisfy level 2.  Ambiguous and unsupported claims are excluded.
+        "SUPPORTED": 2,
+        "PARTIALLY_SUPPORTED": 1,
+        "UNSUPPORTED": 0,
+        "AMBIGUOUS": 0,
+    }.get(support_status, 0)
+    asserted_at = getattr(times, "asserted_at", None)
+    source_quality = getattr(times, "source_availability_quality", "UNKNOWN")
+    return {
+        "snapshot_id": snapshot_id,
+        "claim_id": str(getattr(claim, "claim_id", "")),
+        "occurrence_id": str(getattr(occurrence, "occurrence_id", "")),
+        "semantic_segment_id": str(getattr(occurrence, "semantic_segment_id", "")),
+        "asserted_at": value(asserted_at),
+        "source_available_at": value(getattr(times, "source_available_at", None)),
+        "available_from": value(getattr(times, "available_from", None)),
+        "source_availability_quality": str(getattr(source_quality, "value", source_quality) or "UNKNOWN"),
+        "temporal_bindings": value(getattr(claim, "temporal_bindings", ())),
+        "evidence_refs": value(getattr(occurrence, "evidence_refs", ())),
+        "symbol": str(getattr(claim, "subject_id", "") or ""),
+        "support_status": support_status,
+        "support_count": support_count,
+        "producer_commit": str(producer_commit),
+        "signal_policy_version": "signal-policy.v1",
+        "verification_status": str(getattr(getattr(entry, "result", None), "status", "") or ""),
+    }
+
+
 class PersistStage:
     name = "persist"
     required_inputs = ("summary",)
@@ -2808,6 +3005,7 @@ class PersistStage:
         snapshot_service=None,
         signal_service=None,
         signal_outbox=None,
+        publication_uow=None,
     ) -> None:
         self._videos = videos
         self._chapters = chapters
@@ -2822,6 +3020,7 @@ class PersistStage:
         self._snapshot_service = snapshot_service
         self._signal_service = signal_service
         self._signal_outbox = signal_outbox
+        self._publication_uow = publication_uow
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         if self._artifacts:
@@ -2830,25 +3029,6 @@ class PersistStage:
         if self._claims and not context.state.claims_persisted:
             for claim in context.state.claims:
                 self._claims.save(claim)
-        # Initial verification jobs/results are part of SnapshotRecordingStage's
-        # bundle transaction.  Never enqueue after snapshot publication: that
-        # creates a crash window where a PENDING artifact has no durable job.
-        if self._snapshot_service and self._signal_service and self._signal_outbox and context.artifacts.verification:
-            snapshot = self._snapshot_service.get(context.state.get("content_snapshot_id", ""))
-            if snapshot is not None:
-                for result in context.artifacts.verification.results:
-                    claim = next((item for item in context.state.claims if item.claim_id == result.claim_id), None)
-                    if claim is None or claim.claim_type in {"PRICE", "RETURN", "VALUATION", "FINANCIAL_METRIC"}:
-                        continue
-                    self._signal_service.enqueue_initial(
-                        self._signal_outbox,
-                        snapshot,
-                        claim,
-                        result.model_dump(mode="json") | {"provider": "none"},
-                        verification_artifact_id=context.artifacts.verification.artifact_id,
-                        trace_id=context.trace.get("trace_id"),
-                        decision_id=context.trace.get("decision_id"),
-                    )
         if self._artifacts and context.artifacts.claims is not None and hasattr(
             self._artifacts, "put_claim_members"
         ):

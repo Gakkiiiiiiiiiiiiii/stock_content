@@ -1,0 +1,57 @@
+manifest_version: platform-manifest.v1
+contracts:
+  - id: content.v1
+    schema: contracts/content.v1.yaml
+    checksum: sha256:D8E784B2EB62B522E70645CAE779E702F630ED37DE085E3998660F6F33C4808D
+    producer: stock_content
+    consumers: [stock_agent]
+    compatibility: compatibility
+    deprecated: true
+    sunset: "2027-06-30"
+    owner: content-platform
+  - id: content-factor-signal.v3
+    schema: contracts/content-factor-signal.v4.yaml
+    checksum: sha256:22C88EA6676A45785D6E5198FE7B6BD2E6E53FA91A1DC27DE5F7867B76FE7639
+    producer: stock_content
+    consumers: [stock_factor]
+    compatibility: compatibility
+    deprecated: true
+    sunset: "2027-06-30"
+    owner: content-platform
+  - id: content-factor-signal.v4
+    schema: contracts/content-factor-signal.v4.yaml
+    checksum: sha256:22C88EA6676A45785D6E5198FE7B6BD2E6E53FA91A1DC27DE5F7867B76FE7639
+    producer: stock_content
+    consumers: [stock_factor]
+    compatibility: compatibility
+    deprecated: true
+    sunset: "2027-06-30"
+    owner: content-platform
+  - id: content-factor-signal.v2
+    schema: contracts/content-factor-signal.v2.yaml
+    checksum: sha256:067CFB44FE2D00B813A301EDDB4F1DFDAD0BD4CB12484B40043858526C001CA3
+    producer: stock_content
+    consumers: [stock_factor]
+    compatibility: compatibility
+    deprecated: true
+    sunset: "2027-06-30"
+    owner: content-platform
+  - id: content-factor-signal.v5
+    schema: contracts/content-factor-signal.v5.yaml
+    checksum: sha256:8A165C4B500A342682EC81654D86CB29D2E1A7EC5D8DD1196A6A8AC55A89E660
+    producer: stock_content
+    consumers: [stock_factor]
+    compatibility: compatibility
+    deprecated: true
+    sunset: "2027-06-30"
+    owner: content-platform
+  - id: content-factor-signal.v5.1
+    schema: contracts/content-factor-signal.v5.1.json
+    checksum: sha256:BC4A37EDA4A48977C11F229EED1166D1B3BD3B04A17C2C96F90666026EBE804C
+    producer: stock_content
+    consumers: [stock_factor]
+    compatibility: formal
+    formal_expected: true
+    deprecated: false
+    sunset: null
+    owner: content-platform

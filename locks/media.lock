@@ -1,0 +1,3 @@
+# Auditable top-level requirements for the media profile.
+-e .[media]
+-r requirements/media.in

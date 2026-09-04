@@ -1,0 +1,6 @@
+# Fact authority, public contracts, and replay paths require content owners.
+/contracts/ @content-owners
+/migrations/ @content-owners
+/src/stock_content/domain/ @content-owners
+/src/stock_content/application/ @content-owners
+/src/stock_content/api/ @content-owners

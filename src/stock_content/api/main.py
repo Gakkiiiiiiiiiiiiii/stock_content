@@ -8,13 +8,23 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field, ValidationError
 
+from stock_content.adapters.postgres.repositories import PostgresTaskRunRepository
+from stock_content.api.admin_tasks import create_admin_tasks_router
+from stock_content.api.compatibility_signals import compatibility_response
 from stock_content.api.dependencies import build_application
+from stock_content.api.formal_signal_v2 import FormalSignalQueryRequest, formal_manifest
+from stock_content.api.readiness import create_readiness_router, dependencies_from_application
 from stock_content.application.service import ContentApplication
+from stock_content.application.task_lease_service import TaskLeaseService
+from stock_content.domain.bitemporal_query import PUBLIC_STRICT
 from stock_content.domain.claims import FinancialClaim
+from stock_content.domain.signal_contract_v5_1 import CONTRACT_CHECKSUM, CONTRACT_NAME, validate_signal_v5_1
+from stock_content.domain.source_policy import policy_for_source
 
 SERVICE_NAME = "stock_content"
 SERVICE_VERSION = "1.0.0"
 CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3", "content-factor-signal.v4", "content-factor-signal.v5"]
+CONTRACT_VERSIONS.append(CONTRACT_NAME)
 
 
 class IngestRequest(BaseModel):
@@ -84,6 +94,10 @@ def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
 def create_app(service: ContentApplication | None = None) -> FastAPI:
     app = FastAPI(title="stock_content", version="1.0.0")
     application = service or build_application()
+    app.include_router(create_readiness_router(dependencies=lambda: dependencies_from_application(application)))
+    task_sessions = getattr(getattr(application, "_tasks", None), "_sessions", None)
+    task_service = TaskLeaseService(PostgresTaskRunRepository(task_sessions)) if task_sessions else TaskLeaseService()
+    app.include_router(create_admin_tasks_router(task_service))
 
     @app.middleware("http")
     async def trace_headers(request: Request, call_next):
@@ -123,6 +137,12 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         if not source_ref:
             raise HTTPException(status_code=422, detail="url or bv_id is required")
         options = _with_idempotency(request.options, idempotency_key)
+        policy = policy_for_source("bilibili")
+        options.setdefault("source_policy_version", policy.policy_version)
+        options.setdefault("retention_class", policy.retention_class)
+        options.setdefault("access_classification", policy.access_classification.value)
+        options["source_artifact_metadata_required"] = True
+        options["enforce_source_policy"] = True
         options["trace_id"] = http_request.state.trace_id
         if http_request.state.decision_id:
             options["decision_id"] = http_request.state.decision_id
@@ -137,6 +157,12 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         if not request.m3u8_url:
             raise HTTPException(status_code=422, detail="m3u8_url is required")
         options = _with_idempotency(request.options, idempotency_key)
+        policy = policy_for_source("xiaoe_hls")
+        options.setdefault("source_policy_version", policy.policy_version)
+        options.setdefault("retention_class", policy.retention_class)
+        options.setdefault("access_classification", policy.access_classification.value)
+        options["source_artifact_metadata_required"] = True
+        options["enforce_source_policy"] = True
         options["trace_id"] = http_request.state.trace_id
         if http_request.state.decision_id:
             options["decision_id"] = http_request.state.decision_id
@@ -411,24 +437,66 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"contract_version": "content.v1", "items": items}
 
-    @app.post("/internal/v1/factor-signals")
-    def factor_signals(request: ContentSignalRequest) -> dict:
+    @app.post("/internal/v2/factor-signals/query", tags=["formal"])
+    def formal_factor_signals(request: FormalSignalQueryRequest) -> dict:
+        try:
+            query = request.to_domain()
+            method = getattr(application, "formal_factor_signals", None)
+            candidates = list(method(query) if method is not None else ())
+            items = []
+            for candidate in candidates:
+                try:
+                    items.append(validate_signal_v5_1(candidate))
+                except ValueError:
+                    # Legacy/current materialized rows are not formal facts;
+                    # they remain available through compatibility routes only.
+                    continue
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        snapshot = getattr(application, "_snapshots", None)
+        snapshot = snapshot.get(query.content_snapshot_id) if snapshot is not None else None
+        producer_commit = str(
+            getattr(snapshot, "code_sha", "")
+            or (getattr(snapshot, "producer_manifest", {}) or {}).get("code_sha", "")
+        )
+        if not producer_commit:
+            raise HTTPException(status_code=422, detail="formal signal requires snapshot producer_commit lineage")
+        manifest = formal_manifest(
+            query,
+            producer_commit=producer_commit,
+            items=items,
+        )
+        return {"contract": CONTRACT_NAME, "contract_checksum": CONTRACT_CHECKSUM,
+                "authority": "FORMAL_FACT", "formal_eligible": True,
+                "query_id": query.query_id, "manifest": manifest,
+                "business_as_of": manifest["business_as_of"], "knowledge_as_of": manifest["knowledge_as_of"],
+                "availability_as_of": manifest["availability_as_of"], "content_snapshot_id": query.content_snapshot_id,
+                "pit_mode": PUBLIC_STRICT, "items": items}
+
+    @app.post("/internal/v1/factor-signals", tags=["compatibility"])
+    def factor_signals(request: ContentSignalRequest, response: Response) -> dict:
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
-        return {"contract_version": "content-factor-signal.v3", "items": items}
+        return compatibility_response("content-factor-signal.v3", items)
 
-    @app.post("/internal/v1/factor-signals/v4")
-    def factor_signals_v4(request: ContentSignalRequest) -> dict:
+    @app.post("/internal/v1/factor-signals/v4", tags=["compatibility"])
+    def factor_signals_v4(request: ContentSignalRequest, response: Response) -> dict:
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
-        return {
-            "contract_version": "content-factor-signal.v4",
-            "items": application.factor_signals_v4(request.symbols, start, end),
-        }
+        return compatibility_response(
+            "content-factor-signal.v4",
+            application.factor_signals_v4(request.symbols, start, end),
+        )
 
-    @app.post("/internal/v1/factor-signals/v5")
-    def factor_signals_v5(request: ContentSignalRequest) -> dict:
+    @app.post("/internal/v1/factor-signals/v5", tags=["compatibility"])
+    def factor_signals_v5(request: ContentSignalRequest, response: Response) -> dict:
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         try:
@@ -442,7 +510,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"contract_version": "content-factor-signal.v5", "items": items}
+        return compatibility_response("content-factor-signal.v5", items)
 
     return app
 

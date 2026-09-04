@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "content-factor-signal.v5.1",
+  "title": "Formal content factor signal v5.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_checksum", "authority", "formal_eligible", "signal_id", "claim_id", "occurrence_id", "semantic_segment_id", "asserted_at", "source_available_at", "source_availability_quality", "available_from", "temporal_bindings", "lifecycle_as_of", "content_snapshot_id", "evidence_refs", "producer_commit", "signal_policy_version", "business_as_of", "knowledge_as_of", "availability_as_of"],
+  "properties": {
+    "contract": {"const": "content-factor-signal.v5.1"},
+    "contract_checksum": {"type": "string", "minLength": 1},
+    "authority": {"const": "FORMAL_FACT"},
+    "formal_eligible": {"const": true},
+    "signal_id": {"type": "string", "minLength": 1},
+    "claim_id": {"type": "string", "minLength": 1},
+    "occurrence_id": {"type": "string", "minLength": 1},
+    "semantic_segment_id": {"type": "string", "minLength": 1},
+    "asserted_at": {"type": ["string", "null"], "format": "date-time"},
+    "source_available_at": {"type": ["string", "null"], "format": "date-time"},
+    "source_availability_quality": {"enum": ["EXACT", "PROXY", "PUBLISHED_TIME_PROXY", "INGEST_TIME_UPPER_BOUND"]},
+    "available_from": {"type": "string", "format": "date-time"},
+    "temporal_bindings": {"type": "array", "items": {"type": "object"}},
+    "lifecycle_as_of": {"type": "object", "required": ["status", "known_from", "artifact_id"]},
+    "content_snapshot_id": {"type": "string", "minLength": 1},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    "producer_commit": {"type": "string", "minLength": 1},
+    "signal_policy_version": {"type": "string", "minLength": 1},
+    "business_as_of": {"type": "string", "format": "date-time"},
+    "knowledge_as_of": {"type": "string", "format": "date-time"},
+    "availability_as_of": {"type": "string", "format": "date-time"}
+  }
+}

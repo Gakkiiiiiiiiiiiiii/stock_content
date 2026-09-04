@@ -1,0 +1,17 @@
+name: consumer-contracts
+on:
+  pull_request:
+    paths: ["contracts/**", "scripts/contracts/**", "tests/test_p1_p2_foundations.py"]
+  push:
+    paths: ["contracts/**", "scripts/contracts/**"]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[test]"
+      - run: python scripts/contracts/verify_manifest.py
+      - run: python -m pytest tests/test_p1_p2_foundations.py -q

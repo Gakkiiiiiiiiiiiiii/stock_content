@@ -3,20 +3,27 @@ from __future__ import annotations
 import hashlib
 import logging
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from stock_content.application.conflict_service import ConflictService
+from stock_content.application.historical_claim_projector import (
+    HistoricalClaimProjector,
+    HistoricalLineageIncompleteError,
+)
 from stock_content.application.pipeline import ContentPipeline, PipelineContext
 from stock_content.application.replay_service import ReplayService
+from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.stages import cleanup_work_directory
 from stock_content.application.verification_service import VerificationService, run_verification_pass
 from stock_content.domain.artifacts import serialize_artifact
+from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
 from stock_content.domain.claims import FinancialClaim
 from stock_content.domain.models import ContentTask, TranscriptSegment
+from stock_content.domain.source_policy import allow_source, policy_for_source
 from stock_content.ports.repositories import (
     ChapterRepository,
     ContentTaskRepository,
@@ -53,6 +60,11 @@ class ContentApplication:
         lifecycle_repository: Any | None = None,
         pipeline_config: dict[str, Any] | None = None,
         temporal_reference_snapshot_provider: Any | None = None,
+        publication_uow: Any | None = None,
+        signal_service: SignalService | None = None,
+        claim_event_repository: Any | None = None,
+        historical_projector: HistoricalClaimProjector | None = None,
+        task_lease_service: Any | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
@@ -91,6 +103,11 @@ class ContentApplication:
         )
         self._verification_jobs = verification_job_repository
         self._pipeline_config = dict(pipeline_config or {})
+        self._publication_uow = publication_uow
+        self._task_lease_service = task_lease_service
+        self._signal_service = signal_service or SignalService()
+        self._claim_event_repository = claim_event_repository
+        self._historical_projector = historical_projector
         if self._verification_jobs is None and self._claim_repository is not None:
             sessions = getattr(self._claim_repository, "_sessions", None)
             if sessions is not None:
@@ -113,6 +130,7 @@ class ContentApplication:
             lifecycle_repository=self._lifecycle_repository,
             verification_repository=self._verification_jobs,
             temporal_reference_snapshot_provider=temporal_reference_snapshot_provider,
+            historical_projector=historical_projector,
         )
         # §5 P1-2/P1-4：Claim 验证生命周期与知识冲突（内存注册表，生产由 worker+DB 驱动）。
         self._verification_lifecycle = VerificationService()
@@ -121,6 +139,12 @@ class ContentApplication:
 
     def enqueue(self, source_type: str, source_ref: str, options: dict | None = None) -> dict:
         options = options or {}
+        if options.get("enforce_source_policy"):
+            policy = policy_for_source(source_type)
+            if not allow_source(policy, "ingest"):
+                raise ValueError(f"source policy denied ingestion: {source_type}")
+            if options.get("source_policy_version") != policy.policy_version:
+                raise ValueError("source policy version is required and must match the active policy")
         if self._pipeline_config:
             options = {
                 **options,
@@ -163,6 +187,12 @@ class ContentApplication:
         task = self._tasks.claim_pending(worker_id, lease_seconds)
         if task is None:
             return None
+        task_lease = None
+        if self._task_lease_service is not None:
+            existing_run = self._task_lease_service.repository.get(task.task_id)
+            if existing_run is None:
+                self._task_lease_service.create("content", task.task_id)
+            task_lease = self._task_lease_service.acquire(task.task_id, worker_id, ttl=timedelta(seconds=lease_seconds))
         context = PipelineContext(
             task_id=task.task_id,
             source={"type": task.source_type, "ref": task.source_ref},
@@ -200,9 +230,16 @@ class ContentApplication:
                 }
             payload["content_snapshot_id"] = snapshot_id
             self._tasks.succeed(task.task_id, payload)
+            if task_lease is not None:
+                self._task_lease_service.transition(task.task_id, "SUCCEEDED", worker_id, task_lease.fencing_token)
             return {"task_id": task.task_id, "status": "SUCCEEDED", **payload}
         except Exception as exc:
             self._tasks.fail(task.task_id, context.current_stage, f"{type(exc).__name__}: {exc}")
+            if task_lease is not None:
+                try:
+                    self._task_lease_service.transition(task.task_id, "FAILED", worker_id, task_lease.fencing_token)
+                except Exception:  # noqa: BLE001 - task failure remains authoritative
+                    LOGGER.exception("failed to persist content task lease state", extra={"task_id": task.task_id})
             return {
                 "task_id": task.task_id,
                 "status": "FAILED",
@@ -863,6 +900,67 @@ class ContentApplication:
             availability_as_of=availability_as_of,
             pit_mode=pit_mode,
         )
+
+    def formal_factor_signals(self, query: FormalContentSignalQueryV2) -> list[dict]:
+        """Read only snapshot-bound formal candidates from SQL authority.
+
+        This method deliberately does not consult the search index.  A caller
+        must provide a persisted snapshot; an unknown snapshot is a hard
+        failure rather than an empty result that could hide a routing error.
+        """
+        if self._snapshots.get(query.content_snapshot_id) is None:
+            raise ValueError("unknown content_snapshot_id")
+        publication = getattr(self._publication_uow, "repository", None)
+        ready = getattr(publication, "is_ready", None)
+        if ready is None or not ready(query.content_snapshot_id):
+            raise ValueError(
+                f"publication-not-ready: content snapshot {query.content_snapshot_id} is not formally published"
+            )
+        from datetime import UTC, datetime
+        start = query.start or datetime.min.replace(tzinfo=UTC)
+        end = query.end or query.availability_as_of
+        result = []
+        if self._historical_projector is None:
+            raise HistoricalLineageIncompleteError("legacy/publication-not-ready: historical projector unavailable")
+        claim_ids = self._historical_projector.claims_for_snapshot(query.content_snapshot_id)
+        if not claim_ids:
+            raise HistoricalLineageIncompleteError(
+                f"legacy/publication-not-ready: snapshot {query.content_snapshot_id} has no immutable claim membership"
+            )
+        wanted_symbols = {str(item).split(".", 1)[0] for item in query.symbols}
+        for projection in (
+            self._historical_projector.project(
+                claim_id,
+                business_as_of=query.business_as_of,
+                knowledge_as_of=query.knowledge_as_of,
+                availability_as_of=query.availability_as_of,
+                content_snapshot_id=query.content_snapshot_id,
+            )
+            for claim_id in claim_ids
+        ):
+            if projection is None:
+                continue
+            if projection.get("legacy_history_incomplete"):
+                raise HistoricalLineageIncompleteError(
+                    f"claim {projection.get('claim_id')} has incomplete historical lineage"
+                )
+            symbol = str(projection.get("symbol") or projection.get("subject_id") or "")
+            if wanted_symbols and symbol.split(".", 1)[0] not in wanted_symbols:
+                continue
+            available = projection.get("available_from")
+            if available and not (str(start.isoformat()) <= str(available) <= str(end.isoformat())):
+                continue
+            if int(projection.get("support_count") or 0) < query.min_support:
+                continue
+            lifecycle_as_of = projection.get("lifecycle_as_of")
+            if not isinstance(lifecycle_as_of, dict):
+                raise HistoricalLineageIncompleteError(
+                    f"claim {projection.get('claim_id')} has no lifecycle_as_of lineage"
+                )
+            result.append(self._signal_service.build_signal_v5_1(
+                {**projection, "lifecycle_as_of": dict(lifecycle_as_of)}, query
+            ))
+        return result
 
     def factor_signals(
         self,

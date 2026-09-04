@@ -2,7 +2,7 @@
 
 Financial Content Intelligence Service. This repository owns content ingestion,
 transcription, chaptering, knowledge/evidence, summaries, retrieval, and the
-`content-factor-signal.v3` producer contract. It never imports `stock_agent` or
+`content-factor-signal.v5.1` formal producer contract. It never imports `stock_agent` or
 `stock_factor`.
 
 ## 可信、可追溯、可验证、可重放的金融内容事实层
@@ -10,7 +10,7 @@ transcription, chaptering, knowledge/evidence, summaries, retrieval, and the
 ```text
 Raw Financial Content -> Source Snapshot -> Evidence Artifact -> FinancialClaim
     -> Fact Verification -> Knowledge Unit -> ContentSnapshot
-    -> Search / Factor Signal / Agent Evidence
+    -> Search / Formal v5.1 Factor Signal / Agent Evidence
 ```
 
 - 强类型 Artifact Pipeline（`domain/artifacts.py`），Stage 间不再用字符串 key 传核心对象；
@@ -35,8 +35,22 @@ Implemented source adapters are Bilibili (yt-dlp) and authorized Xiaoe HLS
 (ffmpeg). ASR uses faster-whisper. Tests may provide a transcript fixture in
 `options.transcript`, keeping the complete post-ASR pipeline deterministic.
 
-OCR, vision, external fact verification, conflict resolution, lifecycle jobs,
-and full golden video-accuracy coverage remain subsequent migration slices.
+OCR, vision, external fact verification, conflict resolution and lifecycle
+jobs are implemented as explicit pipeline capabilities. Formal signal queries
+require business, knowledge and availability clocks plus a content snapshot;
+v3/v4/v5 remain compatibility-only. Readiness distinguishes authoritative
+facts/signals from the rebuildable Qdrant search derivative.
+
+Run the strict contract and quality checks with:
+
+```powershell
+python scripts/contracts/verify_manifest.py
+python scripts/generate_sbom.py --profile core
+python -m pytest tests/test_p1_p2_foundations.py -q
+```
+
+Replay and vector rebuild operations are documented in `docs/runbooks/` and
+the v3→v5.1 migration is described in `docs/migrations/`.
 
 ## Run
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "content-factor-signal.v5.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "contract_checksum", "authority", "formal_eligible", "signal_id", "claim_id", "occurrence_id", "content_snapshot_id", "business_as_of", "knowledge_as_of", "availability_as_of"],
+  "properties": {
+    "contract": {"const": "content-factor-signal.v5.1"},
+    "contract_checksum": {"type": "string", "minLength": 1},
+    "authority": {"const": "FORMAL_FACT"},
+    "formal_eligible": {"const": true},
+    "signal_id": {"type": "string", "minLength": 1},
+    "claim_id": {"type": "string", "minLength": 1},
+    "occurrence_id": {"type": "string", "minLength": 1},
+    "content_snapshot_id": {"type": "string", "minLength": 1},
+    "business_as_of": {"type": "string", "format": "date-time"},
+    "knowledge_as_of": {"type": "string", "format": "date-time"},
+    "availability_as_of": {"type": "string", "format": "date-time"}
+  }
+}

@@ -11,8 +11,11 @@ from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.repositories.signal_outbox_repository import SignalOutboxRepository
 from stock_content.application.signal_publisher import SignalPublisherApplication
 from stock_content.domain.lineage import default_code_sha
+from stock_content.domain.worker_capability import TaskKind, WorkerProfile, require_capability
 
 LOGGER = logging.getLogger(__name__)
+WORKER_PROFILE = WorkerProfile.CORE
+QUEUE = TaskKind.INDEX
 
 
 class HttpSignalPublisher:
@@ -46,6 +49,7 @@ def run_db_once(worker_id: str = "signal-publisher", limit: int = 10) -> dict[st
 
 
 def main() -> None:  # pragma: no cover
+    require_capability(WORKER_PROFILE, QUEUE)
     logging.basicConfig(level=logging.INFO)
     default_code_sha()
     interval = float(os.getenv("SIGNAL_PUBLISH_POLL_SECONDS", "30"))

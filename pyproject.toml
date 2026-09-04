@@ -14,8 +14,16 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.8"]
+core = []
 postgres = ["psycopg[binary]>=3.2"]
 search = ["qdrant-client>=1.12"]
+media-cpu = [
+  "faster-whisper>=1.1",
+  "yt-dlp>=2025.1.26",
+]
+ocr = ["opencc-python-reimplemented>=0.1.7", "paddleocr>=3.3.1"]
+diarization = ["pyannote.audio>=3.1"]
+multimodal-gpu = ["opencc-python-reimplemented>=0.1.7", "paddleocr>=3.3.1", "pyannote.audio>=3.1"]
 media = [
   "faster-whisper>=1.1",
   "yt-dlp>=2025.1.26",
@@ -30,6 +38,7 @@ multimodal = [
 stock-content-worker = "stock_content.workers.content_worker:main"
 stock-content-verification-worker = "stock_content.workers.verification_worker:main"
 stock-content-signal-publisher = "stock_content.workers.signal_publisher_worker:main"
+stock-content-rebuild-index = "stock_content.cli.rebuild_index:main"
 
 [tool.ruff]
 line-length = 120

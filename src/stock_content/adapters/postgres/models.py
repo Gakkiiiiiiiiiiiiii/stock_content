@@ -3,7 +3,19 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    CheckConstraint,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -541,6 +553,29 @@ class ContentArtifactRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class SourceArtifactMetadataRow(Base):
+    __tablename__ = "source_artifact_metadata"
+    artifact_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    source_policy_version: Mapped[str] = mapped_column(String(80))
+    retention_class: Mapped[str] = mapped_column(String(64))
+    access_classification: Mapped[str] = mapped_column(String(32))
+    source_content_hash: Mapped[str] = mapped_column(String(64))
+    content_size: Mapped[int] = mapped_column(Integer)
+    mime_type: Mapped[str] = mapped_column(String(128))
+    encryption_key_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactTombstoneRow(Base):
+    __tablename__ = "artifact_tombstone"
+    artifact_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    reason: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str] = mapped_column(String(128))
+    policy_version: Mapped[str] = mapped_column(String(80))
+    request_id: Mapped[str] = mapped_column(String(128))
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ContentArtifactEdgeRow(Base):
     __tablename__ = "content_artifact_edge"
     edge_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -586,6 +621,9 @@ class FinancialClaimRow(Base):
     claim_schema_version: Mapped[str] = mapped_column(String(40), default="claim.v2")
     normalization_version: Mapped[str] = mapped_column(String(40), default="normalization.v1")
     source_support_status: Mapped[str] = mapped_column(String(24), default="UNSUPPORTED")
+    # Claims that predate the append-only ClaimStateEvent stream are denied
+    # formal historical projection until an explicit backfill is completed.
+    legacy_history_incomplete: Mapped[bool] = mapped_column(Boolean, default=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -691,3 +729,97 @@ class ContentSourceHeadRow(Base):
     latest_snapshot_id: Mapped[str] = mapped_column(String(80))
     latest_verified_snapshot_id: Mapped[str | None] = mapped_column(String(80))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class BackgroundTaskRunRow(Base):
+    """Durable lease state; audit rows are append-only and separate."""
+    __tablename__ = "background_task_run"
+
+    task_run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_type: Mapped[str] = mapped_column(String(64), index=True)
+    state: Mapped[str] = mapped_column(String(24), index=True)
+    owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    fencing_token: Mapped[int] = mapped_column(Integer, default=0)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    checkpoints: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class OperatorActionAuditRow(Base):
+    __tablename__ = "operator_action_audit"
+
+    audit_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_run_id: Mapped[str] = mapped_column(String(128), index=True)
+    action: Mapped[str] = mapped_column(String(32))
+    actor: Mapped[str] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(Text)
+    request_id: Mapped[str] = mapped_column(String(128), index=True)
+    fencing_token: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ClaimStateEventRow(Base):
+    """Append-only authority for bitemporal claim state projection."""
+    __tablename__ = "claim_state_events"
+    claim_state_event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(String(96), index=True)
+    event_type: Mapped[str] = mapped_column(String(48), index=True)
+    business_valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    business_valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    known_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    known_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_available_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    previous_event_hash: Mapped[str | None] = mapped_column(String(64))
+    event_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    legacy_history_incomplete: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentPublicationRunRow(Base):
+    """Durable state machine for atomic SQL publication."""
+    __tablename__ = "content_publication_runs"
+    publication_run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_snapshot_id: Mapped[str] = mapped_column(String(80), index=True)
+    query_hash: Mapped[str] = mapped_column(String(128))
+    signal_policy_version: Mapped[str] = mapped_column(String(80))
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    manifest_hash: Mapped[str | None] = mapped_column(String(128))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (UniqueConstraint("content_snapshot_id", "query_hash", "signal_policy_version"),)
+
+
+class ContentPublicationManifestRow(Base):
+    """Immutable, re-readable manifest sealed with a publication run."""
+
+    __tablename__ = "content_publication_manifests"
+    publication_run_id: Mapped[str] = mapped_column(
+        ForeignKey("content_publication_runs.publication_run_id", ondelete="CASCADE"), primary_key=True
+    )
+    content_snapshot_id: Mapped[str] = mapped_column(String(80), index=True)
+    query_hash: Mapped[str] = mapped_column(String(128))
+    signal_policy_version: Mapped[str] = mapped_column(String(80))
+    manifest_hash: Mapped[str] = mapped_column(String(128))
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ContentSealedSignalRow(Base):
+    """Immutable signal projection; deliberately separate from the delivery outbox."""
+
+    __tablename__ = "content_sealed_signals"
+    sealed_signal_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    publication_run_id: Mapped[str] = mapped_column(
+        ForeignKey("content_publication_runs.publication_run_id", ondelete="CASCADE"), index=True
+    )
+    signal_id: Mapped[str] = mapped_column(String(128), index=True)
+    content_snapshot_id: Mapped[str] = mapped_column(String(80), index=True)
+    claim_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    schema_version: Mapped[str] = mapped_column(String(48))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("publication_run_id", "signal_id"),)

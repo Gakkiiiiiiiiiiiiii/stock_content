@@ -39,7 +39,14 @@ class SignalOutboxRepository:
         if not signal_id:
             raise ValueError("outbox payload requires signal_id")
         with self._sessions.begin() as session:
-            _insert_ignore(
+            return self.enqueue_in_session(session, payload, current)
+
+    def enqueue_in_session(self, session, payload: dict[str, Any], now: datetime | None = None) -> SignalOutboxRow:
+        current = now or datetime.now(UTC)
+        signal_id = str(payload.get("signal_id") or "")
+        if not signal_id:
+            raise ValueError("outbox payload requires signal_id")
+        _insert_ignore(
                 session,
                 SignalOutboxRow,
                 {
@@ -56,12 +63,12 @@ class SignalOutboxRepository:
                 },
                 [SignalOutboxRow.signal_id],
             )
-            row = session.scalar(select(SignalOutboxRow).where(SignalOutboxRow.signal_id == signal_id))
-            if row is None:
-                raise RuntimeError("outbox row disappeared after a unique-key conflict")
-            if dict(row.payload or {}) != payload:
-                raise SignalOutboxIntegrityError(f"signal {signal_id} already has a different payload")
-            return row
+        row = session.scalar(select(SignalOutboxRow).where(SignalOutboxRow.signal_id == signal_id))
+        if row is None:
+            raise RuntimeError("outbox row disappeared after a unique-key conflict")
+        if dict(row.payload or {}) != payload:
+            raise SignalOutboxIntegrityError(f"signal {signal_id} already has a different payload")
+        return row
 
     def claim_due(
         self, worker_id: str, limit: int = 10, lease_seconds: int = 60, now: datetime | None = None

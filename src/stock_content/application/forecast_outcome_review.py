@@ -20,6 +20,7 @@ from stock_content.domain.artifacts import (
     VerificationArtifact,
     artifact_id_of,
 )
+from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 from stock_content.domain.lifecycle_event import (
     KnowledgeLifecycleEvent,
@@ -60,6 +61,7 @@ class ForecastOutcomeReview:
         artifact_repository: Any | None = None,
         artifact_store: Any | None = None,
         snapshot_service: SnapshotService | None = None,
+        claim_event_repository: Any | None = None,
     ) -> None:
         self._claims = claim_repository
         self._lifecycle = lifecycle_repository
@@ -67,6 +69,7 @@ class ForecastOutcomeReview:
         self._policy_version = policy_version
         self._artifacts = artifact_repository or artifact_store
         self._snapshots = snapshot_service
+        self._claim_events = claim_event_repository
 
     def review_claim(
         self,
@@ -127,6 +130,7 @@ class ForecastOutcomeReview:
         # attempting an update (or manufacturing a second event).
         existing = _get_event(self._lifecycle, event.lifecycle_event_id)
         if existing is not None:
+            self._append_claim_state(existing)
             return ForecastOutcomeReviewResult(
                 claim_id=claim.claim_id,
                 transitioned=True,
@@ -134,6 +138,7 @@ class ForecastOutcomeReview:
                 reason_code="ALREADY_OUTCOME_REVIEW",
             )
         self._lifecycle.append(event)
+        self._append_claim_state(event)
         return ForecastOutcomeReviewResult(
             claim_id=claim.claim_id,
             transitioned=True,
@@ -343,6 +348,7 @@ class ForecastOutcomeReview:
         self._artifacts.put(lifecycle)
         if existing_event is None:
             self._lifecycle.append(lifecycle_event)
+        self._append_claim_state(lifecycle_event)
         # Replaying the same deterministic input returns the existing snapshot
         # from SnapshotService without changing its historical parent.
         child = _save_snapshot(self._snapshots, child)
@@ -359,6 +365,29 @@ class ForecastOutcomeReview:
     complete = complete_review
     finalize = complete_review
     complete_outcome_review = complete_review
+
+    def _append_claim_state(self, event: KnowledgeLifecycleEvent) -> None:
+        """Mirror lifecycle mutations into the append-only formal state stream."""
+        if self._claim_events is None:
+            return
+        prior = list(self._claim_events.list_for_claim(event.target_id))
+        if any(
+            item.event_type == "LIFECYCLE"
+            and item.payload.get("artifact_id") == event.lifecycle_event_id
+            and item.known_from == event.recorded_at
+            for item in prior
+        ):
+            return
+        state_event = ClaimStateEvent(
+            claim_id=event.target_id,
+            event_type="LIFECYCLE",
+            payload={"status": event.to_status, "artifact_id": event.lifecycle_event_id},
+            known_from=event.recorded_at,
+            business_valid_from=event.effective_at,
+            source_available_from=event.recorded_at,
+            previous_event_hash=prior[-1].event_hash if prior else None,
+        )
+        self._claim_events.append(state_event)
 
     def _artifact_or_none(self, artifact_id: str) -> Any | None:
         if not artifact_id:

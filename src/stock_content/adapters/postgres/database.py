@@ -89,7 +89,7 @@ class Database:
             "content_snapshot_artifact": {
                 "artifact_role": "VARCHAR(40)",
             },
-            "financial_claim": {
+                "financial_claim": {
                 "currency": "VARCHAR(16)",
                 "period_start": "TIMESTAMP",
                 "period_end": "TIMESTAMP",
@@ -99,9 +99,12 @@ class Database:
                 "invalidation_text": "TEXT",
                 "claim_schema_version": "VARCHAR(40)",
                 "normalization_version": "VARCHAR(40)",
-                "source_support_status": "VARCHAR(24)",
-                "payload": json_declaration,
-            },
+                    "source_support_status": "VARCHAR(24)",
+                    # Legacy 013 rows are explicitly denied formal history
+                    # until their append-only state is backfilled.
+                    "legacy_history_incomplete": "BOOLEAN NOT NULL DEFAULT 0",
+                    "payload": json_declaration,
+                },
             "claim_verification_result": {
                 "fact_date": "TIMESTAMP",
                 "adjustment": "VARCHAR(32)",
@@ -143,6 +146,11 @@ class Database:
                 "uq_claim_evidence_claim_evidence "
                 "ON claim_evidence (claim_id, evidence_id)"
             )
+            if "claim_state_events" in inspector.get_table_names():
+                connection.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_claim_state_event_predecessor "
+                    "ON claim_state_events (claim_id, COALESCE(previous_event_hash, '__ROOT__'))"
+                )
             connection.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_video_segment_segment_id ON video_segment (segment_id)"
             )
@@ -248,6 +256,30 @@ class Database:
         }
         if not required <= claim_columns:
             return
+
+        # ``create_all`` cannot alter a pre-existing 013 table.  The additive
+        # column above handles the shape upgrade; this update is the SQLite
+        # equivalent of migration 026's legacy-history marker backfill.
+        if "legacy_history_incomplete" in claim_columns:
+            marker_update = text(
+                "UPDATE financial_claim "
+                "SET legacy_history_incomplete = :history_incomplete "
+                "WHERE legacy_history_incomplete IS FALSE "
+                "OR legacy_history_incomplete IS NULL"
+            )
+            marker_params = {"history_incomplete": True}
+            if "claim_state_events" in tables:
+                marker_update = text(
+                    "UPDATE financial_claim "
+                    "SET legacy_history_incomplete = :history_incomplete "
+                    "WHERE (legacy_history_incomplete IS FALSE "
+                    "OR legacy_history_incomplete IS NULL) "
+                    "AND NOT EXISTS (SELECT 1 FROM claim_state_events "
+                    "WHERE claim_state_events.claim_id = financial_claim.claim_id)"
+                )
+                connection.execute(marker_update, marker_params)
+            else:
+                connection.execute(marker_update, marker_params)
 
         def json_value(value):
             if isinstance(value, str):

@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir -e ".[core,postgres,search,multimodal-gpu]"
+CMD ["python", "-m", "stock_content.workers.content_worker"]

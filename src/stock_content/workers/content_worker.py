@@ -6,11 +6,15 @@ import socket
 import time
 
 from stock_content.api.dependencies import build_application
+from stock_content.domain.worker_capability import TaskKind, WorkerProfile, require_capability
 
 LOGGER = logging.getLogger("stock_content.worker")
+WORKER_PROFILE = WorkerProfile(os.getenv("CONTENT_WORKER_PROFILE", WorkerProfile.CORE.value))
+QUEUE = TaskKind(os.getenv("CONTENT_WORKER_QUEUE", TaskKind.CORE.value))
 
 
 def run_forever() -> None:
+    require_capability(WORKER_PROFILE, QUEUE)
     logging.basicConfig(level=os.getenv("CONTENT_LOG_LEVEL", "INFO"))
     application = build_application()
     worker_id = os.getenv("CONTENT_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")

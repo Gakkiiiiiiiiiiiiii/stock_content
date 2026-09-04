@@ -1,0 +1,3 @@
+# Auditable top-level requirements for the multimodal profile.
+-e .[multimodal]
+-r requirements/multimodal.in

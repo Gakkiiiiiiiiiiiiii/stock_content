@@ -14,6 +14,7 @@ from stock_content.adapters.media import (
 from stock_content.adapters.postgres import Database
 from stock_content.adapters.postgres.repositories import (
     ClaimOccurrenceRepository,
+    ClaimStateEventRepository,
     LifecycleRepository,
     PostgresChapterRepository,
     PostgresContentTaskRepository,
@@ -22,9 +23,11 @@ from stock_content.adapters.postgres.repositories import (
     PostgresKnowledgeRepository,
     PostgresMultimodalRepository,
     PostgresSummaryRepository,
+    PostgresTaskRunRepository,
     PostgresVerificationJobRepository,
     PostgresVerificationRepository,
     PostgresVideoRepository,
+    PublicationRepository,
     SemanticSegmentRepository,
     SignalOutboxRepository,
     SqlArtifactRepository,
@@ -34,7 +37,9 @@ from stock_content.adapters.postgres.repositories import (
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
 from stock_content.adapters.reference import QuantTemporalReferenceAdapter
 from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter
+from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.application.pipeline import ContentPipeline
+from stock_content.application.publication_unit_of_work import PublicationUnitOfWork
 from stock_content.application.service import ContentApplication
 from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
@@ -70,12 +75,14 @@ from stock_content.application.stages import (
     VerificationStage,
     VisionStage,
 )
+from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
+from stock_content.domain.signal_contract import validate_signal_v4
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
@@ -245,8 +252,64 @@ def build_application(
     # P0 C-03/C-04：快照在 persist 前基于 pipeline 已生成 Artifact 记录；失败即 task 失败。
     snapshot_service = SnapshotService(SqlSnapshotStore(database.session_factory))
     signal_outbox = SignalOutboxRepository(database.session_factory)
+    claim_events = ClaimStateEventRepository(database.session_factory)
+    publication_repository = PublicationRepository(database.session_factory)
+
+    def save_snapshot_bundle(session, snapshot, _manifest, bundle):
+        store = snapshot_service._store
+        store.save_bundle(snapshot, session=session, **bundle)
+
+    def seal_signal_rows(_session, rows, *, publication_run_id=None):
+        for payload in rows:
+            validate_signal_v4(payload)
+        if publication_run_id is not None:
+            publication_repository.save_sealed_signals_in_session(
+                _session,
+                publication_run_id,
+                tuple(rows),
+            )
+
+    publication_uow = PublicationUnitOfWork(
+        publication_repository,
+        snapshot_writer=save_snapshot_bundle,
+        signal_writer=seal_signal_rows,
+        outbox_writer=lambda session, rows: [signal_outbox.enqueue_in_session(session, row) for row in rows],
+    )
     occurrences = ClaimOccurrenceRepository(database.session_factory)
     lifecycle = LifecycleRepository(database.session_factory)
+    def snapshot_membership(snapshot_id: str, claim_id: str) -> bool:
+        from stock_content.adapters.postgres.models import ContentArtifactRow, ContentSnapshotRow
+        from stock_content.domain.artifacts import deserialize_artifact
+        with database.session_factory() as session:
+            snapshot = session.get(ContentSnapshotRow, snapshot_id)
+            claims_artifact = (dict(snapshot.artifact_ids or {}).get("claims") if snapshot else None)
+            artifact_row = session.get(ContentArtifactRow, claims_artifact) if claims_artifact else None
+            if artifact_row is None:
+                return False
+            artifact = deserialize_artifact(dict(artifact_row.payload or {}))
+            return str(claim_id) in {
+                str(getattr(item, "claim_id", item)) for item in (getattr(artifact, "claims", ()) or ())
+            }
+
+    def snapshot_claim_ids(snapshot_id: str) -> list[str]:
+        from stock_content.adapters.postgres.models import ContentArtifactRow, ContentSnapshotRow
+        from stock_content.domain.artifacts import deserialize_artifact
+        with database.session_factory() as session:
+            snapshot = session.get(ContentSnapshotRow, snapshot_id)
+            claims_artifact = dict(snapshot.artifact_ids or {}).get("claims") if snapshot else None
+            artifact_row = session.get(ContentArtifactRow, claims_artifact) if claims_artifact else None
+            if artifact_row is None:
+                return []
+            artifact = deserialize_artifact(dict(artifact_row.payload or {}))
+            return [str(getattr(item, "claim_id", item)) for item in (getattr(artifact, "claims", ()) or ())]
+
+    historical_projector = HistoricalClaimProjector(
+        event_loader=claim_events.list_for_claim,
+        membership=snapshot_membership,
+        history_incomplete=claim_events.is_history_incomplete,
+        snapshot_claim_ids=snapshot_claim_ids,
+    )
+    signal_service = SignalService()
     semantic_segments = SemanticSegmentRepository(database.session_factory)
     segmentation_client = ContentModelClient(model=str(config["segmentation_model"]))
     extraction_client = ContentModelClient(model=str(config["extraction_model"]))
@@ -314,6 +377,9 @@ def build_application(
             snapshot_service, artifacts, occurrences, lifecycle,
             verification_repository=verification_jobs,
             verification_job_repository=verification_jobs,
+            claim_event_repository=claim_events,
+            signal_service=signal_service,
+            publication_uow=publication_uow,
         ),
         PersistStage(
             videos,
@@ -327,8 +393,9 @@ def build_application(
             artifacts,
             claims,
             snapshot_service=snapshot_service,
-            signal_service=SignalService(),
+            signal_service=signal_service,
             signal_outbox=signal_outbox,
+            publication_uow=publication_uow,
         ),
         IndexStage(index),
     ]
@@ -359,4 +426,9 @@ def build_application(
         lifecycle_repository=lifecycle,
         pipeline_config=config,
         temporal_reference_snapshot_provider=reference_snapshot_provider,
+        publication_uow=publication_uow,
+        signal_service=signal_service,
+        claim_event_repository=claim_events,
+        historical_projector=historical_projector,
+        task_lease_service=TaskLeaseService(PostgresTaskRunRepository(database.session_factory)),
     )

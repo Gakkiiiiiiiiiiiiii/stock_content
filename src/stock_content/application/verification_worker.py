@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import inspect
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from stock_content.adapters.postgres.repositories.verification_job_repository import (
     PostgresVerificationJobRepository,
 )
+from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 from stock_content.ports.repositories import ClaimRepository
 
@@ -25,11 +26,13 @@ class VerificationWorkerApplication:
         claims: ClaimRepository,
         provider: VerificationProvider | None,
         completion_service: Any | None = None,
+        task_lease_service: TaskLeaseService | None = None,
     ) -> None:
         self._jobs = jobs
         self._claims = claims
         self._provider = provider
         self._completion = completion_service
+        self._task_lease = task_lease_service
 
     def run_once(
         self,
@@ -44,6 +47,14 @@ class VerificationWorkerApplication:
         retried = 0
         manual_review = 0
         for job in jobs:
+            task_run = None
+            if self._task_lease is not None:
+                task_run_id = f"verification:{job.job_id}"
+                if self._task_lease.repository.get(task_run_id) is None:
+                    self._task_lease.create("verification", task_run_id)
+                task_run = self._task_lease.acquire(
+                    task_run_id, worker_id, now=current, ttl=timedelta(seconds=lease_seconds)
+                )
             claim = self._claims.get(job.claim_id)
             if claim is None:
                 self._jobs.mark_manual_review(job.job_id, worker_id, "CLAIM_NOT_FOUND", current)
@@ -70,9 +81,17 @@ class VerificationWorkerApplication:
                     )
                 else:
                     self._jobs.complete_result(job.job_id, worker_id, result, current)
+                if task_run is not None:
+                    self._task_lease.transition(
+                        task_run.task_run_id, "SUCCEEDED", worker_id, task_run.fencing_token, now=current
+                    )
                 completed += 1
             except Exception as exc:  # provider failures do not block ingest
                 updated = self._jobs.mark_retry(job.job_id, worker_id, str(exc), current)
+                if task_run is not None:
+                    self._task_lease.transition(
+                        task_run.task_run_id, "FAILED", worker_id, task_run.fencing_token, now=current
+                    )
                 if updated.status == "MANUAL_REVIEW":
                     manual_review += 1
                 else:

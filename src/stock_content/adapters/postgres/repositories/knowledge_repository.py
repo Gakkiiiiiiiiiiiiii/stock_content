@@ -104,7 +104,7 @@ class PostgresKnowledgeRepository:
 
         business_as_of = filters.get("business_as_of")
         knowledge_as_of = filters.get("knowledge_as_of")
-        if business_as_of is not None or knowledge_as_of is not None:
+        if not filters.get("historical_projection") and (business_as_of is not None or knowledge_as_of is not None):
             business = _iso(business_as_of) if business_as_of else "9999-12-31T23:59:59+00:00"
             knowledge = _iso(knowledge_as_of) if knowledge_as_of else "9999-12-31T23:59:59+00:00"
             events = list(attributes.get("lifecycle_events") or [])
@@ -424,10 +424,14 @@ class PostgresKnowledgeRepository:
         symbols: list[str],
         start: datetime,
         end: datetime,
-        minimum_support_status: str,
+        minimum_support_status: str | int,
         *,
         availability_as_of: datetime | None = None,
         pit_mode: str | None = None,
+        business_as_of: datetime | None = None,
+        knowledge_as_of: datetime | None = None,
+        historical_projection: bool = False,
+        claim_ids: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict]:
         """Build lineage-only v5 signals from SQL rows after PIT filtering."""
         from stock_content.domain.signal_contract import upgrade_signal_v5
@@ -442,22 +446,32 @@ class PostgresKnowledgeRepository:
                 )
                 .order_by(KnowledgeUnitRow.available_from, KnowledgeUnitRow.knowledge_uid)
             ).all()
-            minimum = support_rank(minimum_support_status)
+            minimum = (
+                minimum_support_status
+                if isinstance(minimum_support_status, int) and not isinstance(minimum_support_status, bool)
+                else support_rank(minimum_support_status)
+            )
             requested = {_ticker_code(symbol) for symbol in symbols if _ticker_code(symbol)}
+            requested_claims = {str(item) for item in (claim_ids or ())}
             items: list[dict] = []
             for row in rows:
+                payload = self._payload(row)
+                if requested_claims and str(payload.get("claim_id") or "") not in requested_claims:
+                    continue
                 if support_rank(row.support_status) < minimum:
                     continue
                 if requested and _ticker_code(row.ticker or row.subject_key or "") not in requested:
                     continue
-                payload = self._payload(row)
                 filters = {
                     "availability_as_of": availability_as_of,
                     "pit_mode": pit_mode or "SYSTEM",
+                    "business_as_of": business_as_of,
+                    "knowledge_as_of": knowledge_as_of,
+                    "historical_projection": historical_projection,
                 }
                 if not self._pit_matches(payload, filters):
                     continue
-                if not self._lifecycle_matches(session, payload, filters):
+                if not historical_projection and not self._lifecycle_matches(session, payload, filters):
                     continue
                 try:
                     items.append(upgrade_signal_v5(payload))

@@ -188,6 +188,9 @@ def test_postgres_migration_contains_legacy_backfill_and_atomic_conflict_guards(
     assert payload_create < payload_upgrade
     assert result_create < result_upgrade
     assert "payload JSON NOT NULL" not in claim_table
+    history_migration = Path("migrations/026_claim_state_events_publication.sql").read_text(encoding="utf-8")
+    assert "SET legacy_history_incomplete = TRUE" in history_migration
+    assert "legacy_history_incomplete IS FALSE" in history_migration
     assert "result_payload JSON NOT NULL" not in result_table
     assert "jsonb_build_object" in foundation
     assert "ON CONFLICT(member_id) DO NOTHING" in foundation

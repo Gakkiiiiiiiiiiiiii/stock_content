@@ -1,0 +1,7 @@
+golden_set_version: golden.v1
+contract_version: content-factor-signal.v5.1
+cases: []
+metrics:
+  required: [precision, recall, evidence_coverage, temporal_accuracy, replay_mismatch_count]
+release_gate:
+  semantic_mismatch_blocks: true

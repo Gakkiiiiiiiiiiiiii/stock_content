@@ -1,9 +1,18 @@
 """The sole production caller of the pure SignalPolicy."""
+
 from __future__ import annotations
 
 from typing import Any
 
+from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
 from stock_content.domain.signal_contract import upgrade_signal_v5, validate_signal_v4, validate_signal_v5
+from stock_content.domain.signal_contract_v5_1 import (
+    AUTHORITY_FORMAL,
+    CONTRACT_CHECKSUM,
+    CONTRACT_NAME,
+    formal_signal_id,
+    validate_signal_v5_1,
+)
 from stock_content.domain.signal_policy import SignalPolicy
 
 
@@ -19,24 +28,114 @@ class SignalService:
         return self._policy.build_signal(snapshot, claim, verification, **kwargs)
 
     def build_initial_signals(
-        self, snapshot: Any, claims: list[Any], verification: Any,
-        *, trace_id: str | None = None, decision_id: str | None = None
+        self,
+        snapshot: Any,
+        claims: list[Any],
+        verification: Any,
+        *,
+        trace_id: str | None = None,
+        decision_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build all deterministic eligible projections for a snapshot."""
-        return self._policy.build_initial_signals(snapshot, claims, verification,
-                                                   trace_id=trace_id, decision_id=decision_id)
+        return self._policy.build_initial_signals(
+            snapshot, claims, verification, trace_id=trace_id, decision_id=decision_id
+        )
 
     def rebuild_signals(
-        self, snapshot: Any, claims: list[Any], verification: Any,
-        *, trace_id: str | None = None, decision_id: str | None = None
+        self,
+        snapshot: Any,
+        claims: list[Any],
+        verification: Any,
+        *,
+        trace_id: str | None = None,
+        decision_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Alias used by the Postgres rebuild path; IDs remain stable."""
-        return self._policy.build_initial_signals(snapshot, claims, verification,
-                                                   trace_id=trace_id, decision_id=decision_id)
+        return self._policy.build_initial_signals(
+            snapshot, claims, verification, trace_id=trace_id, decision_id=decision_id
+        )
 
     def build_signal_v5(self, projection: dict[str, Any]) -> dict[str, Any]:
         """Validate/build the lineage-only v5 projection from SQL data."""
         return upgrade_signal_v5(projection)
+
+    def build_signal_v5_1(self, projection: dict[str, Any], query: FormalContentSignalQueryV2) -> dict[str, Any]:
+        """Build a complete formal signal from an immutable historical projection.
+
+        The projection's legacy signal id is intentionally ignored.  Formal
+        identity is scoped to the complete query (all three clocks, snapshot,
+        query and policy), so a materialized v4/v5 row can never be promoted
+        into a v5.1 fact by reusing its id.
+        """
+        lifecycle = dict(projection.get("lifecycle_as_of") or projection.get("lifecycle") or {})
+        lifecycle_status = lifecycle.get("status") or lifecycle.get("to_status")
+        lifecycle_known_from = _as_rfc3339(lifecycle.get("known_from"))
+        lifecycle_artifact_id = lifecycle.get("artifact_id") or lifecycle.get("lifecycle_artifact_id")
+        if (
+            not all((lifecycle_status, lifecycle_known_from, lifecycle_artifact_id))
+            or any(str(value).strip().lower() == "unknown" for value in (
+                lifecycle_status, lifecycle_known_from, lifecycle_artifact_id
+            ))
+        ):
+            raise ValueError("formal signal requires a complete historical lifecycle lineage")
+        occurrence_id = str(projection.get("occurrence_id") or "")
+        semantic_segment_id = str(projection.get("semantic_segment_id") or "")
+        claim_id = str(projection.get("claim_id") or "")
+        available_from = _as_rfc3339(projection.get("available_from"))
+        if not claim_id or not occurrence_id or not semantic_segment_id or not available_from:
+            raise ValueError("formal signal requires immutable claim occurrence and availability lineage")
+        clocks = {
+            field: getattr(query, field).isoformat().replace("+00:00", "Z")
+            for field in ("business_as_of", "knowledge_as_of", "availability_as_of")
+        }
+        signal = {
+            key: projection[key]
+            for key in (
+            "claim_id", "occurrence_id", "semantic_segment_id", "asserted_at",
+                "source_available_at", "available_from", "temporal_bindings",
+            )
+            if key in projection
+        }
+        signal.setdefault("asserted_at", projection.get("asserted_at"))
+        signal.setdefault("source_available_at", projection.get("source_available_at"))
+        signal["available_from"] = available_from
+        signal["asserted_at"] = _as_rfc3339(signal.get("asserted_at"))
+        signal["source_available_at"] = _as_rfc3339(signal.get("source_available_at"))
+        producer_commit = str(projection.get("producer_commit") or "")
+        if not producer_commit:
+            raise ValueError("formal signal requires snapshot producer_commit lineage")
+        signal.update({
+            "contract": CONTRACT_NAME,
+            "contract_checksum": CONTRACT_CHECKSUM,
+            "authority": AUTHORITY_FORMAL,
+            "formal_eligible": True,
+            "content_snapshot_id": query.content_snapshot_id,
+            **clocks,
+            "lifecycle_as_of": {
+                "status": lifecycle_status,
+                "known_from": lifecycle_known_from,
+                "artifact_id": lifecycle_artifact_id,
+            },
+            "producer_commit": producer_commit,
+            # The request policy is authoritative.  A stale materialized row
+            # must not change the identity of a formal query.
+            "signal_policy_version": query.signal_policy_version,
+            "temporal_bindings": list(projection.get("temporal_bindings") or []),
+            "evidence_refs": list(projection.get("evidence_refs") or []),
+            "source_availability_quality": str(projection.get("source_availability_quality") or "EXACT"),
+        })
+        signal["signal_id"] = formal_signal_id(
+            claim_id=claim_id,
+            occurrence_id=occurrence_id,
+            semantic_segment_id=semantic_segment_id,
+            content_snapshot_id=query.content_snapshot_id,
+            business_as_of=clocks["business_as_of"],
+            knowledge_as_of=clocks["knowledge_as_of"],
+            availability_as_of=clocks["availability_as_of"],
+            query_id=query.query_id,
+            signal_policy_version=signal["signal_policy_version"],
+        )
+        return validate_signal_v5_1(signal)
 
     @staticmethod
     def validate_signal_v5(signal: dict[str, Any]) -> dict[str, Any]:
@@ -138,3 +237,11 @@ class SignalService:
 
 
 __all__ = ["SignalService"]
+
+
+def _as_rfc3339(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        value = value.isoformat()
+    return str(value).replace("+00:00", "Z")

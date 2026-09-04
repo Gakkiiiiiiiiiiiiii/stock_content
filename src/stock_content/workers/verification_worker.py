@@ -12,6 +12,7 @@ import time
 from stock_content.adapters.http import QuantExternalFactProvider
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.repositories import (
+    ClaimStateEventRepository,
     PostgresVerificationJobRepository,
     SqlClaimRepository,
 )
@@ -19,10 +20,13 @@ from stock_content.application.verification_refresh import VerificationRefreshSe
 from stock_content.application.verification_service import VerificationService, run_verification_pass
 from stock_content.application.verification_worker import VerificationWorkerApplication
 from stock_content.domain.lineage import default_code_sha
+from stock_content.domain.worker_capability import TaskKind, WorkerProfile, require_capability
 
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 30.0
+WORKER_PROFILE = WorkerProfile.CORE
+QUEUE = TaskKind.CORE
 
 
 def run_once(service: VerificationService) -> dict:
@@ -42,13 +46,19 @@ def run_db_once(worker_id: str = "verification-worker", limit: int = 10) -> dict
     database.create_schema()
     jobs = PostgresVerificationJobRepository(database.session_factory)
     claims = SqlClaimRepository(database.session_factory)
+    claim_events = ClaimStateEventRepository(database.session_factory)
     configured = QuantExternalFactProvider()
     provider = configured if configured.configured() else None
-    refresh = VerificationRefreshService(database.session_factory, jobs, claims)
-    return VerificationWorkerApplication(jobs, claims, provider, refresh).run_once(worker_id, limit)
+    refresh = VerificationRefreshService(database.session_factory, jobs, claims, claim_event_repository=claim_events)
+    from stock_content.adapters.postgres.repositories import PostgresTaskRunRepository
+    from stock_content.application.task_lease_service import TaskLeaseService
+
+    task_leases = TaskLeaseService(PostgresTaskRunRepository(database.session_factory))
+    return VerificationWorkerApplication(jobs, claims, provider, refresh, task_leases).run_once(worker_id, limit)
 
 
 def main() -> None:  # pragma: no cover - 进程入口，由部署编排驱动
+    require_capability(WORKER_PROFILE, QUEUE)
     logging.basicConfig(level=logging.INFO)
     # Validate release identity before entering the retry loop.  Deployment
     # misconfiguration must terminate startup, not be logged forever as a

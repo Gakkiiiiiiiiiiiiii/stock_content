@@ -1,6 +1,8 @@
 """Pipeline Replay + Idempotency 三概念 API 测试（详细修改方案 §4 P0-2/P0-3）。"""
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -55,6 +57,52 @@ def test_ingest_produces_content_snapshot_and_replay(tmp_path):
     listed = client.get(f"/api/v1/videos/{video_id}/snapshots")
     assert listed.status_code == 200
     assert [item["content_snapshot_id"] for item in listed.json()["items"]] == [snapshot_id]
+
+
+def test_ingest_persist_events_drive_formal_v51_query(tmp_path, monkeypatch):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = TestClient(create_app(application))
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest",
+        json={
+            "bv_id": "BV1formal",
+            "options": {
+                **_ingest_options(),
+                "code_sha": "ingest-commit-abc",
+            },
+        },
+    )
+    assert enqueue.status_code == 200
+    application.process_next("formal-e2e")
+    task = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()
+    assert task["status"] == "SUCCEEDED"
+    snapshot_id = task["result"]["content_snapshot_id"]
+    as_of = datetime.now(UTC) + timedelta(minutes=1)
+    request = {
+        "contract": "content-factor-signal.v5.1",
+        "request_id": "formal-e2e-request",
+        "symbols": ["600000.SH"],
+        "business_as_of": as_of.isoformat(),
+        "knowledge_as_of": as_of.isoformat(),
+        "availability_as_of": as_of.isoformat(),
+        "content_snapshot_id": snapshot_id,
+        "pit_mode": "PUBLIC_STRICT",
+        "min_support": 1,
+    }
+    first = client.post("/internal/v2/factor-signals/query", json=request)
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert len(first_body["items"]) == 1
+    item = first_body["items"][0]
+    assert item["producer_commit"] == "ingest-commit-abc"
+    assert item["content_snapshot_id"] == snapshot_id
+    assert item["availability_as_of"] == as_of.isoformat().replace("+00:00", "Z")
+
+    # Runtime defaults are not part of historical event/snapshot lineage.
+    monkeypatch.setenv("CONTENT_GIT_COMMIT", "different-runtime-default")
+    second = client.post("/internal/v2/factor-signals/query", json=request)
+    assert second.status_code == 200, second.text
+    assert second.json() == first_body
 
 
 def test_same_content_different_model_yields_new_snapshot(tmp_path):
