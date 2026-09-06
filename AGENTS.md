@@ -107,3 +107,28 @@ A repository-level feature is complete only when:
 - no high-severity review finding remains;
 - no public-contract or schema drift is unexplained;
 - the baseline result and any pre-existing failures are recorded.
+
+## Conversation Workflow Trigger
+
+Treat a user message beginning with the following exact form as a workflow
+control instruction:
+
+    @开工 <task-id> [economy|safe] :: <feature request>
+
+`economy` is the default. Confirm the parsed task id, mode, and request in one
+line, then take action without asking for a plan confirmation unless the form
+is incomplete or the requested action is unsafe.
+
+- In `economy`, delegate all source edits to exactly one `terra_implementer`.
+  At most one narrowly scoped, read-only Luna explorer or tester may run beside
+  it. Do not let the parent or any second agent edit source files.
+- In `safe`, first obtain a read-only `sol_reviewer` assessment, then delegate
+  source edits to exactly one `terra_implementer`; request a final Sol review
+  for the changed invariants. `sol_implementer` is allowed only when an
+  explicit escalation documents why Terra is insufficient.
+- Check the worktree status before edits and preserve unrelated user changes.
+  If this chat is not in an isolated worktree, state that fact and offer the
+  repository launcher rather than silently mixing a feature into the base
+  checkout.
+- Do not edit another repository. Report the required contract change as a
+  bounded task for that repository or for `@联调`.

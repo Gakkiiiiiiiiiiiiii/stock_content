@@ -1,4 +1,8 @@
-# Sol Supervisor Prompt
+# Legacy Sol Supervisor Prompt
+
+> This compatibility file is no longer loaded by the startup script.
+> Use `ECONOMY_WORKER.md` for the default Terra workflow or
+> `SAFE_SUPERVISOR.md` for the explicit Sol workflow.
 
 Use this as the first task instruction for a feature session in this
 repository. Append the real feature request after the policy.

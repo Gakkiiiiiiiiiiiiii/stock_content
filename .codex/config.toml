@@ -1,7 +1,7 @@
-# Phase 1 native multi-agent baseline for stock_content.
-# Sol owns planning, validation, review, and final acceptance.
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
+# Cost-aware multi-agent baseline.
+# Keep the root model unset: ordinary desktop/CLI sessions remain freely
+# selectable. Launch scripts choose the model only for an explicit workflow.
+# Sol stays reserved for formal review and high-risk supervision.
 review_model = "gpt-5.6-sol"
 
 # The root agent needs to run tests and inspect diffs. The supervisor prompt
@@ -11,8 +11,8 @@ sandbox_mode = "workspace-write"
 [agents]
 enabled = true
 
-# Phase 1 is intentionally low-concurrency: one writer, with read/test work
-# allowed to run independently when it has a disjoint scope.
-max_concurrent_threads_per_session = 3
+# Do not fan out by default. Parallel work is read-only and must have a
+# disjoint scope; each repository still has only one code writer.
+max_concurrent_threads_per_session = 2
 default_subagent_model = "gpt-5.6-luna"
-default_subagent_reasoning_effort = "high"
+default_subagent_reasoning_effort = "medium"
