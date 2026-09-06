@@ -50,7 +50,7 @@ def _load_knowledge_from_postgres(database_url: str | None) -> list[dict[str, An
     from stock_content.adapters.postgres.models import KnowledgeUnitRow
 
     database = Database(database_url)
-    database.create_schema()
+    database.verify_schema()
     with database.session() as session:
         rows = session.scalars(select(KnowledgeUnitRow)).all()
         return [

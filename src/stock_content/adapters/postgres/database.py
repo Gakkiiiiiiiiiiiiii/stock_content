@@ -14,8 +14,13 @@ from stock_content.adapters.postgres.legacy_ids import (
     legacy_evidence_member_id,
     legacy_verification_id,
 )
+from stock_content.adapters.postgres.migration_ledger import MigrationLedgerError, verify_migration_ledger
 from stock_content.adapters.postgres.models import Base
 from stock_content.domain.artifacts import legacy_transcript_segment_id
+
+
+class SchemaNotReadyError(RuntimeError):
+    """Raised when a deployment has not applied the schema required by this release."""
 
 
 class Database:
@@ -28,6 +33,16 @@ class Database:
         self.session_factory = sessionmaker(self.engine, expire_on_commit=False)
 
     def create_schema(self) -> None:
+        """Create or upgrade a schema for an explicitly opted-in development fixture.
+
+        Production composition must use :meth:`verify_schema` instead.  Schema
+        evolution is owned by the one-shot migration process, never an API,
+        worker, or operational CLI process.
+        """
+        if self.engine.dialect.name != "sqlite":
+            raise RuntimeError(
+                "create_schema is development-only for SQLite; use stock-content-migrate for PostgreSQL"
+            )
         Base.metadata.create_all(self.engine)
         # The split service can be deployed against the early minimal schema.
         # Keep upgrades additive so persisted videos/tasks are never discarded.
@@ -210,6 +225,37 @@ class Database:
             # SQLite development databases have the same upgrade semantics.
             self._upgrade_legacy_claims(connection)
             self._upgrade_legacy_segments(connection)
+
+    def verify_schema(self) -> None:
+        """Fail closed unless the database has the release's mapped schema.
+
+        This is deliberately metadata-only: SQLAlchemy's inspector reads the
+        catalog and this method never executes DDL or a data backfill.  The
+        migration owner remains responsible for creating or evolving schema.
+        """
+        try:
+            verify_migration_ledger(self.engine)
+        except MigrationLedgerError as error:
+            raise SchemaNotReadyError(str(error)) from error
+        inspector = inspect(self.engine)
+        available_tables = set(inspector.get_table_names())
+        missing_tables: dict[str, tuple[str, ...]] = {}
+        for table_name, table in Base.metadata.tables.items():
+            if table_name not in available_tables:
+                missing_tables[table_name] = tuple(column.name for column in table.columns)
+                continue
+            available_columns = {column["name"] for column in inspector.get_columns(table_name)}
+            missing_columns = tuple(column.name for column in table.columns if column.name not in available_columns)
+            if missing_columns:
+                missing_tables[table_name] = missing_columns
+        if missing_tables:
+            details = "; ".join(
+                f"{table} ({', '.join(columns)})" for table, columns in sorted(missing_tables.items())
+            )
+            raise SchemaNotReadyError(
+                "database schema is missing or outdated for this release; "
+                f"run the deployment migration before starting stock_content: {details}"
+            )
 
     @staticmethod
     def _upgrade_legacy_segments(connection) -> None:

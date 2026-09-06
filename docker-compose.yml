@@ -1,4 +1,14 @@
 services:
+  content-migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.migration
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   stock-content:
     build:
       context: .
@@ -13,6 +23,8 @@ services:
     ports:
       - "8100:8100"
     depends_on:
+      content-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       qdrant:
@@ -30,7 +42,15 @@ services:
       CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
       CONTENT_QDRANT_URL: http://qdrant:6333
       CONTENT_QDRANT_COLLECTION: knowledge_v3
+      CONTENT_WORKER_PROFILE: core
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
     depends_on:
+      content-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       qdrant:
@@ -48,6 +68,8 @@ services:
       - path: .env
         required: false
     depends_on:
+      content-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
 
@@ -63,6 +85,8 @@ services:
       - path: .env
         required: false
     depends_on:
+      content-migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
 
@@ -78,6 +102,16 @@ services:
       CONTENT_QDRANT_COLLECTION: knowledge_v3
       CONTENT_WORKER_PROFILE: media
       CONTENT_WORKER_QUEUE: media
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4096M
+    depends_on:
+      content-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   multimodal-worker:
     profiles: [multimodal]
@@ -91,6 +125,16 @@ services:
       CONTENT_QDRANT_COLLECTION: knowledge_v3
       CONTENT_WORKER_PROFILE: multimodal
       CONTENT_WORKER_QUEUE: multimodal
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8192M
+    depends_on:
+      content-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine

@@ -1,1 +1,1 @@
--e .[media]
+-e .[core,postgres,search,media]

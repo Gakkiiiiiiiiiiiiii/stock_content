@@ -1,4 +1,4 @@
 # Auditable top-level requirements for the core profile.
 # Resolve with a separately reviewed, generated constraints file in deployment.
--e .
+-e .[core,postgres,search]
 -r requirements/core.in

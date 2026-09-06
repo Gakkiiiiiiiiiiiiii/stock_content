@@ -226,7 +226,7 @@ def build_application(
             "CONTENT_TEMPORAL_REFERENCE_REQUIRED=true requires an exact temporal reference snapshot provider"
         )
     database = Database(database_url)
-    database.create_schema()
+    database.verify_schema()
     tasks = PostgresContentTaskRepository(database.session_factory)
     videos = PostgresVideoRepository(database.session_factory)
     chapters = PostgresChapterRepository(database.session_factory)

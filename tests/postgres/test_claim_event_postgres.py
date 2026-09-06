@@ -7,13 +7,10 @@ PostgreSQL DSN to run them; normal local/SQLite test runs skip the module.
 from __future__ import annotations
 
 import os
-import secrets
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
 
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.repositories.claim_event_repository import ClaimStateEventRepository
@@ -24,32 +21,6 @@ pytestmark = pytest.mark.skipif(
     not POSTGRES_URL,
     reason="CONTENT_TEST_POSTGRES_URL is required for real PostgreSQL tests",
 )
-
-
-@pytest.fixture(scope="module")
-def postgres_database():
-    if not POSTGRES_URL:  # pragma: no cover - module mark handles normal path
-        pytest.skip("CONTENT_TEST_POSTGRES_URL is required")
-    schema = f"claim_event_{secrets.token_hex(8)}"
-    base_url = make_url(POSTGRES_URL)
-    admin = create_engine(base_url, pool_pre_ping=True)
-    schema_created = False
-    try:
-        with admin.begin() as connection:
-            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        schema_created = True
-        query = dict(base_url.query)
-        existing_options = str(query.get("options") or "").strip()
-        query["options"] = f"{existing_options} -csearch_path={schema},public".strip()
-        scoped_url = base_url.set(query=query)
-        database = Database(scoped_url.render_as_string(hide_password=False))
-        database.create_schema()
-        yield database
-    finally:
-        if schema_created:
-            with admin.begin() as connection:
-                connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
-        admin.dispose()
 
 
 def _event(

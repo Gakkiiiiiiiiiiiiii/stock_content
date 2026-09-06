@@ -43,7 +43,7 @@ def run_db_once(worker_id: str = "verification-worker", limit: int = 10) -> dict
     """Run one durable pass; production authority is PostgreSQL, not memory."""
     default_code_sha()
     database = Database()
-    database.create_schema()
+    database.verify_schema()
     jobs = PostgresVerificationJobRepository(database.session_factory)
     claims = SqlClaimRepository(database.session_factory)
     claim_events = ClaimStateEventRepository(database.session_factory)

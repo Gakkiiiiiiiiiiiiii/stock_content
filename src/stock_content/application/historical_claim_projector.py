@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
+from stock_content.domain.bitemporal_query import require_utc
 from stock_content.domain.claim_state_event import ClaimStateEvent, validate_event_chain
 
 
@@ -56,6 +57,13 @@ class HistoricalClaimProjector:
         availability_as_of: datetime,
         content_snapshot_id: str | None = None,
     ) -> dict[str, Any] | None:
+        # Formal queries validate their clocks at the transport boundary, but
+        # replay calls this projector directly.  Keep the shared projection
+        # entry point fail-closed rather than allowing naive comparisons to
+        # depend on an adapter's timezone behavior.
+        business_as_of = require_utc(business_as_of, "business_as_of")
+        knowledge_as_of = require_utc(knowledge_as_of, "knowledge_as_of")
+        availability_as_of = require_utc(availability_as_of, "availability_as_of")
         if content_snapshot_id and (self._membership is None or not self._membership(content_snapshot_id, claim_id)):
             return None
         # A migration marker is an explicit deny, not an unknown state that a

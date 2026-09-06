@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -129,16 +129,21 @@ def validate_signal_v5_1(signal: Mapping[str, Any], *, expected_checksum: str | 
         "INGEST_TIME_UPPER_BOUND",
     }:
         raise ValueError("unsupported source_availability_quality")
-    for key in ("business_as_of", "knowledge_as_of", "availability_as_of"):
-        _rfc3339_aware(signal[key], key)
+    clocks = {
+        key: _rfc3339_utc(signal[key], key)
+        for key in ("business_as_of", "knowledge_as_of", "availability_as_of")
+    }
     # ``available_from`` is the lower bound used by PIT consumers and is not
     # nullable.  The two source timestamps remain nullable by contract.
     if signal["available_from"] is None:
         raise ValueError("available_from must be an RFC3339 datetime")
-    _rfc3339_aware(signal["available_from"], "available_from")
+    available_from = _rfc3339_utc(signal["available_from"], "available_from")
+    if available_from > clocks["availability_as_of"]:
+        raise ValueError("available_from must not be after availability_as_of")
     for key in ("asserted_at", "source_available_at"):
         if signal[key] is not None:
-            _rfc3339_aware(signal[key], key)
+            if _rfc3339_utc(signal[key], key) > clocks["availability_as_of"]:
+                raise ValueError(f"{key} must not be after availability_as_of")
     if signal["lifecycle_as_of"] is None or not isinstance(signal["lifecycle_as_of"], Mapping):
         raise ValueError("lifecycle_as_of must be an object")
     for key in ("status", "known_from", "artifact_id"):
@@ -146,13 +151,16 @@ def validate_signal_v5_1(signal: Mapping[str, Any], *, expected_checksum: str | 
             raise ValueError(f"lifecycle_as_of missing {key}")
         if not isinstance(signal["lifecycle_as_of"][key], str) or not signal["lifecycle_as_of"][key]:
             raise ValueError(f"lifecycle_as_of.{key} must be a non-empty string")
-    _rfc3339_aware(signal["lifecycle_as_of"]["known_from"], "lifecycle_as_of.known_from")
+    if _rfc3339_utc(
+        signal["lifecycle_as_of"]["known_from"], "lifecycle_as_of.known_from"
+    ) > clocks["knowledge_as_of"]:
+        raise ValueError("lifecycle_as_of.known_from must not be after knowledge_as_of")
     if not isinstance(signal["temporal_bindings"], list) or not isinstance(signal["evidence_refs"], list):
         raise ValueError("temporal_bindings and evidence_refs must be arrays")
     return dict(signal)
 
 
-def _rfc3339_aware(value: Any, field: str) -> None:
+def _rfc3339_utc(value: Any, field: str) -> datetime:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be an RFC3339 datetime")
     try:
@@ -161,6 +169,9 @@ def _rfc3339_aware(value: Any, field: str) -> None:
         raise ValueError(f"{field} must be an RFC3339 datetime") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")
+    if parsed.utcoffset() != UTC.utcoffset(parsed):
+        raise ValueError(f"{field} must use UTC timezone")
+    return parsed.astimezone(UTC)
 
 
 __all__ = [

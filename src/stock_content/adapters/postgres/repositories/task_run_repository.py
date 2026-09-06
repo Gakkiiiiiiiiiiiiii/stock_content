@@ -99,6 +99,55 @@ class PostgresTaskRunRepository:
             row.updated_at = now
             return task
 
+    def renew(
+        self,
+        task_run_id: str,
+        owner: str,
+        fencing_token: int,
+        *,
+        now: datetime | None = None,
+        ttl: timedelta = timedelta(minutes=5),
+    ) -> TaskRun:
+        now = now or datetime.now(UTC)
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                select(BackgroundTaskRunRow).where(
+                    BackgroundTaskRunRow.task_run_id == task_run_id,
+                ).with_for_update()
+            )
+            if row is None:
+                raise KeyError(task_run_id)
+            task = self._domain(row).renew_lease(owner, fencing_token, now=now, ttl=ttl)
+            row.lease_expires_at = task.lease_expires_at
+            row.updated_at = now
+            return task
+
+    def transition(
+        self,
+        task_run_id: str,
+        state: TaskRunState | str,
+        owner: str,
+        fencing_token: int,
+        *,
+        now: datetime | None = None,
+    ) -> TaskRun:
+        now = now or datetime.now(UTC)
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                select(BackgroundTaskRunRow).where(
+                    BackgroundTaskRunRow.task_run_id == task_run_id,
+                ).with_for_update()
+            )
+            if row is None:
+                raise KeyError(task_run_id)
+            task = self._domain(row).transition(state, owner, fencing_token, now=now)
+            row.state = task.state.value
+            row.owner = task.owner
+            row.lease_expires_at = task.lease_expires_at
+            row.attempt = task.attempt
+            row.updated_at = now
+            return task
+
     def operator_action(
         self, task_run_id: str, action: OperatorAction | str, *, actor: str, reason: str,
         request_id: str, now: datetime | None = None,

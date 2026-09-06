@@ -21,9 +21,14 @@ class RetentionPolicy:
         return created_at + self.retain_for
 
     def is_expired(self, created_at: datetime, *, now: datetime | None = None) -> bool:
-        return (now or datetime.now(UTC)) >= self.expires_at(created_at)
+        compared_at = now or datetime.now(UTC)
+        if compared_at.tzinfo is None:
+            compared_at = compared_at.replace(tzinfo=UTC)
+        return compared_at >= self.expires_at(created_at)
 
     def derived_expires_at(self, created_at: datetime) -> datetime:
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
         return created_at + (self.derived_retain_for or self.retain_for)
 
 

@@ -4,8 +4,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 
 from stock_content.adapters.postgres.database import Database
+from stock_content.adapters.postgres.models import ClaimVerificationResultRow
 from stock_content.adapters.postgres.repositories.claim_repository import SqlClaimRepository
 from stock_content.adapters.postgres.repositories.verification_job_repository import (
     MANUAL_REVIEW,
@@ -79,6 +81,42 @@ def test_lease_exclusion_expiry_reclaim_and_owner_validation(tmp_path):
         jobs.renew_lease(first[0].job_id, "worker-b", now=start + timedelta(seconds=30))
     reclaimed = jobs.claim_due("worker-b", now=start + timedelta(seconds=61))
     assert len(reclaimed) == 1
+
+
+def test_expired_worker_cannot_commit_after_takeover_and_effect_is_once(tmp_path):
+    database, claims, jobs = _repos(tmp_path)
+    claim = _claim()
+    claims.save(claim)
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    jobs.enqueue([claim], now=start)
+    first = jobs.claim_due("worker-a", now=start, lease_seconds=10)[0]
+    second = jobs.claim_due("worker-b", now=start + timedelta(seconds=11), lease_seconds=10)[0]
+
+    stale = VerificationResult(
+        claim_id=claim.claim_id,
+        status="VERIFIED",
+        market_snapshot_id="stale-market",
+        market_data_version="bars.v1",
+        fact_date=start.date(),
+        adjustment="NONE",
+        verification_timestamp=start,
+    )
+    with pytest.raises(VerificationJobIntegrityError, match="lease owner mismatch"):
+        jobs.complete_result(first.job_id, "worker-a", stale, now=start + timedelta(seconds=11))
+
+    current = VerificationResult(
+        claim_id=claim.claim_id,
+        status="VERIFIED",
+        market_snapshot_id="current-market",
+        market_data_version="bars.v1",
+        fact_date=start.date(),
+        adjustment="NONE",
+        verification_timestamp=start + timedelta(seconds=11),
+    )
+    jobs.complete_result(second.job_id, "worker-b", current, now=start + timedelta(seconds=11))
+    with database.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(ClaimVerificationResultRow)) == 1
+    assert jobs.read_result(claim.claim_id).market_snapshot_id == "current-market"
 
 
 def test_retry_schedule_restart_durability_and_manual_review(tmp_path):

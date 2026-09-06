@@ -115,7 +115,7 @@ def test_sql_publication_reloads_sealed_manifest_and_signals(tmp_path):
         outbox_writer=lambda session, rows: [outbox.enqueue_in_session(session, row) for row in rows],
     )
     manifest = {"artifact_membership": {"claims": "claims-v1"}, "sealed_signals": signals}
-    uow.publish(
+    first = uow.publish(
         content_snapshot_id="snapshot-sealed",
         query_hash="ingest:sealed",
         signal_policy_version="signal-policy.v1",
@@ -138,6 +138,10 @@ def test_sql_publication_reloads_sealed_manifest_and_signals(tmp_path):
     assert [item["signal_id"] for item in sealed["signals"]] == ["a-signal", "z-signal"]
     assert retry == sealed["publication_run"]
     assert sealed["publication_run"].state == PublicationState.READY
+    # A retry after the first transaction committed must retain the exact
+    # sealed hash; it must not enqueue another outbox effect.
+    assert retry.manifest_hash == first.manifest_hash == sealed["publication_run"].manifest_hash
+    assert len(outbox.list_for_snapshot("snapshot-sealed")) == len(signals)
 
 
 def test_sqlite_legacy_schema_upgrade_adds_sealed_projection_tables(tmp_path):

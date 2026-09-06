@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from stock_content.adapters.postgres.models import ClaimStateEventRow, FinancialClaimRow
-from stock_content.domain.claim_state_event import ClaimStateEvent
+from stock_content.domain.claim_state_event import ClaimStateEvent, validate_event_chain
 
 
 class ClaimStateEventRepository:
@@ -36,6 +36,11 @@ class ClaimStateEventRepository:
             event_hash=event.event_hash,
             legacy_history_incomplete=event.legacy_history_incomplete,
         )
+        # A snapshot projection may append more than one event for a claim in
+        # one transaction.  Flush first so the chain's terminal node is read
+        # from the durable session state rather than an incidental
+        # ``created_at`` ordering (which may tie on SQLite).
+        session.flush()
         row = session.get(ClaimStateEventRow, event.event_id)
         if row is not None:
             def utc(value):
@@ -50,12 +55,7 @@ class ClaimStateEventRepository:
             if stored != candidate:
                 raise ValueError(f"claim state event {event.event_id} already stores different payload")
             return event
-        tail = session.scalar(
-            select(ClaimStateEventRow)
-            .where(ClaimStateEventRow.claim_id == event.claim_id)
-            .order_by(ClaimStateEventRow.created_at.desc(), ClaimStateEventRow.claim_state_event_id.desc())
-            .with_for_update()
-        )
+        tail = self._tail_in_session(session, event.claim_id)
         if tail is not None and event.previous_event_hash != tail.event_hash:
             raise ValueError("claim state event previous_event_hash does not match chain tail")
         session.add(ClaimStateEventRow(
@@ -81,12 +81,23 @@ class ClaimStateEventRepository:
             rows = session.scalars(
                 select(ClaimStateEventRow)
                 .where(ClaimStateEventRow.claim_id == claim_id)
-                # ``created_at`` is the append order used by the chain tail;
-                # known_from is a business/PIT clock and may legitimately tie
-                # or move independently of append order.
-                .order_by(ClaimStateEventRow.created_at, ClaimStateEventRow.claim_state_event_id)
             ).all()
+        return list(validate_event_chain(self._events_from_rows(rows)))
 
+    def _tail_in_session(self, session, claim_id: str) -> ClaimStateEvent | None:
+        """Return the sole terminal event, never an arbitrary timestamp tie."""
+        rows = session.scalars(
+            select(ClaimStateEventRow)
+            .where(ClaimStateEventRow.claim_id == claim_id)
+            # Lock every row in this claim's chain.  A terminal-row-only lock
+            # would not protect a chain whose ordering is encoded by hashes.
+            .with_for_update()
+        ).all()
+        events = validate_event_chain(self._events_from_rows(rows))
+        return events[-1] if events else None
+
+    @staticmethod
+    def _events_from_rows(rows) -> list[ClaimStateEvent]:
         def utc(value):
             return value if value is None or value.tzinfo else value.replace(tzinfo=UTC)
 
