@@ -42,7 +42,7 @@ class HttpSignalPublisher:
 def run_db_once(worker_id: str = "signal-publisher", limit: int = 10) -> dict[str, int]:
     default_code_sha()
     database = Database()
-    database.create_schema()
+    database.verify_schema()
     return SignalPublisherApplication(
         SignalOutboxRepository(database.session_factory), HttpSignalPublisher()
     ).run_once(worker_id, limit)

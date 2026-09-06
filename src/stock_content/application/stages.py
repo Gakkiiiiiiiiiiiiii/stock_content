@@ -47,6 +47,7 @@ from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenc
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.financial_event_extractor import FinancialEventExtractor
 from stock_content.domain.financial_numeric import parse_financial_numerics
+from stock_content.domain.governance_evidence import governance_evidence_for, redact_pii
 from stock_content.domain.initial_verification import build_initial_verification_plan
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
@@ -60,6 +61,7 @@ from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoA
 from stock_content.domain.semantic_context_builder import SemanticContextBuilder
 from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
+from stock_content.domain.source_policy import policy_for_source
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_normalizer import TemporalNormalizer
 from stock_content.domain.temporal_semantics import (
@@ -196,6 +198,7 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
     source_ref = existing.source_ref if existing else str(context.source.get("ref") or "")
     metadata = dict(existing.source_metadata if existing else context.state.metadata)
     if context.options.get("source_artifact_metadata_required"):
+        policy = policy_for_source(source_type)
         required = {
             "source_policy_version": context.options.get("source_policy_version"),
             "retention_class": context.options.get("retention_class"),
@@ -209,6 +212,7 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
             "content_size": length,
             "mime_type": context.options.get("mime_type") or "application/octet-stream",
             "encryption_key_id": context.options.get("encryption_key_id"),
+            "governance_evidence": governance_evidence_for(policy),
         })
     identity_hash = hashlib.sha256(f"{source_type}:{source_ref}".encode()).hexdigest()
     source = SourceArtifact(
@@ -489,6 +493,23 @@ class ASRStage:
             segments = self._recognizer.transcribe(context.runtime.audio_path, context.options.get("language"))
         if not segments:
             raise ValueError("ASR returned no transcript segments")
+        detected_types: set[str] = set()
+        for segment in segments:
+            text = redact_pii(segment.text)
+            segment.text = text.text
+            detected_types.update(text.detected_types)
+            if segment.raw_text is not None:
+                raw = redact_pii(segment.raw_text)
+                segment.raw_text = raw.text
+                detected_types.update(raw.detected_types)
+            if segment.normalized_text is not None:
+                normalized = redact_pii(segment.normalized_text)
+                segment.normalized_text = normalized.text
+                detected_types.update(normalized.detected_types)
+        if detected_types:
+            context.state.quality_warnings.extend(
+                f"PII_REDACTED:{category}" for category in sorted(detected_types)
+            )
         context.state["segments"] = segments
         context.state["transcript"] = " ".join(segment.text for segment in segments)
         _register_transcript_artifact(context, producer_stage="asr")

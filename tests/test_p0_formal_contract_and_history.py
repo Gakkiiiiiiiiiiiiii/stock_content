@@ -1,4 +1,6 @@
+import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from stock_content.application.signal_service import SignalService
 from stock_content.application.stages import _claim_state_payload
 from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
 from stock_content.domain.claim_state_event import ClaimStateEvent, validate_event_chain
+from stock_content.domain.lineage import build_content_snapshot
 from stock_content.domain.signal_contract_v5_1 import (
     AUTHORITY_FORMAL,
     CONTRACT_CHECKSUM,
@@ -51,6 +54,15 @@ def test_formal_query_is_immutable_and_all_clocks_are_in_identity():
         query(business_as_of=datetime(2024, 1, 1))
 
 
+@pytest.mark.parametrize("field", ("business_as_of", "knowledge_as_of", "availability_as_of"))
+@pytest.mark.parametrize("value", ("2024-01-02T00:00:00", "2024-01-02T08:00:00+08:00"))
+def test_formal_request_rejects_naive_and_non_utc_clocks(field, value):
+    payload = query().canonical_request()
+    payload[field] = value
+    with pytest.raises(ValueError, match="UTC"):
+        FormalContentSignalQueryV2.from_mapping(payload)
+
+
 def test_formal_signal_contract_and_checksum():
     signal = {
         "contract": CONTRACT_NAME,
@@ -78,6 +90,18 @@ def test_formal_signal_contract_and_checksum():
     assert validate_signal_v5_1(signal)["authority"] == AUTHORITY_FORMAL
     with pytest.raises(ValueError, match="checksum"):
         validate_signal_v5_1({**signal, "contract_checksum": "bad"})
+    for field, value in (
+        ("business_as_of", "2024-01-02T08:00:00+08:00"),
+        ("knowledge_as_of", "2024-01-02T00:00:00"),
+        ("availability_as_of", "2023-12-31T23:59:59Z"),
+    ):
+        with pytest.raises(ValueError, match="UTC|timezone-aware|after"):
+            validate_signal_v5_1({**signal, field: value})
+    with pytest.raises(ValueError, match="knowledge_as_of"):
+        validate_signal_v5_1({
+            **signal,
+            "lifecycle_as_of": {**signal["lifecycle_as_of"], "known_from": "2024-01-03T00:00:00Z"},
+        })
 
 
 def test_historical_projector_excludes_late_event_and_detects_tamper():
@@ -126,6 +150,67 @@ def test_historical_projector_requires_real_lifecycle_lineage():
         "c1", business_as_of=dt(2), knowledge_as_of=dt(2), availability_as_of=dt(2), content_snapshot_id="snap"
     )
     assert projection is not None and "lifecycle_as_of" not in projection
+
+
+def test_historical_projection_golden_respects_three_clocks_and_late_lifecycle():
+    """An appended current lifecycle state cannot rewrite an old as-of view."""
+    events = []
+    verification = ClaimStateEvent(
+        "c1", "VERIFICATION_INITIAL", {"verification_status": "SUPPORTED"}, dt(1),
+        business_valid_from=dt(2), source_available_from=dt(1),
+    )
+    active = ClaimStateEvent(
+        "c1", "LIFECYCLE", {"status": "ACTIVE", "artifact_id": "life-active"}, dt(2),
+        business_valid_from=dt(2), source_available_from=dt(3), previous_event_hash=verification.event_hash,
+    )
+    events.extend((verification, active))
+    projector = HistoricalClaimProjector(
+        event_loader=lambda _claim_id: events,
+        membership=lambda snapshot, claim: snapshot == "snap-1" and claim == "c1",
+    )
+
+    # Business validity, knowledge, and public availability gate independently.
+    assert projector.project(
+        "c1", business_as_of=dt(1), knowledge_as_of=dt(3), availability_as_of=dt(3),
+        content_snapshot_id="snap-1",
+    ) is None
+    not_yet_public = projector.project(
+        "c1", business_as_of=dt(2), knowledge_as_of=dt(2), availability_as_of=dt(2),
+        content_snapshot_id="snap-1",
+    )
+    assert not_yet_public is not None and "lifecycle_as_of" not in not_yet_public
+    historical = projector.project(
+        "c1", business_as_of=dt(2), knowledge_as_of=dt(3), availability_as_of=dt(3),
+        content_snapshot_id="snap-1",
+    )
+    assert historical is not None
+    assert historical["lifecycle_as_of"]["status"] == "ACTIVE"
+    historical_hash = hashlib.sha256(json.dumps(historical, sort_keys=True).encode()).hexdigest()
+
+    # This is current state with an older business effect but later knowledge
+    # and availability.  It must remain invisible to the frozen historical
+    # projection while becoming visible only after its own clocks permit it.
+    events.append(ClaimStateEvent(
+        "c1", "LIFECYCLE", {"status": "WITHDRAWN", "artifact_id": "life-withdrawn"}, dt(6),
+        business_valid_from=dt(1), source_available_from=dt(6), previous_event_hash=active.event_hash,
+    ))
+    historical_again = projector.project(
+        "c1", business_as_of=dt(2), knowledge_as_of=dt(3), availability_as_of=dt(3),
+        content_snapshot_id="snap-1",
+    )
+    assert hashlib.sha256(json.dumps(historical_again, sort_keys=True).encode()).hexdigest() == historical_hash
+    current = projector.project(
+        "c1", business_as_of=dt(2), knowledge_as_of=dt(6), availability_as_of=dt(6),
+        content_snapshot_id="snap-1",
+    )
+    assert current is not None
+    assert current["lifecycle_as_of"]["status"] == "WITHDRAWN"
+
+    with pytest.raises(ValueError, match="timezone-aware UTC"):
+        projector.project(
+            "c1", business_as_of=datetime(2024, 1, 2), knowledge_as_of=dt(3), availability_as_of=dt(3),
+            content_snapshot_id="snap-1",
+        )
 
 
 def test_formal_signal_id_is_new_and_scoped_to_all_query_identity_fields():
@@ -207,7 +292,7 @@ def test_formal_projection_is_snapshot_event_only_and_min_support_is_historical(
         source_available_from=dt(1), previous_event_hash=e1.event_hash,
     )
     projector = HistoricalClaimProjector(
-        [e1, e2], membership=lambda snapshot, claim: snapshot == "snap",
+        [e1, e2], membership=lambda _snapshot, claim: claim == "c1",
         snapshot_claim_ids=lambda snapshot: ["c1"],
     )
     state = projector.project(
@@ -218,24 +303,33 @@ def test_formal_projection_is_snapshot_event_only_and_min_support_is_historical(
     mutable_knowledge_row = {"support_count": 3, "lifecycle_status": "ACTIVE"}
     assert state == immutable
 
+    snapshot = build_content_snapshot(
+        source_type="fixture", source_ref="formal", source_content_hash="source-hash",
+        source_artifact_id="source-1", artifact_ids={"source": "source-1"},
+        code_sha="snapshot-commit", created_at=dt(1),
+    )
     application = ContentApplication.__new__(ContentApplication)
-    application._snapshots = SimpleNamespace(get=lambda snapshot_id: object())
+    application._snapshots = SimpleNamespace(
+        get=lambda snapshot_id: snapshot if snapshot_id == snapshot.content_snapshot_id else None
+    )
     application._publication_uow = SimpleNamespace(
-        repository=SimpleNamespace(is_ready=lambda snapshot_id: snapshot_id == "snap")
+        repository=SimpleNamespace(is_ready=lambda snapshot_id: snapshot_id == snapshot.content_snapshot_id)
     )
     application._historical_projector = projector
     application._signal_service = SignalService()
     application._knowledge = SimpleNamespace(
         factor_signals_v5=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("mutable knowledge queried"))
     )
-    formal_query = query(content_snapshot_id="snap", min_support=3)
+    formal_query = query(content_snapshot_id=snapshot.content_snapshot_id, min_support=3)
     formal = application.formal_factor_signals(formal_query)
     assert len(formal) == 1
     before = json.dumps(formal, sort_keys=True, separators=(",", ":"))
     mutable_knowledge_row.update(support_count=99, lifecycle_status="WITHDRAWN")
     after = json.dumps(application.formal_factor_signals(formal_query), sort_keys=True, separators=(",", ":"))
     assert after == before
-    assert application.formal_factor_signals(query(content_snapshot_id="snap", min_support=4)) == []
+    assert application.formal_factor_signals(
+        query(content_snapshot_id=snapshot.content_snapshot_id, min_support=4)
+    ) == []
 
     database = Database(f"sqlite:///{tmp_path / 'event-fork.db'}")
     database.create_schema()
@@ -248,3 +342,45 @@ def test_formal_projection_is_snapshot_event_only_and_min_support_is_historical(
     )
     with pytest.raises(Exception):
         events.append(fork)
+
+
+def test_formal_boundary_rejects_missing_stale_or_future_snapshot_identity():
+    snapshot = build_content_snapshot(
+        source_type="fixture", source_ref="formal", source_content_hash="source-hash",
+        source_artifact_id="source-1", artifact_ids={"source": "source-1"},
+        code_sha="snapshot-commit", created_at=dt(1),
+    )
+    application = ContentApplication.__new__(ContentApplication)
+    application._publication_uow = SimpleNamespace(repository=SimpleNamespace(is_ready=lambda _snapshot_id: True))
+    application._historical_projector = None
+    application._signal_service = SignalService()
+    application._knowledge = SimpleNamespace()
+
+    for invalid, message in (
+        (replace(snapshot, source_artifact_id=""), "source_artifact_id"),
+        (replace(snapshot, source_content_hash="other"), "stale or mismatched"),
+        (replace(snapshot, created_at=dt(3)), "not available"),
+    ):
+        application._snapshots = SimpleNamespace(get=lambda _snapshot_id, value=invalid: value)
+        with pytest.raises(ValueError, match=message):
+            application.formal_factor_signals(query(content_snapshot_id=snapshot.content_snapshot_id))
+
+
+def test_formal_boundary_rejects_claim_identity_outside_snapshot_membership():
+    snapshot = build_content_snapshot(
+        source_type="fixture", source_ref="formal", source_content_hash="source-hash",
+        source_artifact_id="source-1", artifact_ids={"source": "source-1"},
+        code_sha="snapshot-commit", created_at=dt(1),
+    )
+    application = ContentApplication.__new__(ContentApplication)
+    application._snapshots = SimpleNamespace(get=lambda _snapshot_id: snapshot)
+    application._publication_uow = SimpleNamespace(repository=SimpleNamespace(is_ready=lambda _snapshot_id: True))
+    application._historical_projector = SimpleNamespace(
+        claims_for_snapshot=lambda _snapshot_id: ("claim-1",),
+        project=lambda *_args, **_kwargs: {"claim_id": "claim-2"},
+    )
+    application._signal_service = SignalService()
+    application._knowledge = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="claim identity"):
+        application.formal_factor_signals(query(content_snapshot_id=snapshot.content_snapshot_id))

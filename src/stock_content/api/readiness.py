@@ -25,7 +25,16 @@ def create_readiness_router(
     readiness_service = service or ReadinessService()
     router = APIRouter(tags=["readiness"])
 
-    @router.get("/readiness")
+    @router.get(
+        "/readiness",
+        summary="Report authoritative and derived readiness separately",
+        description=(
+            "Reports SQL-backed read_only_facts and formal_publish separately "
+            "from derived_search. An unavailable or unknown Qdrant index "
+            "watermark degrades derived_search and never changes SQL fact "
+            "authority."
+        ),
+    )
     def readiness() -> dict[str, object]:
         return readiness_service.evaluate((dependencies or (lambda: ReadinessDependencies()))()).to_dict()
 
@@ -81,10 +90,10 @@ def dependencies_from_application(application: object) -> ReadinessDependencies:
     publication_uow = getattr(application, "_publication_uow", None)
     publication_repository = getattr(publication_uow, "repository", None)
     sql_sessions = getattr(snapshot_store, "_sessions", None) or getattr(publication_repository, "_sessions", None)
-    snapshot, outbox_lag, index_lag = SnapshotReadiness(None), 0.0, 0
+    snapshot, outbox_lag = SnapshotReadiness(None), 0.0
     if postgres_ok and sql_sessions:
         try:
-            snapshot, outbox_lag, index_lag = _sql_projection_state(sql_sessions)
+            snapshot, outbox_lag, _pending_outbox_events = _sql_projection_state(sql_sessions)
         except Exception:  # noqa: BLE001 - missing schema is not readiness
             postgres_ok = False
     inventory = _contract_inventory()
@@ -92,7 +101,12 @@ def dependencies_from_application(application: object) -> ReadinessDependencies:
         postgres_ok=postgres_ok,
         qdrant_ok=qdrant_ok,
         outbox_lag_seconds=outbox_lag,
-        index_lag_events=index_lag,
+        # SQL outbox state proves formal-signal delivery, not Qdrant
+        # freshness.  There is no durable index watermark in this schema, so
+        # report the derived-index SLO as unknown rather than relabeling an
+        # outbox backlog as an index backlog.
+        index_lag_events=None,
+        index_state="UNKNOWN" if qdrant_ok else "DOWN",
         latest_snapshot=snapshot,
         contract_inventory=inventory,
         required_contracts=("content.v1", "content-factor-signal.v5.1"),
@@ -103,8 +117,9 @@ def _sql_projection_state(session_factory) -> tuple[SnapshotReadiness, float, in
     """Read authoritative publication/outbox state from SQL.
 
     Readiness must not inspect SnapshotService's in-memory implementation
-    details. Unpublished outbox rows are also the conservative pending-index
-    count because the index adapter has no durable cursor to report.
+    details. The final count is pending formal-signal outbox work; callers
+    must not use it as a Qdrant rebuild backlog because the index adapter has
+    no durable cursor to report.
     """
     now = datetime.now(UTC)
     with session_factory() as session:

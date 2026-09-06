@@ -27,8 +27,12 @@ multimodal-gpu = ["opencc-python-reimplemented>=0.1.7", "paddleocr>=3.3.1", "pya
 media = [
   "faster-whisper>=1.1",
   "yt-dlp>=2025.1.26",
+  "opencc-python-reimplemented>=0.1.7",
+  "paddleocr>=3.3.1",
 ]
 multimodal = [
+  "faster-whisper>=1.1",
+  "yt-dlp>=2025.1.26",
   "opencc-python-reimplemented>=0.1.7",
   "paddleocr>=3.3.1",
   "pyannote.audio>=3.1",
@@ -39,6 +43,7 @@ stock-content-worker = "stock_content.workers.content_worker:main"
 stock-content-verification-worker = "stock_content.workers.verification_worker:main"
 stock-content-signal-publisher = "stock_content.workers.signal_publisher_worker:main"
 stock-content-rebuild-index = "stock_content.cli.rebuild_index:main"
+stock-content-migrate = "stock_content.cli.migrate:main"
 
 [tool.ruff]
 line-length = 120

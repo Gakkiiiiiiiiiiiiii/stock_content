@@ -1,1 +1,1 @@
--e .[multimodal]
+-e .[core,postgres,search,multimodal]

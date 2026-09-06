@@ -1,0 +1,16 @@
+{
+  "schema_version": "quality-gates.v1",
+  "small_fixture_benchmark": {
+    "pytest_targets": [
+      "tests/test_pipeline_integration.py",
+      "tests/test_pipeline_replay.py"
+    ],
+    "max_elapsed_seconds": 90,
+    "max_rss_mib": 1024
+  },
+  "worker_resource_limits": {
+    "core": {"cpus": "1.0", "memory": "1024M"},
+    "media": {"cpus": "2.0", "memory": "4096M"},
+    "multimodal": {"cpus": "4.0", "memory": "8192M"}
+  }
+}

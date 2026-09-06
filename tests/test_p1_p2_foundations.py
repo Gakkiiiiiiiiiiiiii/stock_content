@@ -112,11 +112,12 @@ def test_readiness_uses_sql_publication_and_outbox_state(tmp_path):
             payload={"signal_id": "signal-ready"},
             created_at=created,
         ))
-    snapshot, outbox_lag, index_lag = _sql_projection_state(database.session_factory)
+    snapshot, outbox_lag, pending_outbox_events = _sql_projection_state(database.session_factory)
     assert snapshot.snapshot_id == "snap-ready"
     assert snapshot.state == "READY"
     assert outbox_lag >= 10
-    assert index_lag == 1
+    # Formal-signal outbox work is not evidence of Qdrant freshness.
+    assert pending_outbox_events == 1
 
 
 def test_compose_uses_internal_service_endpoints_and_heavy_profiles():

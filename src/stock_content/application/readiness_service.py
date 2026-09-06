@@ -22,7 +22,11 @@ class ReadinessDependencies:
     postgres_ok: bool = True
     qdrant_ok: bool = True
     outbox_lag_seconds: float = 0.0
-    index_lag_events: int = 0
+    # A derived-index watermark belongs to the index/rebuild control plane,
+    # not to the formal-signal outbox.  ``None`` is deliberately observable:
+    # it means the service cannot make a freshness claim for Qdrant.
+    index_lag_events: int | None = None
+    index_state: str = "UNKNOWN"
     latest_snapshot: SnapshotReadiness = field(default_factory=lambda: SnapshotReadiness(None))
     contract_inventory: tuple[str, ...] = ()
     required_contracts: tuple[str, ...] = ()
@@ -43,7 +47,9 @@ class ReadinessReport:
     search: ComponentReadiness
     latest_ready_snapshot: SnapshotReadiness
     outbox_lag_seconds: float
-    index_lag_events: int
+    index_lag_events: int | None
+    index_state: str
+    max_index_lag_events: int
     contract_inventory: tuple[str, ...]
 
     @property
@@ -66,7 +72,18 @@ class ReadinessReport:
             },
             "outbox_lag_seconds": self.outbox_lag_seconds,
             "index_lag_events": self.index_lag_events,
+            "index_state": self.index_state,
+            "index_backlog_slo_events": self.max_index_lag_events,
             "contract_inventory": list(self.contract_inventory),
+            # These names make the operational permission distinction explicit
+            # without changing any product or wire contract.  Formal publish
+            # is fail-closed on SQL authority; read-only facts are not made
+            # unavailable by the derived vector index.
+            "capabilities": {
+                "read_only_facts": component(self.fact),
+                "formal_publish": component(self.signal),
+                "derived_search": component(self.search),
+            },
         }
 
 
@@ -103,10 +120,22 @@ class ReadinessService:
             search_reasons.append("postgres_unavailable")
         if not dep.qdrant_ok:
             search_reasons.append("qdrant_unavailable")
-        search_degraded = bool(search_reasons) or dep.index_lag_events > self.max_index_lag_events
-        if dep.index_lag_events > self.max_index_lag_events:
-            search_reasons.append("index_lag_exceeded")
-        search = ComponentReadiness("search", not search_reasons, search_degraded, tuple(search_reasons))
+        index_state = _index_state(dep.index_state, qdrant_ok=dep.qdrant_ok)
+        if index_state == "UNKNOWN":
+            search_reasons.append("index_status_unknown")
+        elif index_state == "STALE":
+            search_reasons.append("index_stale")
+        elif index_state == "REBUILDING":
+            search_reasons.append("index_rebuilding")
+        elif index_state == "DOWN" and dep.qdrant_ok:
+            # Preserve a distinct audit reason for an index control-plane
+            # failure even when the Qdrant transport still answers health.
+            search_reasons.append("index_unavailable")
+        if dep.index_lag_events is None:
+            search_reasons.append("index_backlog_unknown")
+        elif dep.index_lag_events > self.max_index_lag_events:
+            search_reasons.append("index_backlog_exceeded")
+        search = ComponentReadiness("search", not search_reasons, bool(search_reasons), tuple(search_reasons))
         return ReadinessReport(
             fact=fact,
             signal=signal,
@@ -114,8 +143,18 @@ class ReadinessService:
             latest_ready_snapshot=snapshot,
             outbox_lag_seconds=dep.outbox_lag_seconds,
             index_lag_events=dep.index_lag_events,
+            index_state=index_state,
+            max_index_lag_events=self.max_index_lag_events,
             contract_inventory=tuple(dep.contract_inventory),
         )
+
+
+def _index_state(value: str, *, qdrant_ok: bool) -> str:
+    """Normalize external rebuild status and fail closed on unknown values."""
+    if not qdrant_ok:
+        return "DOWN"
+    candidate = str(value).upper()
+    return candidate if candidate in {"HEALTHY", "STALE", "REBUILDING", "DOWN"} else "UNKNOWN"
 
 
 __all__ = ["ComponentReadiness", "ReadinessDependencies", "ReadinessReport", "ReadinessService", "SnapshotReadiness"]

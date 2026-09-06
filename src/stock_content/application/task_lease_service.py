@@ -25,6 +25,16 @@ class TaskRunRepository(Protocol):
         now: datetime | None = None,
     ) -> TaskRun: ...
 
+    def renew(
+        self, task_run_id: str, owner: str, fencing_token: int, *, now: datetime | None = None,
+        ttl: timedelta = timedelta(minutes=5),
+    ) -> TaskRun: ...
+
+    def transition(
+        self, task_run_id: str, state: TaskRunState | str, owner: str, fencing_token: int, *,
+        now: datetime | None = None,
+    ) -> TaskRun: ...
+
 
 class InMemoryTaskRunRepository:
     def __init__(self) -> None:
@@ -61,6 +71,9 @@ class TaskLeaseService:
         self, task_run_id: str, owner: str, fencing_token: int, *, now: datetime | None = None,
         ttl: timedelta = timedelta(minutes=5),
     ) -> TaskRun:
+        renew = getattr(self.repository, "renew", None)
+        if renew:
+            return renew(task_run_id, owner, fencing_token, now=now, ttl=ttl)
         return self._save(task_run_id, lambda t: t.renew_lease(owner, fencing_token, now=now, ttl=ttl))
 
     def checkpoint(
@@ -75,6 +88,9 @@ class TaskLeaseService:
         self, task_run_id: str, state: TaskRunState | str, owner: str, fencing_token: int, *,
         now: datetime | None = None,
     ) -> TaskRun:
+        transition = getattr(self.repository, "transition", None)
+        if transition:
+            return transition(task_run_id, state, owner, fencing_token, now=now)
         return self._save(task_run_id, lambda t: t.transition(state, owner, fencing_token, now=now))
 
     def operator(

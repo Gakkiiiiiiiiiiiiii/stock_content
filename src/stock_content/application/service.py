@@ -22,6 +22,7 @@ from stock_content.application.verification_service import VerificationService, 
 from stock_content.domain.artifacts import serialize_artifact
 from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
 from stock_content.domain.claims import FinancialClaim
+from stock_content.domain.governance_evidence import GovernanceEvidenceError, validate_governance_evidence
 from stock_content.domain.models import ContentTask, TranscriptSegment
 from stock_content.domain.source_policy import allow_source, policy_for_source
 from stock_content.ports.repositories import (
@@ -908,8 +909,10 @@ class ContentApplication:
         must provide a persisted snapshot; an unknown snapshot is a hard
         failure rather than an empty result that could hide a routing error.
         """
-        if self._snapshots.get(query.content_snapshot_id) is None:
+        snapshot = self._snapshots.get(query.content_snapshot_id)
+        if snapshot is None:
             raise ValueError("unknown content_snapshot_id")
+        self._validate_formal_snapshot(snapshot, query)
         publication = getattr(self._publication_uow, "repository", None)
         ready = getattr(publication, "is_ready", None)
         if ready is None or not ready(query.content_snapshot_id):
@@ -928,18 +931,18 @@ class ContentApplication:
                 f"legacy/publication-not-ready: snapshot {query.content_snapshot_id} has no immutable claim membership"
             )
         wanted_symbols = {str(item).split(".", 1)[0] for item in query.symbols}
-        for projection in (
-            self._historical_projector.project(
+        for claim_id in claim_ids:
+            projection = self._historical_projector.project(
                 claim_id,
                 business_as_of=query.business_as_of,
                 knowledge_as_of=query.knowledge_as_of,
                 availability_as_of=query.availability_as_of,
                 content_snapshot_id=query.content_snapshot_id,
             )
-            for claim_id in claim_ids
-        ):
             if projection is None:
                 continue
+            if str(projection.get("claim_id") or "") != claim_id:
+                raise ValueError("formal projection claim identity does not match snapshot membership")
             if projection.get("legacy_history_incomplete"):
                 raise HistoricalLineageIncompleteError(
                     f"claim {projection.get('claim_id')} has incomplete historical lineage"
@@ -961,6 +964,89 @@ class ContentApplication:
                 {**projection, "lifecycle_as_of": dict(lifecycle_as_of)}, query
             ))
         return result
+
+
+    def _validate_formal_snapshot(self, snapshot: Any, query: FormalContentSignalQueryV2) -> None:
+        """Reject incomplete, tampered, or not-yet-available snapshot lineage.
+
+        Formal output is a historical assertion, so a snapshot must be both a
+        complete source identity and available by the request's availability
+        clock.  This intentionally duplicates no public contract fields.
+        """
+        from stock_content.domain.bitemporal_query import require_utc
+        from stock_content.domain.lineage import (
+            compute_artifact_root_hash,
+            compute_content_snapshot_id,
+            snapshot_identity_payload,
+        )
+
+        if str(getattr(snapshot, "content_snapshot_id", "") or "") != query.content_snapshot_id:
+            raise ValueError("formal snapshot identity does not match requested content_snapshot_id")
+        for field in ("source_type", "source_ref", "source_content_hash", "source_artifact_id"):
+            if not str(getattr(snapshot, field, "") or "").strip():
+                raise ValueError(f"formal snapshot requires {field} identity")
+        created_at = require_utc(getattr(snapshot, "created_at", None), "snapshot.created_at")
+        if created_at > query.availability_as_of:
+            raise ValueError("formal snapshot is not available at availability_as_of")
+        artifact_ids = dict(getattr(snapshot, "artifact_ids", {}) or {})
+        source_artifact_id = str(getattr(snapshot, "source_artifact_id", "") or "")
+        if str(artifact_ids.get("source") or "") != source_artifact_id:
+            raise ValueError("formal snapshot source artifact identity does not match artifact_ids")
+        # Production formal release must be able to re-read the immutable
+        # source artifact and its governance evidence.  Lightweight legacy
+        # unit fixtures intentionally have no artifact repository, but a
+        # configured repository can never fall back to an unverified source.
+        artifact_repository = getattr(self, "_artifact_repository", None)
+        if artifact_repository is not None:
+            try:
+                source_artifact = artifact_repository.get(source_artifact_id)
+                if source_artifact is None:
+                    raise GovernanceEvidenceError("source artifact is missing")
+                actual_hash = str(
+                    getattr(source_artifact, "raw_content_hash", "")
+                    or getattr(source_artifact, "source_content_hash", "")
+                    or ""
+                )
+                if actual_hash != str(getattr(snapshot, "source_content_hash", "") or ""):
+                    raise GovernanceEvidenceError("source artifact content hash does not match snapshot")
+                validate_governance_evidence(
+                    dict(getattr(source_artifact, "source_metadata", {}) or {}),
+                    source_type=str(getattr(snapshot, "source_type", "") or ""),
+                )
+            except GovernanceEvidenceError as exc:
+                raise ValueError(f"formal snapshot governance evidence is invalid: {exc}") from exc
+        artifact_root_hash = str(getattr(snapshot, "artifact_root_hash", "") or "")
+        if not artifact_root_hash or artifact_root_hash != compute_artifact_root_hash(artifact_ids):
+            raise ValueError("formal snapshot artifact root identity is invalid")
+        identity = snapshot_identity_payload(
+            source_content_hash=snapshot.source_content_hash,
+            source_artifact_id=source_artifact_id,
+            artifact_root_hash=artifact_root_hash,
+            pipeline_version=snapshot.pipeline_version,
+            parser_version=snapshot.parser_version,
+            asr_model=snapshot.asr_model,
+            asr_model_version=snapshot.asr_model_version,
+            vision_model=snapshot.vision_model,
+            llm_model=snapshot.llm_model,
+            prompt_bundle_version=snapshot.prompt_bundle_version,
+            entity_alias_version=snapshot.entity_alias_version,
+            verification_policy_version=snapshot.verification_policy_version,
+            quant_market_snapshot_ids=snapshot.quant_market_snapshot_ids,
+            code_sha=snapshot.code_sha,
+            config_hash=snapshot.config_hash,
+            producer_manifest=snapshot.producer_manifest,
+            model_versions=snapshot.model_versions,
+            prompt_versions=snapshot.prompt_versions,
+            configuration=snapshot.configuration,
+            external_snapshots=snapshot.external_snapshots,
+            policy_versions=snapshot.policy_versions,
+            snapshot_kind=snapshot.snapshot_kind,
+            parent_snapshot_id=snapshot.parent_snapshot_id,
+            supersedes_snapshot_id=snapshot.supersedes_snapshot_id,
+        )
+        expected_id = f"cs-{compute_content_snapshot_id(identity)[:32]}"
+        if expected_id != query.content_snapshot_id:
+            raise ValueError("formal snapshot identity is stale or mismatched")
 
     def factor_signals(
         self,

@@ -19,11 +19,11 @@ Raw Financial Content -> Source Snapshot -> Evidence Artifact -> FinancialClaim
 - Artifact Checkpoint v2：断点恢复前校验 artifact 哈希与 stage 版本；
 - FinancialClaim 区分 Fact / Forecast / Opinion，核验必须绑定 Quant market_snapshot_id；
 - Quant 不可用时核验进入 VERIFICATION_PENDING 退避重试，不影响 ingest 主链；
-- PostgreSQL = Source of Truth，Qdrant 可用 `scripts/rebuild_vector_index.py --from-postgres` 全量重建。
+- PostgreSQL = Source of Truth；Qdrant 是可从 SQL 重建的搜索派生物。
 
-## Current migration status
+## Implemented, local evidence
 
-The first independent vertical slice is operational:
+The first independent vertical slice is implemented and locally testable:
 
 ```text
 POST ingest -> PostgreSQL task -> leased worker -> source/media/ASR
@@ -36,10 +36,21 @@ Implemented source adapters are Bilibili (yt-dlp) and authorized Xiaoe HLS
 `options.transcript`, keeping the complete post-ASR pipeline deterministic.
 
 OCR, vision, external fact verification, conflict resolution and lifecycle
-jobs are implemented as explicit pipeline capabilities. Formal signal queries
-require business, knowledge and availability clocks plus a content snapshot;
-v3/v4/v5 remain compatibility-only. Readiness distinguishes authoritative
-facts/signals from the rebuildable Qdrant search derivative.
+jobs are implemented as explicit pipeline capabilities. The formal producer
+contract is `content-factor-signal.v5.1`: every formal request binds
+`business_as_of`, `knowledge_as_of`, `availability_as_of`, and a
+`content_snapshot_id`. v3/v4/v5 responses remain compatibility-only and are
+not formal evidence.
+
+Readiness reports three independently evaluated capabilities: SQL-backed
+`read_only_facts`, SQL-backed `formal_publish`, and derived Qdrant
+`derived_search`. A Qdrant failure or an unknown index watermark degrades
+search; it does not relabel SQL fact or formal-signal authority as unavailable.
+Source intake is governed by `source-policy.v1`; immutable source metadata
+contains matching `source-governance-evidence.v1` and `pii-redaction.v1`
+records. Validation fails closed if those versioned records are absent or drift
+from the artifact metadata. See the [source-governance policy](docs/security/source-governance.md)
+and [readiness SLO](docs/slo/fact-authority.md).
 
 Run the strict contract and quality checks with:
 
@@ -49,8 +60,19 @@ python scripts/generate_sbom.py --profile core
 python -m pytest tests/test_p1_p2_foundations.py -q
 ```
 
-Replay and vector rebuild operations are documented in `docs/runbooks/` and
-the v3→v5.1 migration is described in `docs/migrations/`.
+Replay and vector rebuild operations are documented in the
+[runbooks](docs/runbooks/README.md), and the
+[v3-to-v5.1 migration guide](docs/migrations/signal-v3-to-v5_1.md) describes
+the compatibility boundary.
+
+## Evidence boundary
+
+This repository has deterministic contract, replay, readiness, and governance
+coverage. The following external exercises are **BLOCKED**, so this README
+does not claim their completion: a cross-repository v5.1 consumer exercise, a
+live PostgreSQL-to-Qdrant rebuild drill, and a durable Qdrant index-watermark
+control plane. Their prerequisites are recorded in
+[pending work](docs/pending-work-2026-09-04.md).
 
 ## Run
 

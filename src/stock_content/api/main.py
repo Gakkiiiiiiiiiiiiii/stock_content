@@ -92,7 +92,19 @@ def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
 
 
 def create_app(service: ContentApplication | None = None) -> FastAPI:
-    app = FastAPI(title="stock_content", version="1.0.0")
+    app = FastAPI(
+        title="stock_content",
+        version="1.0.0",
+        description=(
+            "Financial-content fact API. Formal signals use "
+            "content-factor-signal.v5.1 and bind business_as_of, "
+            "knowledge_as_of, availability_as_of, and content_snapshot_id. "
+            "Readiness separates SQL-backed facts/formal signals from the "
+            "derived Qdrant search index; an unknown index watermark is "
+            "degraded search, not a freshness claim. Governed ingestion "
+            "records source-policy.v1 and source-governance-evidence.v1."
+        ),
+    )
     application = service or build_application()
     app.include_router(create_readiness_router(dependencies=lambda: dependencies_from_application(application)))
     task_sessions = getattr(getattr(application, "_tasks", None), "_sessions", None)
@@ -437,7 +449,17 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"contract_version": "content.v1", "items": items}
 
-    @app.post("/internal/v2/factor-signals/query", tags=["formal"])
+    @app.post(
+        "/internal/v2/factor-signals/query",
+        tags=["formal"],
+        summary="Query formal v5.1 content-factor signals",
+        description=(
+            "Produces only content-factor-signal.v5.1 formal evidence. "
+            "Requests bind business_as_of, knowledge_as_of, "
+            "availability_as_of, and content_snapshot_id; compatibility "
+            "routes do not provide a formal assertion."
+        ),
+    )
     def formal_factor_signals(request: FormalSignalQueryRequest) -> dict:
         try:
             query = request.to_domain()

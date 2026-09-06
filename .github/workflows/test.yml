@@ -1,14 +1,13 @@
-# stock_content CI（详细修改方案 §11）
-#
-# PR      -> lint + unit + architecture + contract + small golden + docker-build
-# Nightly -> full golden + quant integration + qdrant rebuild test
+# Release-blocking CI runs the complete deterministic test closure for this
+# checkout. Do not replace these collection roots with hand-maintained file
+# lists: new governance and safety regressions must be selected automatically.
 name: test
 
 on:
   push:
   pull_request:
   schedule:
-    - cron: "15 19 * * *" # Nightly（UTC）
+    - cron: "15 19 * * *"
   workflow_dispatch:
 
 jobs:
@@ -21,31 +20,6 @@ jobs:
       - run: pip install -e ".[test]"
       - run: ruff check src tests scripts
 
-  unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: "3.11", cache: pip}
-      - run: pip install -e ".[test]"
-      - name: Unit tests（domain/application，不含 API 纵切与 pipeline 集成）
-        run: >
-          pytest tests/test_claim_type_system.py tests/test_verification_lifecycle.py
-          tests/test_knowledge_conflict.py tests/test_knowledge_lifecycle.py
-          tests/test_content_factor_signal_v3.py tests/test_content_snapshot_identity.py
-          tests/test_checkpoint_resume.py tests/test_vector_rebuild.py
-          tests/test_financial_event_extractor.py tests/test_support_status_contract.py
-          -q
-
-  architecture:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: "3.11", cache: pip}
-      - run: pip install -e ".[test]"
-      - run: pytest tests/test_architecture.py -q
-
   contract:
     runs-on: ubuntu-latest
     steps:
@@ -53,45 +27,152 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
       - run: pip install -e ".[test]"
-      - name: Provider/Head contract tests
+      - name: Provider and consumer contract regression suite
         run: >
           pytest tests/test_artifact_contracts.py tests/test_content_factor_signal_v3.py
           tests/test_support_status_contract.py tests/test_p1_p2_foundations.py -q
-      - name: Platform manifest
-        run: python scripts/contracts/verify_manifest.py
+          --junitxml=contract-results.xml
+      - name: Verify platform contract manifest
+        shell: bash
+        run: |
+          set -o pipefail
+          python scripts/contracts/verify_manifest.py 2>&1 | tee manifest-verification.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: content-contract-${{ github.sha }}
+          path: |
+            contract-results.xml
+            manifest-verification.log
+          if-no-files-found: warn
 
-  quality-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: {python-version: "3.11", cache: pip}
-      - run: pip install -e ".[test]"
-      - run: python -m pytest tests/test_p1_p2_foundations.py -q
-      - run: python scripts/generate_sbom.py --profile core --output sbom-core.json
-
-  p0-final-closure:
+  deterministic-closure:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
       - run: pip install -e ".[test,postgres,search]"
-      - name: P0 final deterministic closure
+      - name: Complete deterministic non-PostgreSQL closure
         run: >
-          pytest
-          tests/test_final_claim_evidence_ownership.py
-          tests/test_cross_source_snapshot_replay.py
-          tests/test_temporal_reference_production.py
-          tests/test_temporal_reference_exact_replay.py
-          tests/test_initial_verification_requirement.py
-          tests/test_initial_verification_atomicity.py
-          tests/test_initial_verification_reuse.py
-          tests/test_verification_historical_pending.py
-          tests/test_verification_concurrency.py
-          tests/test_p0_formal_contract_and_history.py
-          tests/test_p0_publication_and_cli.py
-          -q
+          pytest tests -q --ignore=tests/postgres
+          --junitxml=deterministic-results.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: content-deterministic-${{ github.sha }}
+          path: deterministic-results.xml
+          if-no-files-found: error
+
+  postgres-closure:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: stock_content
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d stock_content"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CONTENT_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/stock_content
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test,postgres]"
+      - name: PostgreSQL UoW and fencing closure
+        run: pytest tests/postgres -q --junitxml=postgres-results.xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: content-postgres-${{ github.sha }}
+          path: postgres-results.xml
+          if-no-files-found: error
+
+  quality-gate:
+    needs: [deterministic-closure, postgres-closure]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: Verify profile locks, SBOMs, and resource boundaries
+        run: |
+          for profile in core media multimodal; do
+            python scripts/generate_sbom.py --profile "$profile" --output "sbom-$profile.json"
+            python scripts/verify_sbom.py "sbom-$profile.json" --profile "$profile"
+          done
+          python scripts/verify_profile_resources.py
+      - name: Fixed small-fixture benchmark
+        run: python scripts/benchmark_small_fixture.py --output small-fixture-benchmark.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: content-quality-${{ github.sha }}
+          path: |
+            sbom-*.json
+            small-fixture-benchmark.json
+          if-no-files-found: error
+
+  release-gate:
+    # This must remain a complete, same-SHA release closure.  `always()` lets
+    # the explicit result assertions below reject failed, skipped, and
+    # cancelled prerequisite jobs rather than silently skipping this aggregate.
+    if: always()
+    needs:
+      - lint
+      - contract
+      - deterministic-closure
+      - postgres-closure
+      - quality-gate
+      - golden-content
+      - docker-build
+      - profile-smoke
+      - integration
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_SHA: ${{ github.sha }}
+    steps:
+      - name: Require every release prerequisite to succeed
+        run: |
+          test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.contract.result }}" = "success"
+          test "${{ needs.deterministic-closure.result }}" = "success"
+          test "${{ needs.postgres-closure.result }}" = "success"
+          test "${{ needs.quality-gate.result }}" = "success"
+          test "${{ needs.golden-content.result }}" = "success"
+          test "${{ needs.docker-build.result }}" = "success"
+          test "${{ needs.profile-smoke.result }}" = "success"
+          test "${{ needs.integration.result }}" = "success"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: content-*-${{ github.sha }}
+          path: release-evidence
+          merge-multiple: true
+      - name: Bind release evidence to this checkout
+        run: |
+          test -n "$RELEASE_SHA"
+          test -f release-evidence/contract-results.xml
+          test -f release-evidence/manifest-verification.log
+          test -f release-evidence/deterministic-results.xml
+          test -f release-evidence/postgres-results.xml
+          test -f release-evidence/small-fixture-benchmark.json
+          test -f release-evidence/golden-results.xml
+          test -f release-evidence/compose-logs.txt
+          test -f release-evidence/rebuild-report.json
+          test -f release-evidence/integration-results.xml
+          for workload in api core-worker media-worker multimodal-worker; do
+            test -f "release-evidence/image-$workload.json"
+            grep -F "stock-content-$workload:$RELEASE_SHA" "release-evidence/image-$workload.json"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: content-release-${{ github.sha }}
+          path: release-evidence
+          if-no-files-found: error
 
   golden-content:
     runs-on: ubuntu-latest
@@ -100,23 +181,30 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.11", cache: pip}
       - run: pip install -e ".[test]"
-      - name: Small golden（PR）—— 固定 fixture 的确定性 pipeline
+      - name: Small golden (PR) -- fixed deterministic pipeline fixture
         if: github.event_name == 'pull_request' || github.event_name == 'push'
-        run: pytest tests/test_pipeline_integration.py tests/test_pipeline_replay.py -q
-      - name: Full golden（Nightly）—— 全量 pipeline + 快照身份 + 断点恢复
+        run: >
+          pytest tests/test_pipeline_integration.py tests/test_pipeline_replay.py -q
+          --junitxml=golden-results.xml
+      - name: Full golden (nightly) -- pipeline replay and snapshot lineage
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: >
           pytest tests/test_pipeline_integration.py tests/test_pipeline_replay.py
           tests/test_content_snapshot_identity.py tests/test_checkpoint_resume.py
-          tests/test_quant_snapshot_lineage.py -q
+          tests/test_quant_snapshot_lineage.py -q --junitxml=golden-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: content-golden-${{ github.sha }}
+          path: golden-results.xml
+          if-no-files-found: error
 
   integration:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [docker-build, p0-final-closure]
+    needs: [docker-build, profile-smoke, deterministic-closure, postgres-closure]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Start stack（Postgres + Qdrant + API + worker）
+      - name: Start stack (Postgres + Qdrant + API + worker)
         run: docker compose up -d --build
       - name: Wait for API readiness
         run: |
@@ -127,7 +215,9 @@ jobs:
           docker compose logs --no-color
           exit 1
       - name: Quant snapshot lineage E2E
-        run: pip install -e ".[test]" && pytest tests/test_quant_snapshot_lineage.py -q
+        run: >
+          pip install -e ".[test]" && pytest tests/test_quant_snapshot_lineage.py -q
+          --junitxml=integration-results.xml
       - name: Qdrant rebuild test (service image)
         run: docker compose exec -T stock-content stock-content-rebuild-index --from-postgres --collection knowledge_v3 --database-url "postgresql+psycopg://postgres:postgres@postgres:5432/stock_content" > rebuild-report.json
       - name: Verify rebuild report and collection alias
@@ -138,27 +228,81 @@ jobs:
         run: docker compose logs --no-color > compose-logs.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: content-compose-logs, path: compose-logs.txt}
+        with:
+          name: content-integration-logs-${{ github.sha }}
+          path: compose-logs.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: {name: content-rebuild-report, path: rebuild-report.json}
+        with:
+          name: content-integration-rebuild-${{ github.sha }}
+          path: rebuild-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: content-integration-tests-${{ github.sha }}
+          path: integration-results.xml
       - name: Shutdown
         if: always()
         run: docker compose down -v
 
   docker-build:
+    # Every independently shipped workload image must be built and tagged with
+    # this checkout SHA. Compose profile rendering below is configuration
+    # validation only; it is not image-build evidence.
     strategy:
       matrix:
-        dockerfile: [docker/Dockerfile.api, docker/Dockerfile.core-worker]
+        include:
+          - target: api
+            context: .
+            dockerfile: docker/Dockerfile.api
+            tag: stock-content-api:${{ github.sha }}
+          - target: core-worker
+            context: .
+            dockerfile: docker/Dockerfile.core-worker
+            tag: stock-content-core-worker:${{ github.sha }}
+          - target: media-worker
+            context: .
+            dockerfile: docker/Dockerfile.media
+            tag: stock-content-media-worker:${{ github.sha }}
+          - target: multimodal-worker
+            context: .
+            dockerfile: docker/Dockerfile.multimodal
+            tag: stock-content-multimodal-worker:${{ github.sha }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: false
+          load: true
+          tags: ${{ matrix.tag }}
+      - name: Record tagged workload image evidence
+        run: >
+          docker image inspect "${{ matrix.tag }}"
+          > "image-${{ matrix.target }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: content-image-${{ matrix.target }}-${{ github.sha }}
+          path: image-${{ matrix.target }}.json
+          if-no-files-found: error
       - name: Prove core images exclude heavyweight runtime dependencies
         run: |
           ! grep -E 'ffmpeg|torch|cuda|multimodal|media' docker/Dockerfile.api docker/Dockerfile.core-worker
+
+  profile-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        profile: [core, media, multimodal]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install -e ".[test]"
+      - name: Render selected worker profile
+        run: docker compose --profile "${{ matrix.profile }}" config --quiet
+      - name: Verify audited profile resource limits
+        run: python scripts/verify_profile_resources.py
