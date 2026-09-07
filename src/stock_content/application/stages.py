@@ -1147,7 +1147,7 @@ def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], resu
         raise ValueError("vision narration_aligned must be boolean")
     model = _require_model_text(result.get("model"), "vision model")
     model_version = _require_model_text(result.get("model_version"), "vision model_version")
-    return {
+    normalized = {
         **frame,
         **metadata,
         "visual_summary": visual_summary,
@@ -1161,6 +1161,24 @@ def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], resu
         "model_version": model_version,
         "source_type": "VISION",
     }
+    # The only test-only adapter supplies these fields.  Keep its non-secret
+    # provenance inside the normal vision artifact so C4/C5 replay/audit sees
+    # the precise fixture identity without exposing it in Bundle v1.
+    if "fixture_content_hash" in result:
+        normalized.update(
+            {
+                "bbox": _normalise_bbox(result.get("bbox")),
+                "environment": _require_model_text(result.get("environment"), "vision environment"),
+                "fixture_content_hash": _require_model_text(
+                    result.get("fixture_content_hash"), "vision fixture_content_hash"
+                ),
+                "frame_content_hash": _require_model_text(
+                    result.get("frame_content_hash"), "vision frame_content_hash"
+                ),
+                "adapter_version": _require_model_text(result.get("adapter_version"), "vision adapter_version"),
+            }
+        )
+    return normalized
 
 
 class VisionStage:
@@ -1189,8 +1207,22 @@ class VisionStage:
                     }
                 )
         elif context.state.get("frames"):
+            bind_context = getattr(self._analyzer, "bind_context", None)
+            if callable(bind_context):
+                # An adapter which opts into this hook is explicit.  No
+                # dependency wiring calls it, so it cannot provide a runtime
+                # fallback for an unconfigured production vision model.
+                identity = bind_context(context)
+                if not isinstance(identity, dict):
+                    raise ValueError("vision fixture adapter identity must be an object")
+                context.options["vision_fixture_identity"] = {str(key): str(value) for key, value in identity.items()}
             for frame in context.state["frames"]:
-                result = self._analyzer.analyze(str(frame["image_path"]), _transcript_context_for_frame(context, frame))
+                transcript_context = _transcript_context_for_frame(context, frame)
+                analyze_for_frame = getattr(self._analyzer, "analyze_for_frame", None)
+                if callable(analyze_for_frame):
+                    result = analyze_for_frame(frame, transcript_context)
+                else:
+                    result = self._analyzer.analyze(str(frame["image_path"]), transcript_context)
                 vision_items.append(_normalise_vision_item(context, frame, result))
         # OCR contributes one context item per frame. Merge the corresponding
         # visual observation into that same item so bounded multimodal context
@@ -1362,7 +1394,7 @@ def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[
             if item.model_name or item.model_version
         }
     )
-    return {
+    identity = {
         "crosscheck_version": str(crosscheck_version),
         "knowledge_evidence_window_planner_version": str(
             config.get("knowledge_evidence_window_planner_version") or "knowledge-evidence-window.v1"
@@ -1387,6 +1419,16 @@ def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[
         ),
         "vision_adapter_version": str(config.get("vision_adapter_version") or "http-vision-adapter.v1"),
     }
+    fixture = context.options.get("vision_fixture_identity")
+    if isinstance(fixture, dict):
+        identity.update(
+            {
+                "vision_fixture_adapter_version": str(fixture.get("adapter_version") or ""),
+                "vision_fixture_environment": str(fixture.get("environment") or ""),
+                "vision_fixture_content_hash": str(fixture.get("fixture_content_hash") or ""),
+            }
+        )
+    return identity
 
 
 def _eligible_visual_ids(context: PipelineContext) -> set[str]:
