@@ -24,6 +24,44 @@ def _dns(address_by_host: dict[str, str]):
     return getaddrinfo
 
 
+@pytest.mark.parametrize(
+    ("connection_type", "host", "port", "addresses", "tls"),
+    [
+        (security._PinnedHTTPConnection, "m.xiaoe-tech.com", 80, ["93.184.216.34"], False),
+        (security._PinnedHTTPSConnection, "cdn.bilivideo.com", 443, ["93.184.216.35"], True),
+    ],
+)
+def test_pinned_connections_use_validated_endpoint_for_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_type: type[security._PinnedHTTPConnection] | type[security._PinnedHTTPSConnection],
+    host: str,
+    port: int,
+    addresses: list[str],
+    tls: bool,
+) -> None:
+    expected_socket = object()
+    calls: list[tuple[str, int, list[str], float, bool]] = []
+
+    def connect_pinned(
+        connected_host: str,
+        connected_port: int,
+        connected_addresses: list[str],
+        *,
+        timeout: float,
+        tls: bool,
+    ) -> object:
+        calls.append((connected_host, connected_port, connected_addresses, timeout, tls))
+        return expected_socket
+
+    monkeypatch.setattr(security, "_connect_pinned", connect_pinned)
+    connection = connection_type(host, port, addresses=addresses, timeout=7.5)
+
+    connection.connect()
+
+    assert calls == [(host, port, addresses, 7.5, tls)]
+    assert connection.sock is expected_socket
+
+
 def test_initial_malicious_url_is_rejected_before_external_downloader(monkeypatch: pytest.MonkeyPatch) -> None:
     called = False
 

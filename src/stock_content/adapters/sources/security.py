@@ -275,7 +275,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self.sock = _connect_pinned(
-            self._host, self.port, self._validated_addresses, timeout=self.timeout, tls=False
+            self.host, self.port, self._validated_addresses, timeout=self.timeout, tls=False
         )
 
 
@@ -286,7 +286,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self) -> None:
         self.sock = _connect_pinned(
-            self._host, self.port, self._validated_addresses, timeout=self.timeout, tls=True
+            self.host, self.port, self._validated_addresses, timeout=self.timeout, tls=True
         )
 
 
