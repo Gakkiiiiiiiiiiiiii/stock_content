@@ -87,6 +87,7 @@ from stock_content.application.stages import (
     TranscriptPostprocessStage,
     TranscriptQualityStage,
     TranscriptSelectionStage,
+    TranscriptVisualCrosscheckStage,
     VerificationStage,
     VisionStage,
 )
@@ -122,11 +123,12 @@ STAGE_VERSIONS: dict[str, str] = {
     # pre-targeted OCR/vision context as if it covered the complete frame set.
     "ocr": "2.0.0",
     "vision": "2.0.0",
-    "multimodal_context": "2.0.0",
+    "transcript_visual_crosscheck": "1.0.0",
+    "multimodal_context": "3.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
     "knowledge_frame": "1.0.0",
-    "semantic_context": "1.0.0",
+    "semantic_context": "2.0.0",
     "atomic_claim_extraction": "1.0.0",
     "atomic_claim_validation": "1.0.0",
     "evidence_grounding": "1.0.0",
@@ -472,6 +474,7 @@ def build_application(
         *semantic_stages,
         OCRStage(PaddleOcrEngine()),
         VisionStage(HttpVisionAnalyzer()),
+        TranscriptVisualCrosscheckStage(),
         MultimodalContextStage(MultimodalContextBuilder()),
         TemporalWindowStage(TemporalWindowBuilder()),
         *compatibility_stages,

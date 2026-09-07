@@ -91,5 +91,7 @@ def test_pipeline_wires_targeted_frame_stage_after_semantic_segmentation(tmp_pat
     names = [runner.name for runner in application._pipeline._stages]  # noqa: SLF001
 
     assert names.index("semantic_segmentation") < names.index("knowledge_frame") < names.index("ocr")
-    assert names.index("ocr") < names.index("vision") < names.index("multimodal_context")
-    assert names.index("vision") < names.index("temporal_window") < names.index("semantic_context")
+    assert names.index("ocr") < names.index("vision") < names.index("transcript_visual_crosscheck")
+    assert names.index("transcript_visual_crosscheck") < names.index("multimodal_context")
+    assert names.index("transcript_visual_crosscheck") < names.index("temporal_window")
+    assert names.index("temporal_window") < names.index("semantic_context")

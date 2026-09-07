@@ -80,6 +80,9 @@ class PipelineState:
     knowledge_evidence_windows: list[Any] = field(default_factory=list)
     frame_insights: list[dict[str, Any]] = field(default_factory=list)
     ocr_evidence: list[dict[str, Any]] = field(default_factory=list)
+    # Internal audit records only.  These do not change transcript or Bundle.
+    transcript_visual_crosschecks: list[dict[str, Any]] = field(default_factory=list)
+    eligible_frame_insights: list[dict[str, Any]] = field(default_factory=list)
     multimodal_context: dict[str, Any] = field(default_factory=dict)
     temporal_windows: list[dict[str, Any]] = field(default_factory=list)
     semantic_segments: list[Any] = field(default_factory=list)

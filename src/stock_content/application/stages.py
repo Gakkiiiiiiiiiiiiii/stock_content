@@ -84,6 +84,7 @@ from stock_content.domain.transcript_candidate import (
     TranscriptSource,
 )
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
+from stock_content.domain.transcript_visual_crosscheck import TranscriptVisualCrossChecker
 from stock_content.ports.media import AudioExtractor, SourceAdapter, SpeechRecognizer
 from stock_content.ports.repositories import (
     ChapterRepository,
@@ -1236,6 +1237,75 @@ class VisionStage:
         return _stage_result(context, "vision")
 
 
+class TranscriptVisualCrosscheckStage:
+    """Admit visual context only after deterministic transcript cross-check."""
+
+    name = "transcript_visual_crosscheck"
+    required_inputs = ("transcript", "semantic_segments")
+    output_types = ()
+
+    def __init__(self, checker: TranscriptVisualCrossChecker | None = None) -> None:
+        self._checker = checker or TranscriptVisualCrossChecker()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        if transcript is None:
+            raise ValueError("transcript visual crosscheck requires transcript")
+        artifact_by_frame = {item.frame_id: item for item in context.artifacts.frames}
+        ocr_by_frame: dict[str, list[dict[str, Any]]] = {}
+        for item in context.artifacts.ocr:
+            ocr_by_frame.setdefault(item.frame_id, []).append({
+                "frame_id": item.frame_id, "evidence_text": item.text, "text": item.text,
+                "confidence_score": item.confidence_score, "ocr_engine": item.engine,
+                "ocr_engine_version": item.engine_version,
+            })
+        vision_by_frame = {item.frame_id: dict(item.payload) for item in context.artifacts.vision}
+        segments_by_semantic: dict[str, list[Any]] = {}
+        for semantic in context.state.get("semantic_segments") or ():
+            segments_by_semantic[str(semantic.semantic_segment_id)] = [
+                item for item in transcript.segments
+                if semantic.start_segment_index <= item.segment_index <= semantic.end_segment_index
+            ]
+        checks: list[dict[str, Any]] = []
+        eligible_ids: set[str] = set()
+        for raw_frame in context.state.get("frames") or ():
+            if not isinstance(raw_frame, dict):
+                continue
+            frame_id = str(raw_frame.get("frame_id") or "")
+            artifact = artifact_by_frame.get(frame_id)
+            frame = {
+                **raw_frame,
+                "frame_artifact_id": artifact.artifact_id if artifact else "",
+                "semantic_segment_ids": list(
+                    artifact.semantic_segment_ids if artifact else raw_frame.get("semantic_segment_ids") or ()
+                ),
+                "evidence_window_ids": list(
+                    artifact.evidence_window_ids if artifact else raw_frame.get("evidence_window_ids") or ()
+                ),
+            }
+            owned, seen = [], set()
+            for semantic_id in frame["semantic_segment_ids"]:
+                for segment in segments_by_semantic.get(str(semantic_id), ()):
+                    if segment.segment_id not in seen:
+                        seen.add(segment.segment_id)
+                        owned.append(segment)
+            check = self._checker.check(
+                frame=frame, ocr_items=ocr_by_frame.get(frame_id, ()),
+                vision_item=vision_by_frame.get(frame_id), transcript_segments=owned,
+            )
+            checks.append(check)
+            if check["relation"] in {"SUPPORTS", "CONTRADICTS"}:
+                eligible_ids.add(frame_id)
+        context.state["transcript_visual_crosschecks"] = sorted(
+            checks, key=lambda item: (item["timestamp_ms"], item["frame_id"])
+        )
+        context.state["eligible_frame_insights"] = [
+            item for item in context.state.get("frame_insights") or []
+            if str(item.get("frame_id") or "") in eligible_ids
+        ]
+        return _stage_result(context)
+
+
 class MultimodalContextStage:
     name = "multimodal_context"
     required_inputs = ("transcript",)
@@ -1251,7 +1321,9 @@ class MultimodalContextStage:
                 for item in context.state["segments"]
             ]
         }
-        context.state["multimodal_context"] = self._builder.build(transcript, context.state.get("frame_insights") or [])
+        context.state["multimodal_context"] = self._builder.build(
+            transcript, context.state.get("eligible_frame_insights") or []
+        )
         return _stage_result(context)
 
 
@@ -1276,7 +1348,9 @@ class TemporalWindowStage:
                 for item in context.state["segments"]
             ]
         }
-        context.state["temporal_windows"] = self._builder.build(transcript, context.state.get("frame_insights") or [])
+        context.state["temporal_windows"] = self._builder.build(
+            transcript, context.state.get("eligible_frame_insights") or []
+        )
         return _stage_result(context)
 
 
@@ -1461,13 +1535,20 @@ class SemanticContextStage:
         semantic_artifact = context.artifacts.semantic_segments
         if transcript is None or semantic_artifact is None:
             raise ValueError("semantic context requires transcript and semantic segments")
+        eligible_ids = {
+            str(item.get("frame_id") or "")
+            for item in context.state.get("eligible_frame_insights") or ()
+        }
+        frames = [item for item in context.artifacts.frames if item.frame_id in eligible_ids]
+        ocr = [item for item in context.artifacts.ocr if item.frame_id in eligible_ids]
+        vision = [item for item in context.artifacts.vision if item.frame_id in eligible_ids]
         contexts = [
             self._builder.build(
                 segment,
                 transcript,
-                context.artifacts.frames,
-                context.artifacts.ocr,
-                context.artifacts.vision,
+                frames,
+                ocr,
+                vision,
                 context.state.get("temporal_windows") or (),
             )
             for segment in context.state.get("semantic_segments") or ()
