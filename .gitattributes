@@ -1,4 +1,7 @@
 # Manifest schemas are checksummed as LF bytes and must check out consistently.
+contracts/content-knowledge-bundle.v1.json text eol=lf
+contracts/content-ingestion.v1.json text eol=lf
+contracts/knowledge-quality-report.v1.json text eol=lf
 contracts/content.v1.yaml text eol=lf
 contracts/content-factor-signal.v2.yaml text eol=lf
 contracts/content-factor-signal.v4.yaml text eol=lf
