@@ -9,6 +9,13 @@ from typing import Any
 
 import yaml
 
+_FORMAL_CONTRACT_IDS = frozenset(
+    {
+        "content-knowledge-bundle.v1",
+        "content-factor-signal.v5.1",
+    }
+)
+
 
 class ManifestError(ValueError):
     pass
@@ -173,11 +180,14 @@ def verify_manifest(path: str | Path = "contracts/platform-manifest.yaml", *, to
                     errors.append(f"{prefix} active contract sunset must be in the future")
             except ValueError:
                 errors.append(f"{prefix} sunset must be ISO date or null")
-        if identifier.endswith("v5.1"):
+        if identifier in _FORMAL_CONTRACT_IDS:
             if item.get("compatibility") != "formal" or item.get("formal_expected") is not True:
-                errors.append("content-factor-signal.v5.1 must be formal and formal_expected=true")
-        elif item.get("compatibility") == "formal":
-            errors.append(f"{prefix} only content-factor-signal.v5.1 may be formal")
+                errors.append(f"{identifier} must be formal and formal_expected=true")
+        elif item.get("compatibility") == "formal" or item.get("formal_expected") is True:
+            errors.append(
+                f"{prefix} only content-knowledge-bundle.v1 and "
+                "content-factor-signal.v5.1 may be formal and formal_expected=true"
+            )
     return errors
 
 

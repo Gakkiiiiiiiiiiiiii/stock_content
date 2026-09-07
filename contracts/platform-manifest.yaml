@@ -12,7 +12,7 @@ contracts:
     owner: content-platform
   - id: content-ingestion.v1
     schema: contracts/content-ingestion.v1.json
-    checksum: sha256:F1BE4AD5855EB96647B09F8E1DAB19616EDF0C91B480762A792B319F762DA2A1
+    checksum: sha256:4F2D0AFF88E3231D6722A5C3C78B0E145BF3AB709A696C089764D76140FDD805
     producer: stock_content
     consumers: [stock_agent]
     compatibility: additive

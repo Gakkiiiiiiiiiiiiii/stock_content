@@ -26,6 +26,9 @@ def _write_manifest(
     *,
     schema_reference: str = "contracts/schema.json",
     fixture_reference: str | None = None,
+    contract_id: str = "test.contract.v1",
+    compatibility: str = "compatibility",
+    formal_expected: bool | None = None,
 ) -> Path:
     contracts = tmp_path / "contracts"
     contracts.mkdir(exist_ok=True)
@@ -35,16 +38,18 @@ def _write_manifest(
     fixture.parent.mkdir(exist_ok=True)
     fixture.write_bytes(b'{"fixture":true}\n')
     contract = {
-        "id": "test.contract.v1",
+        "id": contract_id,
         "schema": schema_reference,
         "checksum": "sha256:" + hashlib.sha256(schema.read_bytes()).hexdigest(),
         "producer": "stock_content",
         "consumers": ["stock_factor"],
-        "compatibility": "compatibility",
+        "compatibility": compatibility,
         "deprecated": False,
         "sunset": None,
         "owner": "content-platform",
     }
+    if formal_expected is not None:
+        contract["formal_expected"] = formal_expected
     if fixture_reference is not None:
         contract["fixture"] = fixture_reference
     manifest = contracts / "platform-manifest.yaml"
@@ -85,6 +90,57 @@ def test_manifest_verifier_keeps_raw_byte_checksum_validation(tmp_path):
     errors = verifier.verify_manifest(manifest, today=date(2026, 1, 1))
 
     assert any("checksum mismatch" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "contract_id",
+    ["content-knowledge-bundle.v1", "content-factor-signal.v5.1"],
+)
+def test_manifest_verifier_accepts_only_declared_formal_contracts(tmp_path, contract_id):
+    verifier = _contract_verifier()
+    manifest = _write_manifest(
+        tmp_path,
+        contract_id=contract_id,
+        compatibility="formal",
+        formal_expected=True,
+    )
+
+    assert verifier.verify_manifest(manifest, today=date(2026, 1, 1)) == []
+
+
+@pytest.mark.parametrize(
+    ("compatibility", "formal_expected"),
+    [("compatibility", True), ("formal", False), ("formal", None)],
+)
+def test_manifest_verifier_requires_formal_contract_combination(tmp_path, compatibility, formal_expected):
+    verifier = _contract_verifier()
+    manifest = _write_manifest(
+        tmp_path,
+        contract_id="content-knowledge-bundle.v1",
+        compatibility=compatibility,
+        formal_expected=formal_expected,
+    )
+
+    errors = verifier.verify_manifest(manifest, today=date(2026, 1, 1))
+
+    assert errors == ["content-knowledge-bundle.v1 must be formal and formal_expected=true"]
+
+
+@pytest.mark.parametrize(
+    ("compatibility", "formal_expected"),
+    [("formal", True), ("compatibility", True)],
+)
+def test_manifest_verifier_rejects_unlisted_formal_contract_combinations(tmp_path, compatibility, formal_expected):
+    verifier = _contract_verifier()
+    manifest = _write_manifest(
+        tmp_path,
+        compatibility=compatibility,
+        formal_expected=formal_expected,
+    )
+
+    errors = verifier.verify_manifest(manifest, today=date(2026, 1, 1))
+
+    assert any("only content-knowledge-bundle.v1 and content-factor-signal.v5.1" in error for error in errors)
 
 
 @pytest.mark.parametrize(
