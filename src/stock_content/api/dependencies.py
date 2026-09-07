@@ -95,6 +95,11 @@ from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
+from stock_content.domain.knowledge_evidence_window import (
+    KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION,
+    KnowledgeEvidenceWindowPlanner,
+)
+from stock_content.domain.knowledge_frame_plan import KNOWLEDGE_FRAME_PLANNER_VERSION, KnowledgeFramePlanner
 from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.retention import RetentionPolicy
@@ -103,6 +108,7 @@ from stock_content.domain.signal_contract import validate_signal_v4
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
+from stock_content.domain.transcript_visual_crosscheck import TranscriptVisualCrossChecker
 
 LOGGER = logging.getLogger(__name__)
 
@@ -121,14 +127,14 @@ STAGE_VERSIONS: dict[str, str] = {
     # C3 moves visual consumers after transcript-planned knowledge frames.
     # Bumping their checkpoint identities prevents resume from accepting
     # pre-targeted OCR/vision context as if it covered the complete frame set.
-    "ocr": "2.0.0",
-    "vision": "2.0.0",
-    "transcript_visual_crosscheck": "1.0.0",
-    "multimodal_context": "3.0.0",
+    "ocr": "3.0.0",
+    "vision": "3.0.0",
+    "transcript_visual_crosscheck": "2.0.0",
+    "multimodal_context": "4.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
-    "knowledge_frame": "1.0.0",
-    "semantic_context": "2.0.0",
+    "knowledge_frame": "2.0.0",
+    "semantic_context": "3.0.0",
     "atomic_claim_extraction": "1.0.0",
     "atomic_claim_validation": "1.0.0",
     "evidence_grounding": "1.0.0",
@@ -180,6 +186,24 @@ def pipeline_config_from_env() -> dict[str, object]:
         "semantic_safe_tokens": int(os.getenv("CONTENT_SEMANTIC_GLOBAL_MAX_SAFE_TOKENS", "3200")),
         "semantic_padding_ms": int(os.getenv("CONTENT_SEMANTIC_PADDING_MS", "4000")),
         "atomic_claim_extraction_enabled": _env_bool("CONTENT_ATOMIC_CLAIM_EXTRACTION_ENABLED", True),
+        # Visual identity is non-secret and enters both checkpoints and the
+        # immutable snapshot configuration.  It prevents a resumed task from
+        # silently mixing OCR/vision/planner outputs from different versions.
+        "knowledge_evidence_window_planner_version": os.getenv(
+            "CONTENT_KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION", KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION
+        ),
+        "knowledge_frame_planner_version": os.getenv(
+            "CONTENT_KNOWLEDGE_FRAME_PLANNER_VERSION", KNOWLEDGE_FRAME_PLANNER_VERSION
+        ),
+        "transcript_visual_crosscheck_version": os.getenv(
+            "CONTENT_TRANSCRIPT_VISUAL_CROSSCHECK_VERSION", "transcript-visual-crosscheck.v1"
+        ),
+        "ocr_engine": os.getenv("CONTENT_OCR_ENGINE", "paddleocr"),
+        "ocr_engine_version": os.getenv("CONTENT_OCR_ENGINE_VERSION", "3"),
+        "vision_model": os.getenv("CONTENT_VISION_MODEL", ""),
+        "vision_model_version": os.getenv("CONTENT_VISION_MODEL_VERSION", ""),
+        "vision_prompt_version": os.getenv("CONTENT_VISION_PROMPT_VERSION", "vision-context.prompt.v1"),
+        "vision_adapter_version": os.getenv("CONTENT_VISION_ADAPTER_VERSION", "http-vision-adapter.v1"),
     }
     # Keep the disabled/offline configuration byte-for-byte compatible with
     # historical snapshot identities.  Reference settings enter the config
@@ -428,7 +452,13 @@ def build_application(
         [
             ChapterStage(ChapterSegmenter()),
             SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
-            KnowledgeDirectedFrameExtractionStage(FfmpegFrameExtractor()),
+            KnowledgeDirectedFrameExtractionStage(
+                FfmpegFrameExtractor(),
+                window_planner=KnowledgeEvidenceWindowPlanner(
+                    planner_version=str(config["knowledge_evidence_window_planner_version"])
+                ),
+                frame_planner=KnowledgeFramePlanner(planner_version=str(config["knowledge_frame_planner_version"])),
+            ),
         ]
         if semantic_enabled
         else []
@@ -474,7 +504,9 @@ def build_application(
         *semantic_stages,
         OCRStage(PaddleOcrEngine()),
         VisionStage(HttpVisionAnalyzer()),
-        TranscriptVisualCrosscheckStage(),
+        TranscriptVisualCrosscheckStage(
+            TranscriptVisualCrossChecker(version=str(config["transcript_visual_crosscheck_version"]))
+        ),
         MultimodalContextStage(MultimodalContextBuilder()),
         TemporalWindowStage(TemporalWindowBuilder()),
         *compatibility_stages,

@@ -19,11 +19,14 @@ from stock_content.application.replay_service import ReplayService
 from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
 from stock_content.application.source_resolution_service import request_hash_for, source_identity_hash_for
-from stock_content.application.stages import cleanup_work_directory
+from stock_content.application.stage_runner import _checkpoint_identity
+from stock_content.application.stages import BuildVideoStage, ChapterStage, cleanup_work_directory
 from stock_content.application.transcript_quality_service import TranscriptQualityService
 from stock_content.application.verification_service import VerificationService, run_verification_pass
 from stock_content.domain.artifacts import serialize_artifact
 from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
+from stock_content.domain.chapter import ChapterSegmenter
+from stock_content.domain.checkpoint import CheckpointValidationError
 from stock_content.domain.claims import FinancialClaim
 from stock_content.domain.governance_evidence import GovernanceEvidenceError, validate_governance_evidence
 from stock_content.domain.models import ContentTask, TranscriptSegment
@@ -45,6 +48,52 @@ from stock_content.ports.repositories import (
 LOGGER = logging.getLogger(__name__)
 
 _EPHEMERAL_URL_KEYS = frozenset({"signature", "sig", "token", "expires", "x-amz-signature", "x-amz-credential"})
+
+_VISUAL_CHECKPOINT_STAGES = frozenset(
+    {
+        "knowledge_frame",
+        "ocr",
+        "vision",
+        "transcript_visual_crosscheck",
+        "multimodal_context",
+        "temporal_window",
+        "semantic_context",
+    }
+)
+_VISUAL_MODEL_IDENTITY_KEYS = frozenset(
+    {
+        "knowledge_evidence_window_planner",
+        "knowledge_frame_planner",
+        "transcript_visual_crosscheck",
+        "ocr_engine",
+        "ocr_engine_version",
+        "vision",
+        "vision_version",
+    }
+)
+_VISUAL_PROMPT_IDENTITY_KEYS = frozenset({"vision", "vision_adapter"})
+
+
+def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineContext) -> None:
+    """Reject a visual checkpoint made by a different planner/model adapter."""
+    expected = _checkpoint_identity(context)
+    expected_models = dict(expected.get("model_identity") or {})
+    expected_prompts = dict(expected.get("prompt_identity") or {})
+    for record in records:
+        if str(getattr(record, "stage", "")) not in _VISUAL_CHECKPOINT_STAGES:
+            continue
+        actual_models = dict(getattr(record, "model_identity", None) or {})
+        actual_prompts = dict(getattr(record, "prompt_identity", None) or {})
+        for key in _VISUAL_MODEL_IDENTITY_KEYS:
+            if actual_models.get(key) != expected_models.get(key):
+                raise CheckpointValidationError(
+                    f"CHECKPOINT_ERROR: visual model identity incompatible for {record.stage}: {key}"
+                )
+        for key in _VISUAL_PROMPT_IDENTITY_KEYS:
+            if actual_prompts.get(key) != expected_prompts.get(key):
+                raise CheckpointValidationError(
+                    f"CHECKPOINT_ERROR: visual prompt identity incompatible for {record.stage}: {key}"
+                )
 
 
 def _assert_checkpoint_has_no_signed_url(value: Any) -> None:
@@ -168,13 +217,19 @@ class ContentApplication:
         )
         self._signal_outbox = signal_outbox
         self._occurrence_repository = occurrence_repository or next(
-            (getattr(stage, "_repository", None) for stage in getattr(pipeline, "_stages", [])
-             if getattr(stage, "name", "") == "claim_occurrence_persistence"),
+            (
+                getattr(stage, "_repository", None)
+                for stage in getattr(pipeline, "_stages", [])
+                if getattr(stage, "name", "") == "claim_occurrence_persistence"
+            ),
             None,
         )
         self._lifecycle_repository = lifecycle_repository or next(
-            (getattr(stage, "_repository", None) for stage in getattr(pipeline, "_stages", [])
-             if getattr(stage, "name", "") == "lifecycle_projection"),
+            (
+                getattr(stage, "_repository", None)
+                for stage in getattr(pipeline, "_stages", [])
+                if getattr(stage, "name", "") == "lifecycle_projection"
+            ),
             None,
         )
         self._verification_jobs = verification_job_repository
@@ -236,18 +291,29 @@ class ContentApplication:
         # Internal compatibility API. HTTP ingress uses the stricter
         # ``SourceResolutionService`` adapters; pipeline/replay callers may
         # carry deterministic fixture controls not exposed on the public API.
-        return self.enqueue_ingestion(ContentIngestionCommand(
-            source_type=source_type,
-            canonical_source_ref=source_ref,
-            part=options.get("part"),
-            transcript_policy=str(options.get("transcript_policy") or "subtitle_first"),
-            options={key: value for key, value in options.items() if key not in {
-                "idempotency_key", "part", "transcript_policy", "trace_id", "decision_id",
-            }},
-            idempotency_key=str(options.get("idempotency_key") or "") or None,
-            trace_id=str(options.get("trace_id") or "") or None,
-            decision_id=str(options.get("decision_id") or "") or None,
-        ))
+        return self.enqueue_ingestion(
+            ContentIngestionCommand(
+                source_type=source_type,
+                canonical_source_ref=source_ref,
+                part=options.get("part"),
+                transcript_policy=str(options.get("transcript_policy") or "subtitle_first"),
+                options={
+                    key: value
+                    for key, value in options.items()
+                    if key
+                    not in {
+                        "idempotency_key",
+                        "part",
+                        "transcript_policy",
+                        "trace_id",
+                        "decision_id",
+                    }
+                },
+                idempotency_key=str(options.get("idempotency_key") or "") or None,
+                trace_id=str(options.get("trace_id") or "") or None,
+                decision_id=str(options.get("decision_id") or "") or None,
+            )
+        )
 
     def enqueue_ingestion(self, command: ContentIngestionCommand) -> dict:
         """Persist only the canonical, non-secret command projection."""
@@ -375,8 +441,11 @@ class ContentApplication:
             snapshot_id = result.state.content_snapshot_id
             if not snapshot_id:
                 self._tasks.fail(
-                    task.task_id, "content_snapshot", "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot",
-                    worker_id, fencing_token,
+                    task.task_id,
+                    "content_snapshot",
+                    "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot",
+                    worker_id,
+                    fencing_token,
                 )
                 return {
                     "task_id": task.task_id,
@@ -403,7 +472,11 @@ class ContentApplication:
             safe_error = redact_text(f"{type(exc).__name__}: {exc}")
             try:
                 self._tasks.fail(
-                    task.task_id, context.current_stage, safe_error, worker_id, fencing_token,
+                    task.task_id,
+                    context.current_stage,
+                    safe_error,
+                    worker_id,
+                    fencing_token,
                 )
             except StaleTaskLease:
                 return {"task_id": task.task_id, "status": "LEASE_LOST"}
@@ -433,6 +506,7 @@ class ContentApplication:
         records, persisted = repository.load_checkpoints(task.task_id, stage_versions)
         if not records:
             return False
+        _validate_visual_checkpoint_identity(records, context)
         context.restored_artifacts = dict(persisted)
         restorable = {
             "resolve",
@@ -445,8 +519,13 @@ class ContentApplication:
             "transcript_quality",
             "diarization",
             "transcript_postprocess",
+            "transcript",
+            "chapter",
+            "semantic_segmentation",
+            "knowledge_frame",
             "ocr",
             "vision",
+            "transcript_visual_crosscheck",
         }
         prefix: list[Any] = []
         for record in records:
@@ -464,15 +543,23 @@ class ContentApplication:
             for artifact_id in record.output_artifact_ids:
                 artifact = persisted.get(artifact_id)
                 if artifact is None:
-                    raise RuntimeError(
-                        f"ARTIFACT_INTEGRITY_ERROR: checkpoint artifact missing {artifact_id}"
-                    )
+                    raise RuntimeError(f"ARTIFACT_INTEGRITY_ERROR: checkpoint artifact missing {artifact_id}")
                 slot = artifact.artifact_type
                 if slot in {"frame", "ocr", "vision"}:
                     context.artifacts.add({"frame": "frames", "ocr": "ocr", "vision": "vision"}[slot], artifact)
                 elif slot in {
-                    "source", "media", "transcript", "semantic_segments", "evidence", "claims",
-                    "occurrences", "lifecycle", "verification", "knowledge", "summary"
+                    "source",
+                    "media",
+                    "transcript",
+                    "semantic_segments",
+                    "evidence",
+                    "claims",
+                    "occurrences",
+                    "lifecycle",
+                    "verification",
+                    "knowledge",
+                    "summary",
+                    "transcript_visual_crosscheck",
                 }:
                     context.artifacts.set(slot, artifact)
         self._restore_typed_prefix(context, persisted)
@@ -485,10 +572,7 @@ class ContentApplication:
         source = context.artifacts.source
         fixture = self._fixture_options(task.options)
         media_stages = {"download", "frame", "audio", "asr", "diarization", "transcript_postprocess", "ocr", "vision"}
-        has_media_checkpoint = any(
-            record.status == "SUCCEEDED" and record.stage in media_stages
-            for record in records
-        )
+        has_media_checkpoint = any(record.status == "SUCCEEDED" and record.stage in media_stages for record in records)
         if not fixture and has_media_checkpoint:
             if source is None or not source.raw_storage_uri:
                 raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: durable raw media unavailable for resume")
@@ -514,9 +598,7 @@ class ContentApplication:
             # worker must recreate that workspace before any extractor runs;
             # only the raw bytes and immutable artifacts are durable.
             if context.runtime.work_dir is None:
-                context.runtime.work_dir = Path(
-                    tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-")
-                )
+                context.runtime.work_dir = Path(tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-"))
             context.runtime.video_path = Path(raw_uri)
             # ``audio`` checkpoints historically contain no filesystem path;
             # when ASR is the first failed stage, restore the ephemeral audio
@@ -564,6 +646,11 @@ class ContentApplication:
             ]
             context.state.transcript = " ".join(item.text for item in context.state.segments)
             context.state.transcript_quality_report = _restored_transcript_quality(context, transcript)
+            # These stages produce state-only compatibility projections.  The
+            # checkpointed crosscheck depends on their deterministic values,
+            # so rebuild them without creating a second durable effect.
+            BuildVideoStage().execute(context)
+            ChapterStage(ChapterSegmenter()).execute(context)
         context.state.frames = [
             {
                 "frame_id": item.frame_id,
@@ -593,40 +680,51 @@ class ContentApplication:
             }
             for item in context.artifacts.ocr
         ]
-        context.state.frame_insights = [dict(item.payload) for item in context.artifacts.vision]
+        context.state.frame_insights = [
+            {
+                **dict(item.payload),
+                "frame_id": item.frame_id,
+                "frame_artifact_id": item.frame_artifact_id,
+                "timestamp_ms": item.timestamp_ms,
+                "image_hash": item.image_hash,
+                "semantic_segment_ids": list(item.semantic_segment_ids),
+                "evidence_window_ids": list(item.evidence_window_ids),
+            }
+            for item in context.artifacts.vision
+        ]
+        crosscheck = context.artifacts.transcript_visual_crosscheck
+        if crosscheck is not None:
+            context.state.transcript_visual_crosschecks = [
+                item for item in crosscheck.to_dict().get("relations", []) if isinstance(item, dict)
+            ]
+            eligible = set(crosscheck.eligible_frame_ids)
+            context.state.eligible_frame_insights = [
+                item for item in context.state.frame_insights if str(item.get("frame_id") or "") in eligible
+            ]
         context.state.evidence = list(getattr(context.artifacts.evidence, "evidences", ()) or ())
         if context.artifacts.semantic_segments:
             context.state.semantic_segments = list(context.artifacts.semantic_segments.segments or ())
         if context.artifacts.occurrences:
             occurrence_ids = tuple(context.artifacts.occurrences.occurrence_ids or ())
             if occurrence_ids and self._occurrence_repository is None:
-                raise RuntimeError(
-                    "ARTIFACT_INTEGRITY_ERROR: occurrence repository unavailable for checkpoint rows"
-                )
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: occurrence repository unavailable for checkpoint rows")
             context.state.occurrences = []
             for occurrence_id in occurrence_ids:
                 occurrence = self._occurrence_repository.get(str(occurrence_id))
                 if occurrence is None:
-                    raise RuntimeError(
-                        f"ARTIFACT_INTEGRITY_ERROR: occurrence row missing {occurrence_id}"
-                    )
+                    raise RuntimeError(f"ARTIFACT_INTEGRITY_ERROR: occurrence row missing {occurrence_id}")
                 context.state.occurrences.append(occurrence)
         if context.artifacts.lifecycle:
-            lifecycle_ids = (
-                tuple(context.artifacts.lifecycle.claim_lifecycle_event_ids or ())
-                + tuple(context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ())
+            lifecycle_ids = tuple(context.artifacts.lifecycle.claim_lifecycle_event_ids or ()) + tuple(
+                context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ()
             )
             if lifecycle_ids and self._lifecycle_repository is None:
-                raise RuntimeError(
-                    "ARTIFACT_INTEGRITY_ERROR: lifecycle repository unavailable for checkpoint rows"
-                )
+                raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: lifecycle repository unavailable for checkpoint rows")
             context.state.lifecycle_events = []
             for event_id in lifecycle_ids:
                 event = self._lifecycle_repository.get(str(event_id))
                 if event is None:
-                    raise RuntimeError(
-                        f"ARTIFACT_INTEGRITY_ERROR: lifecycle event row missing {event_id}"
-                    )
+                    raise RuntimeError(f"ARTIFACT_INTEGRITY_ERROR: lifecycle event row missing {event_id}")
                 context.state.lifecycle_events.append(event)
         if context.artifacts.claims and self._claim_repository is not None:
             claim_ids = tuple(context.artifacts.claims.claims or ())
@@ -634,14 +732,10 @@ class ContentApplication:
             for claim_id in claim_ids:
                 claim = self._claim_repository.get(str(claim_id))
                 if claim is None:
-                    raise RuntimeError(
-                        f"ARTIFACT_INTEGRITY_ERROR: claim row missing {claim_id}"
-                    )
+                    raise RuntimeError(f"ARTIFACT_INTEGRITY_ERROR: claim row missing {claim_id}")
                 context.state.claims.append(claim)
         elif context.artifacts.claims and context.artifacts.claims.claims:
-            raise RuntimeError(
-                "ARTIFACT_INTEGRITY_ERROR: claim repository unavailable for checkpoint rows"
-            )
+            raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: claim repository unavailable for checkpoint rows")
 
     def get_content_snapshot(self, content_snapshot_id: str) -> dict | None:
         snapshot = self._snapshots.get(content_snapshot_id)
@@ -669,8 +763,10 @@ class ContentApplication:
             evidence_ids: set[str] = set()
             for occurrence in self._occurrence_repository.list_for_claim(claim_id):
                 for role in (
-                    "evidence_refs", "condition_evidence_refs",
-                    "invalidation_evidence_refs", "temporal_evidence_refs",
+                    "evidence_refs",
+                    "condition_evidence_refs",
+                    "invalidation_evidence_refs",
+                    "temporal_evidence_refs",
                 ):
                     evidence_ids.update(str(item) for item in (getattr(occurrence, role, ()) or ()))
             return sorted(evidence_ids)
@@ -753,9 +849,7 @@ class ContentApplication:
             for parent_id in parent_ids:
                 parent = self._snapshots.get(parent_id)
                 if parent is None:
-                    lineage_errors.append(
-                        f"snapshot lineage parent missing: {identifier} -> {parent_id}"
-                    )
+                    lineage_errors.append(f"snapshot lineage parent missing: {identifier} -> {parent_id}")
                     continue
                 parent_tree = snapshot_tree(parent, current_path)
                 if parent_tree is not None:
@@ -818,18 +912,17 @@ class ContentApplication:
         evidence_artifact = self._artifact_repository.get(str(mapping.get("evidence") or ""))
         if occurrence_artifact is None or evidence_artifact is None:
             return []
-        allowed = {
-            str(item.evidence_id)
-            for item in (getattr(evidence_artifact, "evidences", ()) or ())
-        }
+        allowed = {str(item.evidence_id) for item in (getattr(evidence_artifact, "evidences", ()) or ())}
         refs: set[str] = set()
         for occurrence_id in getattr(occurrence_artifact, "occurrence_ids", ()) or ():
             occurrence = self._occurrence_repository.get(str(occurrence_id))
             if occurrence is None or str(occurrence.claim_id) != str(claim_id):
                 continue
             for role in (
-                "evidence_refs", "condition_evidence_refs",
-                "invalidation_evidence_refs", "temporal_evidence_refs",
+                "evidence_refs",
+                "condition_evidence_refs",
+                "invalidation_evidence_refs",
+                "temporal_evidence_refs",
             ):
                 refs.update(str(item) for item in (getattr(occurrence, role, ()) or ()))
         return sorted(refs & allowed)
@@ -1036,11 +1129,7 @@ class ContentApplication:
                 # relational authority, preserving candidate order and
                 # removing any rows already hydrated from the index.
                 fallback = self._knowledge.search(query, effective_filters, limit)
-                seen = {
-                    str(item.get("knowledge_uid"))
-                    for item in hydrated
-                    if item.get("knowledge_uid") is not None
-                }
+                seen = {str(item.get("knowledge_uid")) for item in hydrated if item.get("knowledge_uid") is not None}
                 for item in fallback:
                     uid = item.get("knowledge_uid")
                     if uid is not None and str(uid) in seen:
@@ -1097,6 +1186,7 @@ class ContentApplication:
                 f"publication-not-ready: content snapshot {query.content_snapshot_id} is not formally published"
             )
         from datetime import UTC, datetime
+
         start = query.start or datetime.min.replace(tzinfo=UTC)
         end = query.end or query.availability_as_of
         result = []
@@ -1137,11 +1227,10 @@ class ContentApplication:
                 raise HistoricalLineageIncompleteError(
                     f"claim {projection.get('claim_id')} has no lifecycle_as_of lineage"
                 )
-            result.append(self._signal_service.build_signal_v5_1(
-                {**projection, "lifecycle_as_of": dict(lifecycle_as_of)}, query
-            ))
+            result.append(
+                self._signal_service.build_signal_v5_1({**projection, "lifecycle_as_of": dict(lifecycle_as_of)}, query)
+            )
         return result
-
 
     def _validate_formal_snapshot(self, snapshot: Any, query: FormalContentSignalQueryV2) -> None:
         """Reject incomplete, tampered, or not-yet-available snapshot lineage.

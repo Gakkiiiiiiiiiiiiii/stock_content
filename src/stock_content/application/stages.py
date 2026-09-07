@@ -32,6 +32,8 @@ from stock_content.domain.artifacts import (
     SummaryArtifact,
     TranscriptArtifact,
     TranscriptSegmentItem,
+    TranscriptVisualCrosscheckArtifact,
+    TranscriptVisualCrosscheckRecord,
     VerificationArtifact,
     VisionArtifact,
     artifact_id_of,
@@ -249,8 +251,7 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
             "source_part": metadata.get("part_id") or metadata.get("source_part") or context.options.get("part"),
             "source_available_from": (
                 context.options.get("replay_source_available_at")
-                or
-                context.options.get("source_available_at")
+                or context.options.get("source_available_at")
                 or metadata.get("source_available_at")
                 or metadata.get("available_at")
             ),
@@ -778,22 +779,24 @@ class TranscriptCandidateStage:
             origin = getattr(track, "source", None)
             if origin not in {"official", "automatic"}:
                 raise ValueError("TRANSCRIPT_CANDIDATES_INVALID")
-            result.append({
-                "candidate_id": getattr(track, "artifact_id"),
-                "source": "OFFICIAL_SUBTITLE" if origin == "official" else "AUTO_SUBTITLE",
-                "source_artifact_id": getattr(track, "artifact_id"),
-                "language": getattr(track, "language"),
-                "segments": [
-                    {
-                        "start_ms": getattr(cue, "start_ms"),
-                        "end_ms": getattr(cue, "end_ms"),
-                        "raw_text": getattr(cue, "raw_text"),
-                        "normalized_text": getattr(cue, "normalized_text"),
-                        "confidence": 1.0 if origin == "official" else 0.8,
-                    }
-                    for cue in getattr(track, "cues", ())
-                ],
-            })
+            result.append(
+                {
+                    "candidate_id": getattr(track, "artifact_id"),
+                    "source": "OFFICIAL_SUBTITLE" if origin == "official" else "AUTO_SUBTITLE",
+                    "source_artifact_id": getattr(track, "artifact_id"),
+                    "language": getattr(track, "language"),
+                    "segments": [
+                        {
+                            "start_ms": getattr(cue, "start_ms"),
+                            "end_ms": getattr(cue, "end_ms"),
+                            "raw_text": getattr(cue, "raw_text"),
+                            "normalized_text": getattr(cue, "normalized_text"),
+                            "confidence": 1.0 if origin == "official" else 0.8,
+                        }
+                        for cue in getattr(track, "cues", ())
+                    ],
+                }
+            )
         return result
 
     def execute(self, context: PipelineContext) -> PipelineContext:
@@ -1187,9 +1190,7 @@ class VisionStage:
                 )
         elif context.state.get("frames"):
             for frame in context.state["frames"]:
-                result = self._analyzer.analyze(
-                    str(frame["image_path"]), _transcript_context_for_frame(context, frame)
-                )
+                result = self._analyzer.analyze(str(frame["image_path"]), _transcript_context_for_frame(context, frame))
                 vision_items.append(_normalise_vision_item(context, frame, result))
         # OCR contributes one context item per frame. Merge the corresponding
         # visual observation into that same item so bounded multimodal context
@@ -1242,28 +1243,34 @@ class TranscriptVisualCrosscheckStage:
 
     name = "transcript_visual_crosscheck"
     required_inputs = ("transcript", "semantic_segments")
-    output_types = ()
+    output_types = ("transcript_visual_crosscheck",)
 
     def __init__(self, checker: TranscriptVisualCrossChecker | None = None) -> None:
         self._checker = checker or TranscriptVisualCrossChecker()
 
-    def execute(self, context: PipelineContext) -> PipelineContext:
+    def execute(self, context: PipelineContext) -> StageResult:
         transcript = context.artifacts.transcript
         if transcript is None:
             raise ValueError("transcript visual crosscheck requires transcript")
         artifact_by_frame = {item.frame_id: item for item in context.artifacts.frames}
         ocr_by_frame: dict[str, list[dict[str, Any]]] = {}
         for item in context.artifacts.ocr:
-            ocr_by_frame.setdefault(item.frame_id, []).append({
-                "frame_id": item.frame_id, "evidence_text": item.text, "text": item.text,
-                "confidence_score": item.confidence_score, "ocr_engine": item.engine,
-                "ocr_engine_version": item.engine_version,
-            })
+            ocr_by_frame.setdefault(item.frame_id, []).append(
+                {
+                    "frame_id": item.frame_id,
+                    "evidence_text": item.text,
+                    "text": item.text,
+                    "confidence_score": item.confidence_score,
+                    "ocr_engine": item.engine,
+                    "ocr_engine_version": item.engine_version,
+                }
+            )
         vision_by_frame = {item.frame_id: dict(item.payload) for item in context.artifacts.vision}
         segments_by_semantic: dict[str, list[Any]] = {}
         for semantic in context.state.get("semantic_segments") or ():
             segments_by_semantic[str(semantic.semantic_segment_id)] = [
-                item for item in transcript.segments
+                item
+                for item in transcript.segments
                 if semantic.start_segment_index <= item.segment_index <= semantic.end_segment_index
             ]
         checks: list[dict[str, Any]] = []
@@ -1290,8 +1297,10 @@ class TranscriptVisualCrosscheckStage:
                         seen.add(segment.segment_id)
                         owned.append(segment)
             check = self._checker.check(
-                frame=frame, ocr_items=ocr_by_frame.get(frame_id, ()),
-                vision_item=vision_by_frame.get(frame_id), transcript_segments=owned,
+                frame=frame,
+                ocr_items=ocr_by_frame.get(frame_id, ()),
+                vision_item=vision_by_frame.get(frame_id),
+                transcript_segments=owned,
             )
             checks.append(check)
             if check["relation"] in {"SUPPORTS", "CONTRADICTS"}:
@@ -1300,10 +1309,95 @@ class TranscriptVisualCrosscheckStage:
             checks, key=lambda item: (item["timestamp_ms"], item["frame_id"])
         )
         context.state["eligible_frame_insights"] = [
-            item for item in context.state.get("frame_insights") or []
+            item
+            for item in context.state.get("frame_insights") or []
             if str(item.get("frame_id") or "") in eligible_ids
         ]
-        return _stage_result(context)
+        semantic = context.artifacts.semantic_segments
+        identity = _visual_identity(context, self._checker.version)
+        relation_records = tuple(TranscriptVisualCrosscheckRecord.from_dict(item) for item in checks)
+        artifact = TranscriptVisualCrosscheckArtifact(
+            artifact_id="transcript-visual-crosscheck-pending",
+            artifact_type="transcript_visual_crosscheck",
+            producer_stage=self.name,
+            producer_version=self._checker.version,
+            transcript_artifact_id=transcript.artifact_id,
+            semantic_segment_artifact_id=semantic.artifact_id if semantic else "",
+            crosscheck_version=self._checker.version,
+            visual_identity=identity,
+            relations=relation_records,
+            eligible_frame_ids=tuple(sorted(eligible_ids)),
+            parent_artifact_ids=tuple(
+                sorted(
+                    {
+                        transcript.artifact_id,
+                        *(item.artifact_id for item in context.artifacts.frames),
+                        *(item.artifact_id for item in context.artifacts.ocr),
+                        *(item.artifact_id for item in context.artifacts.vision),
+                        *((semantic.artifact_id,) if semantic else ()),
+                    }
+                )
+            ),
+        )
+        context.artifacts.set(
+            "transcript_visual_crosscheck",
+            TranscriptVisualCrosscheckArtifact(**{**artifact.__dict__, "artifact_id": artifact_id_of(artifact)}),
+        )
+        return _stage_result(context, "transcript_visual_crosscheck")
+
+
+def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[str, str]:
+    """Return only replay-relevant, non-secret visual component identities."""
+    config = dict(context.options.get("pipeline_config") or {})
+    planner_versions = sorted(
+        {str(item.planner_version) for item in context.artifacts.frames if str(item.planner_version or "")}
+    )
+    ocr_versions = sorted(
+        {f"{item.engine}@{item.engine_version}" for item in context.artifacts.ocr if item.engine or item.engine_version}
+    )
+    vision_versions = sorted(
+        {
+            f"{item.model_name}@{item.model_version}"
+            for item in context.artifacts.vision
+            if item.model_name or item.model_version
+        }
+    )
+    return {
+        "crosscheck_version": str(crosscheck_version),
+        "knowledge_evidence_window_planner_version": str(
+            config.get("knowledge_evidence_window_planner_version") or "knowledge-evidence-window.v1"
+        ),
+        "knowledge_frame_planner_version": ",".join(
+            planner_versions or [str(config.get("knowledge_frame_planner_version") or "knowledge-frame-plan.v1")]
+        ),
+        "ocr_engine_versions": ",".join(
+            ocr_versions or [f"{config.get('ocr_engine') or 'paddleocr'}@{config.get('ocr_engine_version') or '3'}"]
+        ),
+        "vision_model_versions": ",".join(
+            vision_versions
+            or [
+                f"{config.get('vision_model') or context.options.get('vision_model') or 'unconfigured'}@"
+                f"{config.get('vision_model_version') or context.options.get('vision_model_version') or 'unconfigured'}"
+            ]
+        ),
+        "vision_prompt_version": str(
+            config.get("vision_prompt_version")
+            or context.options.get("vision_prompt_version")
+            or "vision-context.prompt.v1"
+        ),
+        "vision_adapter_version": str(config.get("vision_adapter_version") or "http-vision-adapter.v1"),
+    }
+
+
+def _eligible_visual_ids(context: PipelineContext) -> set[str]:
+    artifact = context.artifacts.transcript_visual_crosscheck
+    if artifact is not None:
+        return set(artifact.eligible_frame_ids)
+    return {
+        str(item.get("frame_id") or "")
+        for item in context.state.get("eligible_frame_insights") or ()
+        if isinstance(item, dict) and str(item.get("frame_id") or "")
+    }
 
 
 class MultimodalContextStage:
@@ -1535,10 +1629,7 @@ class SemanticContextStage:
         semantic_artifact = context.artifacts.semantic_segments
         if transcript is None or semantic_artifact is None:
             raise ValueError("semantic context requires transcript and semantic segments")
-        eligible_ids = {
-            str(item.get("frame_id") or "")
-            for item in context.state.get("eligible_frame_insights") or ()
-        }
+        eligible_ids = _eligible_visual_ids(context)
         frames = [item for item in context.artifacts.frames if item.frame_id in eligible_ids]
         ocr = [item for item in context.artifacts.ocr if item.frame_id in eligible_ids]
         vision = [item for item in context.artifacts.vision if item.frame_id in eligible_ids]
@@ -1661,9 +1752,7 @@ class AtomicClaimValidationStage:
         return _stage_result(context)
 
 
-def _extractor_draft_to_atomic_payload(
-    draft: ClaimOccurrenceDraft, transcript: TranscriptArtifact
-) -> dict[str, Any]:
+def _extractor_draft_to_atomic_payload(draft: ClaimOccurrenceDraft, transcript: TranscriptArtifact) -> dict[str, Any]:
     """Build validator input from an untrusted extractor DTO and authority text.
 
     This adapter deliberately has no path for extractor-supplied acceptance
@@ -1678,9 +1767,7 @@ def _extractor_draft_to_atomic_payload(
         for item in transcript.segments
     }
     evidence_indices = list(draft.evidence_segment_indices)
-    authority_quote = " ".join(
-        text_by_index[index] for index in evidence_indices if index in text_by_index
-    )
+    authority_quote = " ".join(text_by_index[index] for index in evidence_indices if index in text_by_index)
     temporal = []
     for expression in draft.temporal_expressions:
         role = str(expression.role).upper()
@@ -1750,8 +1837,11 @@ def _accepted_atomic_to_claim_draft(item) -> ClaimOccurrenceDraft:
         subject_name=draft.subject.subject_name,
         predicate_key=draft.predicate,
         conclusion=draft.normalized_statement,
-        value=(draft.object.value if draft.object and draft.object.value is not None else
-               (draft.object.text if draft.object else draft.normalized_statement)),
+        value=(
+            draft.object.value
+            if draft.object and draft.object.value is not None
+            else (draft.object.text if draft.object else draft.normalized_statement)
+        ),
         unit=draft.object.unit if draft.object else None,
         currency=draft.object.currency if draft.object else None,
         sentiment=draft.sentiment,
@@ -1763,13 +1853,18 @@ def _accepted_atomic_to_claim_draft(item) -> ClaimOccurrenceDraft:
         temporal_expressions=[
             TemporalExpressionDraft(
                 role=(
-                    "REPORTING_PERIOD" if expression.pit_meaning == "REPORTING_PERIOD"
-                    else "FORECAST_TARGET" if expression.pit_meaning == "FORECAST_TARGET"
+                    "REPORTING_PERIOD"
+                    if expression.pit_meaning == "REPORTING_PERIOD"
+                    else "FORECAST_TARGET"
+                    if expression.pit_meaning == "FORECAST_TARGET"
                     else "VALID_AT"
-                ), raw_expression=expression.raw_expression,
+                ),
+                raw_expression=expression.raw_expression,
                 scope_hint=None,
-                evidence_segment_indices=list(expression.evidence_segment_indices), confidence=expression.confidence,
-            ) for expression in draft.temporal_expressions
+                evidence_segment_indices=list(expression.evidence_segment_indices),
+                confidence=expression.confidence,
+            )
+            for expression in draft.temporal_expressions
         ],
         extraction_confidence=draft.extraction_confidence,
         extraction_model_id="atomic-claim-validator",
@@ -2431,6 +2526,10 @@ class KnowledgeExtractionStage:
     @staticmethod
     def _chapter_payload(context: PipelineContext) -> list[dict]:
         payload = []
+        eligible_ids = _eligible_visual_ids(context)
+        eligible_ocr = [
+            item for item in context.state.get("ocr_evidence") or () if str(item.get("frame_id") or "") in eligible_ids
+        ]
         for chapter in context.state["chapters"]:
             segments = [
                 segment
@@ -2452,8 +2551,8 @@ class KnowledgeExtractionStage:
                     }
                     for segment in segments
                 ],
-                "ocr_blocks": list(context.state.get("ocr_evidence") or []),
-                "frame_refs": list(context.state.get("frame_insights") or []),
+                "ocr_blocks": eligible_ocr,
+                "frame_refs": list(context.state.get("eligible_frame_insights") or []),
             }
             payload.append(
                 {
@@ -2621,8 +2720,11 @@ class KnowledgeExtractionStage:
                         source_artifact_id=transcript.artifact_id,
                     )
                 )
+        eligible_ids = _eligible_visual_ids(context)
         ocr_sources: dict[tuple[str, str], list[str]] = {}
         for artifact in context.artifacts.ocr:
+            if artifact.frame_id not in eligible_ids:
+                continue
             frame_id = next(
                 (
                     frame.frame_id
@@ -2633,6 +2735,8 @@ class KnowledgeExtractionStage:
             )
             ocr_sources.setdefault((frame_id, artifact.text), []).append(artifact.artifact_id)
         for item in context.state.ocr_evidence:
+            if str(item.get("frame_id") or "") not in eligible_ids:
+                continue
             raw = str(item.get("evidence_text") or item.get("text") or "")
             if not raw.strip():
                 continue
@@ -2667,6 +2771,8 @@ class KnowledgeExtractionStage:
             )
         vision_sources: dict[tuple[str, str], list[str]] = {}
         for artifact in context.artifacts.vision:
+            if artifact.frame_id not in eligible_ids:
+                continue
             frame_id = next(
                 (
                     frame.frame_id
@@ -2676,7 +2782,7 @@ class KnowledgeExtractionStage:
                 "",
             )
             vision_sources.setdefault((frame_id, artifact.label), []).append(artifact.artifact_id)
-        for item in context.state.frame_insights:
+        for item in context.state.eligible_frame_insights:
             raw = str(item.get("description") or item.get("label") or "")
             if not raw.strip():
                 continue
@@ -2714,8 +2820,8 @@ class KnowledgeExtractionStage:
             filter(
                 None,
                 [transcript.artifact_id if transcript else ""]
-                + [item.artifact_id for item in context.artifacts.ocr]
-                + [item.artifact_id for item in context.artifacts.vision],
+                + [item.artifact_id for item in context.artifacts.ocr if item.frame_id in eligible_ids]
+                + [item.artifact_id for item in context.artifacts.vision if item.frame_id in eligible_ids],
             )
         )
         evidence_parent_ids = tuple(
@@ -2957,7 +3063,14 @@ class KnowledgeExtractionStage:
             metadata.setdefault("publish_time", available_from.isoformat())
             records = self._structured_extractor.extract(metadata, self._chapter_payload(context))
             records = self._normalizer.normalize(records, metadata)
-            records = self._cross_modal.verify_many(records, list(context.state.get("ocr_evidence") or []))
+            records = self._cross_modal.verify_many(
+                records,
+                [
+                    item
+                    for item in context.state.get("ocr_evidence") or ()
+                    if str(item.get("frame_id") or "") in _eligible_visual_ids(context)
+                ],
+            )
             records = self._external.verify_many(records)
             records = self._temporal.apply(records, available_from)
             records = self._deduplicator.deduplicate(records)
@@ -3639,11 +3752,9 @@ class SnapshotRecordingStage:
                     # predecessor when a later snapshot extends the chain.
                     if state_event.event_id in existing_ids.get(state_event.claim_id, set()):
                         continue
-                    if (
-                        state_event.event_type == "VERIFICATION_INITIAL"
-                        and event_logical_identity(state_event)
-                        in existing_initial_keys.get(state_event.claim_id, set())
-                    ):
+                    if state_event.event_type == "VERIFICATION_INITIAL" and event_logical_identity(
+                        state_event
+                    ) in existing_initial_keys.get(state_event.claim_id, set()):
                         continue
                     prior = tails.get(state_event.claim_id)
                     if prior:
@@ -3794,10 +3905,24 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
         "asr_version",
         (transcript.asr_model_version if transcript else None) or context.options.get("asr_model_version") or "unknown",
     )
-    models.setdefault("ocr", context.options.get("ocr_model") or "fixture")
-    models.setdefault("ocr_version", context.options.get("ocr_model_version") or "1")
-    models.setdefault("vision", context.options.get("vision_model") or "unknown")
     pipeline_config = dict(context.options.get("pipeline_config") or {})
+    models.setdefault(
+        "ocr",
+        context.options.get("ocr_model") or (context.artifacts.ocr[0].engine if context.artifacts.ocr else "fixture"),
+    )
+    models.setdefault(
+        "ocr_version",
+        context.options.get("ocr_model_version")
+        or (context.artifacts.ocr[0].engine_version if context.artifacts.ocr else "1"),
+    )
+    models.setdefault(
+        "vision",
+        context.options.get("vision_model") or pipeline_config.get("vision_model") or "unknown",
+    )
+    models.setdefault(
+        "vision_version",
+        context.options.get("vision_model_version") or pipeline_config.get("vision_model_version") or "unknown",
+    )
     models.setdefault(
         "segmentation",
         context.options.get("segmentation_model") or pipeline_config.get("segmentation_model") or "unknown",
@@ -3848,6 +3973,11 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     prompts.setdefault("normalization", context.options.get("normalization_prompt_version", "normalization.v1"))
     prompts.setdefault("verification", context.options.get("verification_prompt_version", "verification.v1"))
     prompts.setdefault("summary", context.options.get("summary_prompt_version", "summary.v1"))
+    prompts.setdefault(
+        "vision",
+        context.options.get("vision_prompt_version")
+        or pipeline_config.get("vision_prompt_version", "vision-context.prompt.v1"),
+    )
     manifest["prompts"] = prompts
     configs = dict(manifest.get("configs") or {})
     # As with code_sha, an explicit option wins.  A nested manifest value is
@@ -3859,6 +3989,21 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     )
     configs["config_hash"] = str(effective_config_hash)
     configs.setdefault("entity_alias_version", context.options.get("entity_alias_version", "entity_alias.v1"))
+    configs.setdefault(
+        "knowledge_frame_planner_version",
+        pipeline_config.get("knowledge_frame_planner_version", "knowledge-frame-plan.v1"),
+    )
+    configs.setdefault(
+        "knowledge_evidence_window_planner_version",
+        pipeline_config.get("knowledge_evidence_window_planner_version", "knowledge-evidence-window.v1"),
+    )
+    configs.setdefault(
+        "transcript_visual_crosscheck_version",
+        pipeline_config.get("transcript_visual_crosscheck_version", "transcript-visual-crosscheck.v1"),
+    )
+    configs.setdefault(
+        "vision_adapter_version", pipeline_config.get("vision_adapter_version", "http-vision-adapter.v1")
+    )
     manifest["configs"] = configs
     return manifest
 
@@ -4065,13 +4210,16 @@ class PersistStage:
                 "SQL_PROJECTION",
                 {"artifacts": sorted(context.artifacts.artifact_ids()), "task_id": context.task_id},
             )
-            return self._fenced_effects.execute_sql(
-                context.task_id,
-                context.worker_id,
-                context.fencing_token,
-                intent,
-                lambda session: self._persist(context, session=session),
-            ) or context
+            return (
+                self._fenced_effects.execute_sql(
+                    context.task_id,
+                    context.worker_id,
+                    context.fencing_token,
+                    intent,
+                    lambda session: self._persist(context, session=session),
+                )
+                or context
+            )
         return self._persist(context)
 
     def _persist(self, context: PipelineContext, *, session=None) -> PipelineContext:
@@ -4112,15 +4260,24 @@ class PersistStage:
             # already persisted on the task/checkpoint rows.
             write(self._verifications, "append", context.state["knowledge"], context.trace.get("trace_id"))
         if self._multimodal:
-            write(self._multimodal, "replace",
+            eligible_ids = _eligible_visual_ids(context)
+            write(
+                self._multimodal,
+                "replace",
                 video.video_id,
-                list(context.state.get("frames") or []),
-                list(context.state.get("ocr_evidence") or []),
-                list(context.state.get("frame_insights") or []),
+                [item for item in context.state.get("frames") or [] if str(item.get("frame_id") or "") in eligible_ids],
+                [
+                    item
+                    for item in context.state.get("ocr_evidence") or []
+                    if str(item.get("frame_id") or "") in eligible_ids
+                ],
+                list(context.state.get("eligible_frame_insights") or []),
                 list(context.state.get("temporal_windows") or []),
             )
         if self._financial:
-            write(self._financial, "replace",
+            write(
+                self._financial,
+                "replace",
                 video.video_id,
                 list(context.state.get("financial_numeric_facts") or []),
                 list(context.state.get("financial_events") or []),
@@ -4167,6 +4324,7 @@ class IndexStage:
         else:
             self._index.index(context.state["knowledge"])
         return _stage_result(context)
+
 
 class BuildVideoStage:
     name = "transcript"

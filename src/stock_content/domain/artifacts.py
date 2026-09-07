@@ -4,6 +4,7 @@ Artifact = immutable；Stage 之间不再通过字符串 key 隐式耦合传递�
 第一阶段与 ``PipelineContext.data`` 双轨共存（data 标记 deprecated），
 全部 Stage 迁移完成后再删除 ``data``。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +18,7 @@ ARTIFACT_SCHEMA_VERSION = "artifact.v1"
 
 def canonical_json(payload: Any) -> str:
     """canonical JSON：key 排序、紧凑分隔符、统一序列化。"""
+
     def _default(value: Any) -> Any:
         if hasattr(value, "model_dump"):
             return value.model_dump(mode="json")
@@ -81,11 +83,7 @@ def artifact_identity_payload(artifact: "ArtifactBase") -> dict[str, Any]:
     row, so the rule is shared by all persistence implementations.
     """
     payload = artifact.to_dict()
-    return {
-        key: value
-        for key, value in payload.items()
-        if key not in {"artifact_id", "created_at", "content_hash"}
-    }
+    return {key: value for key, value in payload.items() if key not in {"artifact_id", "created_at", "content_hash"}}
 
 
 def _utcnow() -> datetime:
@@ -117,6 +115,7 @@ class ArtifactBase:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
 
 @dataclass(frozen=True)
 class SourceArtifact(ArtifactBase):
@@ -316,6 +315,130 @@ class VisionArtifact(ArtifactBase):
 
 
 @dataclass(frozen=True)
+class TranscriptVisualCorrectionCandidate:
+    """An audit-only OCR candidate; it can never rewrite transcript evidence."""
+
+    kind: str = ""
+    original: tuple[str, ...] = ()
+    replacement: tuple[str, ...] = ()
+    frame_id: str = ""
+    transcript_segment_ids: tuple[str, ...] = ()
+    ocr_engine: str = ""
+    ocr_engine_version: str = ""
+    ocr_confidence_score: float | None = None
+    status: str = "TRACE_ONLY_REQUIRES_INDEPENDENT_TRANSCRIPT_GROUNDING"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "TranscriptVisualCorrectionCandidate":
+        return cls(
+            kind=str(value.get("kind") or ""),
+            original=tuple(sorted(str(item) for item in value.get("original") or ())),
+            replacement=tuple(sorted(str(item) for item in value.get("replacement") or ())),
+            frame_id=str(value.get("frame_id") or ""),
+            transcript_segment_ids=tuple(sorted(str(item) for item in value.get("transcript_segment_ids") or ())),
+            ocr_engine=str(value.get("ocr_engine") or ""),
+            ocr_engine_version=str(value.get("ocr_engine_version") or ""),
+            ocr_confidence_score=value.get("ocr_confidence_score"),
+            status=str(value.get("status") or "TRACE_ONLY_REQUIRES_INDEPENDENT_TRANSCRIPT_GROUNDING"),
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptVisualCrosscheckRecord:
+    """Compact, typed relation between one frame and its owning transcript."""
+
+    frame_id: str = ""
+    frame_artifact_id: str = ""
+    timestamp_ms: int = 0
+    semantic_segment_ids: tuple[str, ...] = ()
+    evidence_window_ids: tuple[str, ...] = ()
+    transcript_segment_ids: tuple[str, ...] = ()
+    relation: str = "UNKNOWN"
+    reason_codes: tuple[str, ...] = ()
+    matches: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    mismatches: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
+    confidence_inputs: dict[str, Any] = field(default_factory=dict)
+    correction_candidates: tuple[TranscriptVisualCorrectionCandidate, ...] = ()
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "TranscriptVisualCrosscheckRecord":
+        raw_matches = value.get("matches") if isinstance(value.get("matches"), dict) else {}
+        raw_mismatches = value.get("mismatches") if isinstance(value.get("mismatches"), dict) else {}
+        raw_confidence = value.get("confidence_inputs") if isinstance(value.get("confidence_inputs"), dict) else {}
+        candidates = value.get("correction_candidates") or ()
+        return cls(
+            frame_id=str(value.get("frame_id") or ""),
+            frame_artifact_id=str(value.get("frame_artifact_id") or ""),
+            timestamp_ms=int(value.get("timestamp_ms") or 0),
+            semantic_segment_ids=tuple(sorted(str(item) for item in value.get("semantic_segment_ids") or ())),
+            evidence_window_ids=tuple(sorted(str(item) for item in value.get("evidence_window_ids") or ())),
+            transcript_segment_ids=tuple(sorted(str(item) for item in value.get("transcript_segment_ids") or ())),
+            relation=str(value.get("relation") or "UNKNOWN"),
+            reason_codes=tuple(sorted(str(item) for item in value.get("reason_codes") or ())),
+            matches={
+                str(key): tuple(sorted(str(item) for item in items or ())) for key, items in sorted(raw_matches.items())
+            },
+            mismatches={
+                str(key): {
+                    str(side): tuple(sorted(str(item) for item in items or ())) for side, items in sorted(parts.items())
+                }
+                for key, parts in sorted(raw_mismatches.items())
+                if isinstance(parts, dict)
+            },
+            confidence_inputs={
+                str(key): tuple(value) if isinstance(value, list) else value
+                for key, value in sorted(raw_confidence.items())
+            },
+            correction_candidates=tuple(
+                sorted(
+                    (
+                        item
+                        if isinstance(item, TranscriptVisualCorrectionCandidate)
+                        else TranscriptVisualCorrectionCandidate.from_dict(item)
+                        for item in candidates
+                        if isinstance(item, (dict, TranscriptVisualCorrectionCandidate))
+                    ),
+                    key=lambda item: (item.kind, item.frame_id, item.original, item.replacement),
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class TranscriptVisualCrosscheckArtifact(ArtifactBase):
+    """Internal visual-admission audit, content-addressed without media locators."""
+
+    transcript_artifact_id: str = ""
+    semantic_segment_artifact_id: str = ""
+    crosscheck_version: str = ""
+    visual_identity: dict[str, str] = field(default_factory=dict)
+    relations: tuple[TranscriptVisualCrosscheckRecord, ...] = ()
+    eligible_frame_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        records = tuple(
+            sorted(
+                self.relations,
+                key=lambda item: (item.timestamp_ms, item.frame_id, item.frame_artifact_id),
+            )
+        )
+        if any(item.relation not in {"SUPPORTS", "CONTRADICTS", "UNRELATED", "UNKNOWN"} for item in records):
+            raise ValueError("invalid transcript visual crosscheck relation")
+        if any(not item.frame_id or not item.frame_artifact_id for item in records):
+            raise ValueError("crosscheck relation requires frame identity")
+        eligible = tuple(sorted(set(str(item) for item in self.eligible_frame_ids if str(item))))
+        allowed = {item.frame_id for item in records if item.relation in {"SUPPORTS", "CONTRADICTS"}}
+        if set(eligible) != allowed:
+            raise ValueError("eligible visual frames must exactly equal admitted crosscheck relations")
+        object.__setattr__(self, "relations", records)
+        object.__setattr__(self, "eligible_frame_ids", eligible)
+        object.__setattr__(
+            self, "visual_identity", {str(key): str(value) for key, value in sorted(self.visual_identity.items())}
+        )
+        super().__post_init__()
+
+
+@dataclass(frozen=True)
 class ClaimArtifact(ArtifactBase):
     evidence_artifact_id: str = ""
     claims: list[Any] = field(default_factory=list)  # list[FinancialClaim]（claims.py 定义）
@@ -409,7 +532,7 @@ ARTIFACT_SLOT_NAMES = (
 # Formal single-value slots introduced by the semantic/temporal chain.  The
 # legacy tuple remains stable for callers that enumerate the original slots;
 # this unified registry set is the source of truth for all slot operations.
-SINGLE_ARTIFACT_SLOT_NAMES = ("semantic_segments", "occurrences", "lifecycle")
+SINGLE_ARTIFACT_SLOT_NAMES = ("semantic_segments", "occurrences", "lifecycle", "transcript_visual_crosscheck")
 
 VISUAL_ARTIFACT_SLOT_NAMES = ("frames", "ocr", "vision")
 
@@ -432,6 +555,7 @@ class ArtifactRegistry:
     semantic_segments: SemanticSegmentArtifact | None = None
     occurrences: ClaimOccurrenceArtifact | None = None
     lifecycle: LifecycleArtifact | None = None
+    transcript_visual_crosscheck: TranscriptVisualCrosscheckArtifact | None = None
 
     def set(self, slot: str, artifact: ArtifactBase) -> None:
         if slot in SINGLE_ARTIFACT_SLOT_NAMES:
@@ -446,6 +570,7 @@ class ArtifactRegistry:
                 "semantic_segments": SemanticSegmentArtifact,
                 "occurrences": ClaimOccurrenceArtifact,
                 "lifecycle": LifecycleArtifact,
+                "transcript_visual_crosscheck": TranscriptVisualCrosscheckArtifact,
             }[slot]
             if not isinstance(artifact, expected):
                 raise TypeError(f"{slot} expects {expected.__name__}")
@@ -462,8 +587,10 @@ class ArtifactRegistry:
         if slot not in ARTIFACT_SLOT_NAMES:
             raise KeyError(f"unknown artifact slot: {slot}")
         existing = getattr(self, slot)
-        if existing is not None and existing.artifact_id == artifact.artifact_id and (
-            existing.content_hash != artifact.content_hash
+        if (
+            existing is not None
+            and existing.artifact_id == artifact.artifact_id
+            and (existing.content_hash != artifact.content_hash)
         ):
             raise ValueError(f"artifact id {artifact.artifact_id} already has a different payload")
         setattr(self, slot, artifact)
@@ -502,9 +629,7 @@ class ArtifactRegistry:
 
     def artifact_ids(self) -> dict[str, str]:
         result = {
-            slot: artifact.artifact_id
-            for slot in ARTIFACT_SLOT_NAMES
-            if (artifact := getattr(self, slot)) is not None
+            slot: artifact.artifact_id for slot in ARTIFACT_SLOT_NAMES if (artifact := getattr(self, slot)) is not None
         }
         result.update(
             {
@@ -544,6 +669,13 @@ def deserialize_artifact(payload: dict[str, Any]) -> ArtifactBase:
             from stock_content.domain.semantic_segment import SemanticSegmentItem
 
             value = [SemanticSegmentItem(**item) if isinstance(item, dict) else item for item in value]
+        if key == "relations" and cls is TranscriptVisualCrosscheckArtifact:
+            value = tuple(
+                item
+                if isinstance(item, TranscriptVisualCrosscheckRecord)
+                else TranscriptVisualCrosscheckRecord.from_dict(item)
+                for item in value
+            )
         if key == "evidences" and cls is EvidenceArtifact:
             value = [EvidenceItem(**item) if isinstance(item, dict) else item for item in value]
         if key == "results" and cls is VerificationArtifact:
@@ -600,6 +732,7 @@ _TYPE_REGISTRY: dict[str, type[ArtifactBase]] = {
     "frame": FrameArtifact,
     "ocr": OCRArtifact,
     "vision": VisionArtifact,
+    "transcript_visual_crosscheck": TranscriptVisualCrosscheckArtifact,
     "semantic_segments": SemanticSegmentArtifact,
     "occurrences": ClaimOccurrenceArtifact,
     "lifecycle": LifecycleArtifact,
@@ -698,6 +831,9 @@ __all__ = [
     "FrameArtifact",
     "OCRArtifact",
     "VisionArtifact",
+    "TranscriptVisualCorrectionCandidate",
+    "TranscriptVisualCrosscheckArtifact",
+    "TranscriptVisualCrosscheckRecord",
     "SourceArtifact",
     "SummaryArtifact",
     "LifecycleArtifact",

@@ -3,6 +3,7 @@
 不改变 Stage 执行语义；仅在 Stage 执行前后记录输入/输出 Artifact 与哈希，
 并在失败时写入 FAILED checkpoint，供断点恢复判定。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -65,11 +66,7 @@ class StageRunner:
     def execute(self, context: PipelineContext) -> PipelineContext:
         self._validate_inputs(context)
         registry = context.artifacts
-        before = (
-            {artifact.artifact_id for artifact in registry.artifacts()}
-            if self._legacy_fallback
-            else set()
-        )
+        before = {artifact.artifact_id for artifact in registry.artifacts()} if self._legacy_fallback else set()
         input_artifact_ids = [artifact.artifact_id for artifact in registry.artifacts()]
         input_hashes = [str(artifact.content_hash) for artifact in registry.artifacts()]
         checkpoint_identity = _checkpoint_identity(context)
@@ -85,41 +82,37 @@ class StageRunner:
                 self._validate_outputs(outputs)
             else:
                 if not self._legacy_fallback:
-                    raise TypeError(
-                        f"production stage {self.name} must return StageResult"
-                    )
+                    raise TypeError(f"production stage {self.name} must return StageResult")
                 context = result
                 outputs = []
         except Exception as exc:  # noqa: BLE001 - checkpoint 需要记录失败后继续抛出
             failed_checkpoint = build_checkpoint(
-                    stage=self.name,
-                    stage_version=self._stage_version,
-                    input_artifact_ids=input_artifact_ids,
-                    input_hashes=input_hashes,
-                    **checkpoint_identity,
-                    started_at=started_at,
-                    status="FAILED",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+                stage=self.name,
+                stage_version=self._stage_version,
+                input_artifact_ids=input_artifact_ids,
+                input_hashes=input_hashes,
+                **checkpoint_identity,
+                started_at=started_at,
+                status="FAILED",
+                error=f"{type(exc).__name__}: {exc}",
+            )
             context.checkpoints.append(failed_checkpoint)
             self._persist_checkpoint((), context, failed_checkpoint)
             raise
         if not explicit_result and not outputs:
             # Legacy stage adapter only. Production StageResult must declare
             # produced_artifacts explicitly.
-            outputs = [
-                artifact for artifact in context.artifacts.artifacts() if artifact.artifact_id not in before
-            ]
+            outputs = [artifact for artifact in context.artifacts.artifacts() if artifact.artifact_id not in before]
         checkpoint = build_checkpoint(
-                stage=self.name,
-                stage_version=self._stage_version,
-                input_artifact_ids=input_artifact_ids,
-                input_hashes=input_hashes,
-                **checkpoint_identity,
-                output_artifacts=outputs,
-                started_at=started_at,
-                status="SUCCEEDED",
-            )
+            stage=self.name,
+            stage_version=self._stage_version,
+            input_artifact_ids=input_artifact_ids,
+            input_hashes=input_hashes,
+            **checkpoint_identity,
+            output_artifacts=outputs,
+            started_at=started_at,
+            status="SUCCEEDED",
+        )
         context.checkpoints.append(checkpoint)
         self._persist_checkpoint(outputs, context, checkpoint)
         return context
@@ -127,8 +120,10 @@ class StageRunner:
     def _persist_checkpoint(self, outputs: list[Any] | tuple[Any, ...], context: PipelineContext, checkpoint) -> None:
         if self._artifact_repository is None:
             return
-        if context.worker_id and context.fencing_token is not None and hasattr(
-            self._artifact_repository, "put_with_fenced_checkpoint"
+        if (
+            context.worker_id
+            and context.fencing_token is not None
+            and hasattr(self._artifact_repository, "put_with_fenced_checkpoint")
         ):
             self._artifact_repository.put_with_fenced_checkpoint(
                 outputs, context.task_id, checkpoint, context.worker_id, context.fencing_token
@@ -219,6 +214,13 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "asr_version": context.options.get("asr_model_version") or "1.0",
             "segmentation": context.options.get("segmentation_model") or config.get("segmentation_model") or "",
             "extraction": context.options.get("extraction_model") or config.get("extraction_model") or "",
+            "knowledge_evidence_window_planner": config.get("knowledge_evidence_window_planner_version") or "",
+            "knowledge_frame_planner": config.get("knowledge_frame_planner_version") or "",
+            "transcript_visual_crosscheck": config.get("transcript_visual_crosscheck_version") or "",
+            "ocr_engine": config.get("ocr_engine") or context.options.get("ocr_model") or "",
+            "ocr_engine_version": config.get("ocr_engine_version") or context.options.get("ocr_model_version") or "",
+            "vision": config.get("vision_model") or context.options.get("vision_model") or "",
+            "vision_version": config.get("vision_model_version") or context.options.get("vision_model_version") or "",
         }.items()
         if value
     }
@@ -231,6 +233,8 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "extraction": (
                 context.options.get("atomic_claim_prompt_version") or config.get("extraction_prompt_version")
             ),
+            "vision": context.options.get("vision_prompt_version") or config.get("vision_prompt_version"),
+            "vision_adapter": config.get("vision_adapter_version"),
         }.items()
         if value
     }

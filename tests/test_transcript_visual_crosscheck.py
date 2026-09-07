@@ -3,8 +3,11 @@ from __future__ import annotations
 import pytest
 
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.service import ContentApplication, _validate_visual_checkpoint_identity
+from stock_content.application.stage_runner import _checkpoint_identity
 from stock_content.application.stages import (
     MultimodalContextStage,
+    PersistStage,
     SemanticContextStage,
     TranscriptVisualCrosscheckStage,
 )
@@ -14,7 +17,12 @@ from stock_content.domain.artifacts import (
     TranscriptArtifact,
     TranscriptSegmentItem,
     VisionArtifact,
+    artifact_identity_payload,
+    content_hash_of,
+    deserialize_artifact,
+    serialize_artifact,
 )
+from stock_content.domain.checkpoint import CheckpointValidationError, build_checkpoint
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.semantic_segment import build_semantic_segment_artifact, materialize_semantic_segments
 from stock_content.domain.transcript_visual_crosscheck import TranscriptVisualCrossChecker
@@ -103,6 +111,7 @@ def _stage_context() -> PipelineContext:
     )
     semantic = materialize_semantic_segments(transcript, [])[0]
     context.artifacts.transcript = transcript
+    context.state.segments = list(transcript.segments)
     context.state.semantic_segments = [semantic]
     context.artifacts.semantic_segments = build_semantic_segment_artifact(transcript, [])
     for frame_id, text in (("support", "600519 12%"), ("unrelated", "直播二维码")):
@@ -140,6 +149,15 @@ def _stage_context() -> PipelineContext:
                 engine_version="3",
             )
         )
+        context.state.ocr_evidence.append(
+            {
+                "frame_id": frame_id,
+                "timestamp_ms": 1000,
+                "evidence_text": text,
+                "text": text,
+                "confidence_score": 0.99,
+            }
+        )
         context.artifacts.vision.append(
             VisionArtifact(
                 artifact_id=f"v-{frame_id}",
@@ -151,15 +169,45 @@ def _stage_context() -> PipelineContext:
                 semantic_segment_ids=(semantic.semantic_segment_id,),
                 evidence_window_ids=("w1",),
                 payload={
+                    "frame_id": frame_id,
+                    "frame_artifact_id": frame.artifact_id,
+                    "timestamp_ms": 1000,
+                    "image_hash": frame_id,
+                    "semantic_segment_ids": [semantic.semantic_segment_id],
+                    "evidence_window_ids": ["w1"],
+                    "ocr_text": text,
                     "visual_summary": text,
+                    "label": text,
                     "symbols": [],
                     "labels": [],
+                    "themes": [],
                     "confidence_score": 0.9,
                     "narration_aligned": True,
+                    "model": "fixture",
+                    "model_version": "fixture.v1",
                 },
             )
         )
-        context.state.frame_insights.append({"frame_id": frame_id, "timestamp_ms": 1000, "ocr_text": text})
+        context.state.frame_insights.append(
+            {
+                "frame_id": frame_id,
+                "frame_artifact_id": f"a-{frame_id}",
+                "timestamp_ms": 1000,
+                "image_hash": frame_id,
+                "semantic_segment_ids": [semantic.semantic_segment_id],
+                "evidence_window_ids": ["w1"],
+                "ocr_text": text,
+                "visual_summary": text,
+                "label": text,
+                "labels": [],
+                "themes": [],
+                "symbols": [],
+                "confidence_score": 0.9,
+                "narration_aligned": True,
+                "model": "fixture",
+                "model_version": "fixture.v1",
+            }
+        )
     return context
 
 
@@ -172,3 +220,110 @@ def test_only_support_or_contradiction_enter_multimodal_and_semantic_context():
     assert len(context.state.multimodal_context["items"]) == 1
     SemanticContextStage().execute(context)
     assert context.state.semantic_contexts[0].frame_refs == ["a-support"]
+
+
+def test_crosscheck_artifact_roundtrips_is_content_addressed_and_rehydrates_eligible_state():
+    context = _stage_context()
+    TranscriptVisualCrosscheckStage().execute(context)
+    artifact = context.artifacts.transcript_visual_crosscheck
+    assert artifact is not None
+    assert artifact.eligible_frame_ids == ("support",)
+    assert [item.relation for item in artifact.relations] == ["SUPPORTS", "UNRELATED"]
+    restored_artifact = deserialize_artifact(serialize_artifact(artifact))
+    assert restored_artifact.content_hash == artifact.content_hash
+    assert restored_artifact.to_dict() == artifact.to_dict()
+
+    tampered = serialize_artifact(artifact)
+    tampered["relations"][0]["reason_codes"] = [*tampered["relations"][0]["reason_codes"], "TAMPERED"]
+    tampered_artifact = deserialize_artifact(tampered)
+    assert content_hash_of(artifact_identity_payload(tampered_artifact)) != tampered_artifact.content_hash
+
+    restored = PipelineContext(task_id="crosscheck", source={"type": "bilibili", "ref": "BV1fixture"})
+    restored.artifacts = context.artifacts
+    app = object.__new__(ContentApplication)
+    app._occurrence_repository = None  # noqa: SLF001 - isolated resume seam
+    app._lifecycle_repository = None  # noqa: SLF001 - isolated resume seam
+    app._claim_repository = None  # noqa: SLF001 - isolated resume seam
+    app._restore_typed_prefix(restored, {})  # noqa: SLF001 - isolated resume seam
+    assert restored.state.transcript_visual_crosschecks == list(artifact.to_dict()["relations"])
+    assert [item["frame_id"] for item in restored.state.eligible_frame_insights] == ["support"]
+    builder = MultimodalContextBuilder()
+    MultimodalContextStage(builder).execute(context)
+    MultimodalContextStage(builder).execute(restored)
+    assert content_hash_of(restored.state.multimodal_context) == content_hash_of(context.state.multimodal_context)
+
+
+def test_visual_checkpoint_identity_rejects_changed_model_or_planner_version():
+    context = _stage_context()
+    context.options["pipeline_config"] = {
+        "knowledge_evidence_window_planner_version": "windows.v1",
+        "knowledge_frame_planner_version": "frames.v1",
+        "transcript_visual_crosscheck_version": "crosscheck.v1",
+        "ocr_engine": "paddleocr",
+        "ocr_engine_version": "3",
+        "vision_model": "gpt-terra",
+        "vision_model_version": "2026-09-08",
+        "vision_prompt_version": "vision.v1",
+        "vision_adapter_version": "adapter.v1",
+    }
+    identity = _checkpoint_identity(context)
+    record = build_checkpoint(
+        stage="transcript_visual_crosscheck",
+        model_identity=identity["model_identity"],
+        prompt_identity=identity["prompt_identity"],
+    )
+    _validate_visual_checkpoint_identity([record], context)
+    context.options["pipeline_config"]["vision_model_version"] = "2026-09-09"
+    with pytest.raises(CheckpointValidationError, match="visual model identity incompatible"):
+        _validate_visual_checkpoint_identity([record], context)
+
+
+def test_crosscheck_without_visual_inputs_keeps_an_empty_internal_audit_artifact():
+    context = _stage_context()
+    context.artifacts.frames = []
+    context.artifacts.ocr = []
+    context.artifacts.vision = []
+    context.state.frames = []
+    context.state.ocr_evidence = []
+    context.state.frame_insights = []
+    TranscriptVisualCrosscheckStage().execute(context)
+    artifact = context.artifacts.transcript_visual_crosscheck
+    assert artifact is not None
+    assert artifact.relations == () and artifact.eligible_frame_ids == ()
+    assert context.state.eligible_frame_insights == []
+
+
+class _Repository:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def upsert(self, *args) -> None:
+        self.calls.append(args)
+
+    def replace_for_video(self, *args) -> None:
+        self.calls.append(args)
+
+    def replace(self, *args) -> None:
+        self.calls.append(args)
+
+
+class _SummaryRepository:
+    def upsert(self, *args) -> None:
+        return None
+
+
+def test_persist_projects_only_crosscheck_admitted_visual_rows():
+    from types import SimpleNamespace
+
+    context = _stage_context()
+    TranscriptVisualCrosscheckStage().execute(context)
+    context.state.video = SimpleNamespace(video_id="video-1")
+    context.state.chapters = []
+    context.state.knowledge = []
+    context.state.summary = SimpleNamespace()
+    videos, chapters, knowledge, multimodal = _Repository(), _Repository(), _Repository(), _Repository()
+    PersistStage(videos, chapters, knowledge, _SummaryRepository(), multimodal=multimodal).execute(context)
+    _video_id, frames, ocr, vision, _windows = multimodal.calls[0]
+    assert [item["frame_id"] for item in frames] == ["support"]
+    assert [item["frame_id"] for item in ocr] == ["support"]
+    assert [item["frame_id"] for item in vision] == ["support"]
