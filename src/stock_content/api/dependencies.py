@@ -117,9 +117,12 @@ STAGE_VERSIONS: dict[str, str] = {
     "transcript_quality": "1.0.0",
     "diarization": "1.0.0",
     "transcript_postprocess": "1.0.0",
-    "ocr": "1.0.0",
-    "vision": "1.0.0",
-    "multimodal_context": "1.0.0",
+    # C3 moves visual consumers after transcript-planned knowledge frames.
+    # Bumping their checkpoint identities prevents resume from accepting
+    # pre-targeted OCR/vision context as if it covered the complete frame set.
+    "ocr": "2.0.0",
+    "vision": "2.0.0",
+    "multimodal_context": "2.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
     "knowledge_frame": "1.0.0",
@@ -132,7 +135,7 @@ STAGE_VERSIONS: dict[str, str] = {
     "claim_occurrence_persistence": "1.0.0",
     "lifecycle_projection": "1.0.0",
     "chapter": "1.0.0",
-    "temporal_window": "1.0.0",
+    "temporal_window": "2.0.0",
     "knowledge": "final.1.0",
     "verification": "1.0.0",
     "financial_enrichment": "1.0.0",
@@ -422,9 +425,21 @@ def build_application(
     semantic_stages = (
         [
             ChapterStage(ChapterSegmenter()),
-            TemporalWindowStage(TemporalWindowBuilder()),
             SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
             KnowledgeDirectedFrameExtractionStage(FfmpegFrameExtractor()),
+        ]
+        if semantic_enabled
+        else []
+    )
+    compatibility_stages = (
+        []
+        if semantic_enabled
+        else [
+            ChapterStage(ChapterSegmenter()),
+        ]
+    )
+    semantic_claim_stages = (
+        [
             SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
             AtomicClaimExtractionStage(extractor=atomic_extractor),
             AtomicClaimValidationStage(),
@@ -439,14 +454,6 @@ def build_application(
         if semantic_enabled
         else []
     )
-    compatibility_stages = (
-        []
-        if semantic_enabled
-        else [
-            ChapterStage(ChapterSegmenter()),
-            TemporalWindowStage(TemporalWindowBuilder()),
-        ]
-    )
     stages = [
         ResolveSourceStage(sources),
         DownloadStage(sources),
@@ -458,12 +465,17 @@ def build_application(
         TranscriptQualityStage(),
         SpeakerDiarizationStage(PyannoteDiarizer()),
         TranscriptPostprocessStage(TranscriptPostprocessor()),
+        # Video identity is required by semantic segment persistence; visual
+        # analysis follows semantic planning so it sees coarse and targeted
+        # frames in one immutable set.
+        BuildVideoStage(),
+        *semantic_stages,
         OCRStage(PaddleOcrEngine()),
         VisionStage(HttpVisionAnalyzer()),
         MultimodalContextStage(MultimodalContextBuilder()),
-        BuildVideoStage(),
-        *semantic_stages,
+        TemporalWindowStage(TemporalWindowBuilder()),
         *compatibility_stages,
+        *semantic_claim_stages,
         KnowledgeExtractionStage(
             external_verifier=ExternalFactVerifier(
                 provider=external_provider if external_provider.configured() else None

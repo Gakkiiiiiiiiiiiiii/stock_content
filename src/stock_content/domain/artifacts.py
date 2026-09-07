@@ -286,7 +286,14 @@ class FrameArtifact(ArtifactBase):
 @dataclass(frozen=True)
 class OCRArtifact(ArtifactBase):
     frame_artifact_id: str = ""
+    frame_id: str = ""
+    timestamp_ms: int = 0
+    image_hash: str = ""
+    semantic_segment_ids: tuple[str, ...] = ()
+    evidence_window_ids: tuple[str, ...] = ()
     text: str = ""
+    bbox: list[Any] | None = None
+    confidence_score: float | None = None
     blocks: list[dict[str, Any]] = field(default_factory=list)
     engine: str = ""
     engine_version: str = ""
@@ -295,7 +302,14 @@ class OCRArtifact(ArtifactBase):
 @dataclass(frozen=True)
 class VisionArtifact(ArtifactBase):
     frame_artifact_id: str = ""
+    frame_id: str = ""
+    timestamp_ms: int = 0
+    image_hash: str = ""
+    semantic_segment_ids: tuple[str, ...] = ()
+    evidence_window_ids: tuple[str, ...] = ()
     label: str = ""
+    labels: list[str] = field(default_factory=list)
+    confidence_score: float | None = None
     payload: dict[str, Any] = field(default_factory=dict)
     model_name: str = ""
     model_version: str = ""

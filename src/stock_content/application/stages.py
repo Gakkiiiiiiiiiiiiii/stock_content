@@ -949,6 +949,68 @@ class TranscriptPostprocessStage:
         return _stage_result(context, "transcript")
 
 
+def _finite_confidence(value: Any, field: str = "confidence_score") -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError(f"{field} must be a finite number")
+    result = float(value)
+    if not 0.0 <= result <= 1.0:
+        raise ValueError(f"{field} must be between 0 and 1")
+    return result
+
+
+def _normalise_bbox(value: Any) -> list[Any]:
+    """Accept only a rectangular, JSON-safe OCR coordinate payload.
+
+    PaddleOCR has emitted both ``[left, top, right, bottom]`` and four
+    corner-points over supported releases.  Preserve either exact shape while
+    rejecting lossy/coerced coordinates and non-finite values.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError("OCR bbox must contain four coordinates or corner points")
+    if all(not isinstance(item, (list, tuple)) for item in value):
+        return [_finite_coordinate(item) for item in value]
+    if not all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value):
+        raise ValueError("OCR bbox corner points must each contain two coordinates")
+    return [[_finite_coordinate(coordinate) for coordinate in item] for item in value]
+
+
+def _finite_coordinate(value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise ValueError("OCR bbox coordinates must be finite numbers")
+    return value
+
+
+def _frame_metadata(context: PipelineContext, frame_id: str, supplied: dict[str, Any]) -> dict[str, Any]:
+    """Resolve immutable frame provenance without synthesising model evidence."""
+    frame = next((item for item in context.artifacts.frames if item.frame_id == frame_id), None)
+    if frame is not None:
+        return {
+            "frame_id": frame.frame_id,
+            "timestamp_ms": frame.timestamp_ms,
+            "image_hash": frame.image_hash,
+            "semantic_segment_ids": list(frame.semantic_segment_ids),
+            "evidence_window_ids": list(frame.evidence_window_ids),
+            "frame_artifact_id": frame.artifact_id,
+        }
+    # Explicit test fixtures may intentionally have no materialised frame.
+    # Preserve their supplied coordinate rather than creating a fake model
+    # output; FrameExtractionStage creates deterministic parents in production.
+    return {
+        "frame_id": frame_id,
+        "timestamp_ms": int(supplied.get("timestamp_ms") or 0),
+        "image_hash": str(supplied.get("image_hash") or ""),
+        "semantic_segment_ids": list(supplied.get("semantic_segment_ids") or ()),
+        "evidence_window_ids": list(supplied.get("evidence_window_ids") or ()),
+        "frame_artifact_id": "",
+    }
+
+
+def _require_model_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
 class OCRStage:
     name = "ocr"
     required_inputs = ("media",)
@@ -960,50 +1022,141 @@ class OCRStage:
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         supplied = context.options.get("ocr_evidence")
-        evidence = list(supplied) if supplied is not None else []
+        evidence: list[dict[str, Any]] = []
         if supplied is None:
             for frame in context.state.get("frames", []):
                 result = self._engine.recognize(str(frame["image_path"]))
-                blocks = list(result.get("blocks") or [])
+                if not isinstance(result, dict):
+                    raise ValueError("OCR engine returned a non-object response")
+                engine = _require_model_text(result.get("engine"), "OCR engine")
+                engine_version = _require_model_text(result.get("engine_version"), "OCR engine_version")
+                raw_blocks = result.get("blocks")
+                if not isinstance(raw_blocks, list):
+                    raise ValueError("OCR blocks must be a list")
+                blocks = []
+                metadata = _frame_metadata(context, str(frame.get("frame_id") or ""), frame)
+                for raw_block in raw_blocks:
+                    if not isinstance(raw_block, dict):
+                        raise ValueError("OCR block must be an object")
+                    text = _require_model_text(raw_block.get("text"), "OCR text")
+                    block = {
+                        **metadata,
+                        "source_type": "OCR",
+                        "evidence_text": text,
+                        "text": text,
+                        "bbox": _normalise_bbox(raw_block.get("bbox")),
+                        "confidence_score": _finite_confidence(raw_block.get("score"), "OCR score"),
+                        "ocr_engine": engine,
+                        "ocr_engine_version": engine_version,
+                    }
+                    blocks.append(block)
+                    evidence.append(block)
                 item = {
                     **frame,
-                    "ocr_text": str(result.get("text") or ""),
+                    "ocr_text": "\n".join(block["text"] for block in blocks),
                     "ocr_evidence": {"blocks": blocks},
-                    "ocr_engine": result.get("engine"),
-                    "ocr_engine_version": result.get("engine_version"),
+                    "ocr_engine": engine,
+                    "ocr_engine_version": engine_version,
+                    "source_type": "OCR",
                 }
                 context.state.setdefault("frame_insights", []).append(item)
-                evidence.extend(
-                    [
-                        {
-                            **block,
-                            "frame_id": frame["frame_id"],
-                            "timestamp_ms": frame["timestamp_ms"],
-                            "source_type": "OCR",
-                            "confidence_score": block.get("score"),
-                            "evidence_text": block.get("text"),
-                        }
-                        for block in blocks
-                    ]
-                )
+        else:
+            # Explicit, caller-supplied offline fixtures stay deterministic.
+            # They are not accepted as a substitute for a malformed engine
+            # response and therefore retain their historical minimal shape.
+            for raw in supplied:
+                if not isinstance(raw, dict):
+                    raise ValueError("OCR fixture evidence must be an object")
+                frame_id = str(raw.get("frame_id") or "")
+                if not frame_id:
+                    raise ValueError("OCR fixture evidence requires frame_id")
+                metadata = _frame_metadata(context, frame_id, raw)
+                evidence.append({**metadata, **raw, "source_type": "OCR"})
         context.state["ocr_evidence"] = evidence
         ocr_artifacts = []
-        for index, item in enumerate(evidence):
+        for item in evidence:
             frame_id = str(item.get("frame_id") or "")
-            parent = next((frame.artifact_id for frame in context.artifacts.frames if frame.frame_id == frame_id), "")
+            metadata = _frame_metadata(context, frame_id, item)
+            parent = metadata["frame_artifact_id"]
+            is_fixture = supplied is not None
+            confidence = item.get("confidence_score", item.get("score"))
             ocr = OCRArtifact(
                 artifact_id="ocr-pending",
                 artifact_type="ocr",
                 frame_artifact_id=parent,
+                frame_id=frame_id,
+                timestamp_ms=metadata["timestamp_ms"],
+                image_hash=metadata["image_hash"],
+                semantic_segment_ids=tuple(metadata["semantic_segment_ids"]),
+                evidence_window_ids=tuple(metadata["evidence_window_ids"]),
                 text=str(item.get("evidence_text") or item.get("text") or ""),
+                bbox=(item.get("bbox") if is_fixture else _normalise_bbox(item.get("bbox"))),
+                confidence_score=(None if is_fixture and confidence is None else _finite_confidence(confidence)),
                 blocks=[dict(item)],
                 engine=str(item.get("ocr_engine") or "fixture"),
-                engine_version=str(item.get("ocr_engine_version") or "1"),
+                engine_version=str(item.get("ocr_engine_version") or "fixture.v1"),
                 parent_artifact_ids=(parent,) if parent else (),
             )
             ocr_artifacts.append(OCRArtifact(**{**ocr.__dict__, "artifact_id": artifact_id_of(ocr)}))
         context.artifacts.ocr = ocr_artifacts
         return _stage_result(context, "ocr")
+
+
+def _transcript_context_for_frame(context: PipelineContext, frame: dict[str, Any]) -> str:
+    """Keep a targeted visual request anchored to its semantic evidence window."""
+    segment_ids = {str(value) for value in frame.get("semantic_segment_ids") or ()}
+    if not segment_ids:
+        return str(context.state.transcript)
+    ranges = [
+        (int(segment.start_ms), int(segment.end_ms))
+        for segment in context.state.semantic_segments
+        if str(segment.semantic_segment_id) in segment_ids
+    ]
+    if not ranges:
+        return str(context.state.transcript)
+    selected = []
+    for item in context.state.segments:
+        start_ms, end_ms = int(item.start_seconds * 1000), int(item.end_seconds * 1000)
+        if any(start_ms <= high and end_ms >= low for low, high in ranges):
+            selected.append(item.text)
+    return " ".join(selected) or str(context.state.transcript)
+
+
+def _normalise_string_list(value: Any, field: str, *, allow_empty: bool = True) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ValueError(f"{field} must be a list of non-empty strings")
+    if not allow_empty and not value:
+        raise ValueError(f"{field} must not be empty")
+    return list(value)
+
+
+def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ValueError("vision analyzer returned a non-object response")
+    metadata = _frame_metadata(context, str(frame.get("frame_id") or ""), frame)
+    visual_summary = _require_model_text(result.get("visual_summary"), "vision visual_summary")
+    labels = _normalise_string_list(result.get("labels"), "vision labels", allow_empty=False)
+    themes = _normalise_string_list(result.get("themes"), "vision themes")
+    symbols = _normalise_string_list(result.get("symbols"), "vision symbols")
+    narration_aligned = result.get("narration_aligned")
+    if not isinstance(narration_aligned, bool):
+        raise ValueError("vision narration_aligned must be boolean")
+    model = _require_model_text(result.get("model"), "vision model")
+    model_version = _require_model_text(result.get("model_version"), "vision model_version")
+    return {
+        **frame,
+        **metadata,
+        "visual_summary": visual_summary,
+        "label": labels[0],
+        "labels": labels,
+        "themes": themes,
+        "symbols": symbols,
+        "confidence_score": _finite_confidence(result.get("confidence_score"), "vision confidence_score"),
+        "narration_aligned": narration_aligned,
+        "model": model,
+        "model_version": model_version,
+        "source_type": "VISION",
+    }
 
 
 class VisionStage:
@@ -1017,25 +1170,65 @@ class VisionStage:
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         insights = list(context.state.get("frame_insights") or [])
+        vision_items: list[dict[str, Any]] = []
         if context.options.get("frame_insights") is not None:
-            insights.extend(context.options["frame_insights"])
+            for raw in context.options["frame_insights"]:
+                if not isinstance(raw, dict) or not str(raw.get("frame_id") or ""):
+                    raise ValueError("vision fixture insight requires frame_id")
+                metadata = _frame_metadata(context, str(raw["frame_id"]), raw)
+                vision_items.append(
+                    {
+                        **metadata,
+                        **raw,
+                        "model": raw.get("model") or "fixture",
+                        "model_version": raw.get("model_version") or "fixture.v1",
+                    }
+                )
         elif context.state.get("frames"):
             for frame in context.state["frames"]:
-                result = self._analyzer.analyze(str(frame["image_path"]), context.state["transcript"])
-                insights.append({**frame, **result, "model": getattr(self._analyzer, "_model", None)})
+                result = self._analyzer.analyze(
+                    str(frame["image_path"]), _transcript_context_for_frame(context, frame)
+                )
+                vision_items.append(_normalise_vision_item(context, frame, result))
+        # OCR contributes one context item per frame. Merge the corresponding
+        # visual observation into that same item so bounded multimodal context
+        # cannot crowd vision out behind duplicate OCR-only entries.
+        insight_indexes = {
+            str(item.get("frame_id") or ""): index
+            for index, item in enumerate(insights)
+            if isinstance(item, dict) and item.get("frame_id")
+        }
+        for item in vision_items:
+            frame_id = str(item["frame_id"])
+            if frame_id in insight_indexes:
+                index = insight_indexes[frame_id]
+                insights[index] = {**insights[index], **item}
+            else:
+                insight_indexes[frame_id] = len(insights)
+                insights.append(item)
         context.state["frame_insights"] = insights
         vision_artifacts = []
-        for index, item in enumerate(insights):
+        for item in vision_items:
             frame_id = str(item.get("frame_id") or "")
-            parent = next((frame.artifact_id for frame in context.artifacts.frames if frame.frame_id == frame_id), "")
+            metadata = _frame_metadata(context, frame_id, item)
+            parent = metadata["frame_artifact_id"]
+            is_fixture = context.options.get("frame_insights") is not None
+            confidence = item.get("confidence_score")
             vision = VisionArtifact(
                 artifact_id="vision-pending",
                 artifact_type="vision",
                 frame_artifact_id=parent,
+                frame_id=frame_id,
+                timestamp_ms=metadata["timestamp_ms"],
+                image_hash=metadata["image_hash"],
+                semantic_segment_ids=tuple(metadata["semantic_segment_ids"]),
+                evidence_window_ids=tuple(metadata["evidence_window_ids"]),
                 label=str(item.get("label") or item.get("description") or ""),
+                labels=list(item.get("labels") or ()),
+                confidence_score=(None if is_fixture and confidence is None else _finite_confidence(confidence)),
                 payload=dict(item),
                 model_name=str(item.get("model") or "fixture"),
-                model_version=str(item.get("model_version") or "1"),
+                model_version=str(item.get("model_version") or "fixture.v1"),
                 parent_artifact_ids=(parent,) if parent else (),
             )
             vision_artifacts.append(VisionArtifact(**{**vision.__dict__, "artifact_id": artifact_id_of(vision)}))

@@ -90,7 +90,6 @@ def test_pipeline_wires_targeted_frame_stage_after_semantic_segmentation(tmp_pat
     application = build_application(f"sqlite:///{tmp_path / 'targeted-stage.db'}", enable_qdrant=False)
     names = [runner.name for runner in application._pipeline._stages]  # noqa: SLF001
 
-    assert names.index("semantic_segmentation") < names.index("knowledge_frame") < names.index("semantic_context")
-    # C2 intentionally does not move OCR/vision.  C3 owns making those stages
-    # consume target frames after this newly materialized checkpoint boundary.
-    assert names.index("ocr") < names.index("knowledge_frame")
+    assert names.index("semantic_segmentation") < names.index("knowledge_frame") < names.index("ocr")
+    assert names.index("ocr") < names.index("vision") < names.index("multimodal_context")
+    assert names.index("vision") < names.index("temporal_window") < names.index("semantic_context")
