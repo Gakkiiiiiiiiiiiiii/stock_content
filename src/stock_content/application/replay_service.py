@@ -25,6 +25,8 @@ class ReplayService(ReplayIntegrityMixin, ReplayHistoricalMixin, ReplayReprocess
             "idempotency_key", "trace_id", "decision_id", "replay_raw_storage_uri",
             "replay_snapshot_kind", "replay_parent_snapshot_id", "replay_supersedes_snapshot_id",
             "replay_pipeline_version", "replay_lifecycle_timestamp",
+            "replay_source_available_at", "replay_source_business_as_of",
+            "replay_source_pipeline_version",
             "temporal_reference_provider",
         }
     )

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -17,20 +21,46 @@ from stock_content.adapters.postgres.models import (
     ContentArtifactEdgeRow,
     ContentArtifactRow,
     ContentStageCheckpointRow,
+    ContentTaskEffectRow,
     ContentTaskRow,
+    RetentionArtifactLocatorRow,
+    SourceArtifactMetadataRow,
 )
 from stock_content.domain.artifacts import (
     ArtifactBase,
+    SourceArtifact,
     artifact_identity_payload,
     canonical_json,
     deserialize_artifact,
     serialize_artifact,
 )
-from stock_content.domain.checkpoint import CheckpointRecord, CheckpointValidationError
+from stock_content.domain.checkpoint import CheckpointRecord, CheckpointValidationError, checkpoint_state_checksum
+from stock_content.ports.repositories import StaleTaskLease
 
 
 class ArtifactIntegrityError(ValueError):
     """Artifact id/hash/payload immutability violation."""
+
+
+def _fenced_checkpoint_payload_hash(checkpoint: Any, artifacts: list[ArtifactBase]) -> str:
+    """Return a lease- and clock-independent stage-effect receipt hash.
+
+    Checkpoint audit fields retain the worker/fence and timestamps, but those
+    fields are not part of the business effect.  This permits a valid resumed
+    worker to recognize an already committed stage without weakening the
+    immutable input/output identity check.
+    """
+    stable_checksum = checkpoint_state_checksum(checkpoint)
+    if checkpoint.state_checksum and checkpoint.state_checksum != stable_checksum:
+        raise ArtifactIntegrityError("fenced checkpoint state checksum is invalid")
+    payload = {
+        "checkpoint_state_checksum": stable_checksum,
+        "schema_version": str(checkpoint.schema_version),
+        "output_artifact_ids": list(checkpoint.output_artifact_ids),
+        "output_artifact_hashes": list(checkpoint.output_hashes),
+        "artifacts": [artifact.content_hash for artifact in artifacts],
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _json_payload(artifact: ArtifactBase) -> dict:
@@ -110,32 +140,108 @@ class SqlArtifactRepository:
         """Persist stage artifacts and checkpoint in one database transaction."""
         items = list(artifacts)
         with self._sessions.begin() as session:
-            for artifact in items:
-                _put_artifact_in_session(session, artifact)
-            checkpoint_id = f"{task_id}:{checkpoint.stage}:{checkpoint.stage_version}"
-            existing_checkpoint = session.get(ContentStageCheckpointRow, checkpoint_id)
-            if existing_checkpoint is None:
-                session.add(
-                    ContentStageCheckpointRow(
-                        checkpoint_id=checkpoint_id,
-                        task_id=task_id,
-                        stage=checkpoint.stage,
-                        stage_version=checkpoint.stage_version,
-                        status=checkpoint.status,
-                        artifact_ids=list(checkpoint.output_artifact_ids),
-                        artifact_hashes=list(checkpoint.output_hashes),
-                        payload=checkpoint.to_dict(),
-                    )
+            self._put_checkpoint_in_session(session, items, task_id, checkpoint)
+
+    def put_with_fenced_checkpoint(
+        self,
+        artifacts: Iterable[ArtifactBase],
+        task_id: str,
+        checkpoint: Any,
+        worker_id: str,
+        fencing_token: int,
+    ) -> None:
+        """Atomically persist a stage receipt only for the current task lease.
+
+        A prior worker may still finish a model/download call after takeover;
+        its immutable artifact is harmless, but its checkpoint must not make
+        that output resumable or advance the task's durable recovery point.
+        """
+        items = list(artifacts)
+        with self._sessions.begin() as session:
+            row = session.scalar(
+                select(ContentTaskRow).where(ContentTaskRow.task_id == task_id).with_for_update()
+            )
+            expires_at = row.lease_expires_at if row is not None else None
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            now = datetime.now(UTC)
+            if (
+                row is None
+                or row.status != "RUNNING"
+                or row.lease_owner != worker_id
+                or row.fencing_token != fencing_token
+                or expires_at is None
+                or expires_at <= now
+            ):
+                raise StaleTaskLease(f"content task lease is stale: {task_id}")
+            # A FAILED checkpoint is diagnostic/recovery state, not a
+            # completed business effect.  It must remain retryable by a later
+            # current lease; only a successful receipt consumes the stable
+            # stage effect identity.
+            if checkpoint.status != "SUCCEEDED":
+                self._put_checkpoint_in_session(session, items, task_id, checkpoint)
+                return
+            effect_key = f"stage:{checkpoint.stage}:{checkpoint.stage_version}"
+            # A task can resume in another process with a different worker,
+            # lease token and wall clock.  The durable receipt must bind only
+            # the frozen recovery facts, not those runtime audit fields.
+            payload_hash = _fenced_checkpoint_payload_hash(checkpoint, items)
+            effect = session.scalar(
+                select(ContentTaskEffectRow)
+                .where(ContentTaskEffectRow.task_id == task_id, ContentTaskEffectRow.effect_key == effect_key)
+                .with_for_update()
+            )
+            if effect is not None and (
+                effect.payload_hash != payload_hash or effect.effect_kind != "STAGE_ARTIFACT_CHECKPOINT"
+            ):
+                raise ArtifactIntegrityError("fenced stage effect identity already stores different payload")
+            if effect is not None:
+                # Preserve the original immutable receipt; a retry must not
+                # overwrite it with a new process/lease audit envelope.
+                return
+            self._put_checkpoint_in_session(session, items, task_id, checkpoint)
+            session.add(
+                ContentTaskEffectRow(
+                    effect_id="eff_" + hashlib.sha256(f"{task_id}|{effect_key}".encode()).hexdigest(),
+                    task_id=task_id,
+                    effect_key=effect_key,
+                    effect_kind="STAGE_ARTIFACT_CHECKPOINT",
+                    payload_hash=payload_hash,
+                    fencing_token=fencing_token,
+                    state="COMPLETED",
+                    attempt_count=1,
+                    completed_at=now,
                 )
-            else:
-                history = list((existing_checkpoint.payload or {}).get("attempt_history") or [])
-                history.append(dict(existing_checkpoint.payload or {}))
-                payload = checkpoint.to_dict()
-                payload["attempt_history"] = history
-                existing_checkpoint.status = checkpoint.status
-                existing_checkpoint.artifact_ids = list(checkpoint.output_artifact_ids)
-                existing_checkpoint.artifact_hashes = list(checkpoint.output_hashes)
-                existing_checkpoint.payload = payload
+            )
+
+    @staticmethod
+    def _put_checkpoint_in_session(session, artifacts: list[ArtifactBase], task_id: str, checkpoint: Any) -> None:
+        for artifact in artifacts:
+            _put_artifact_in_session(session, artifact)
+        checkpoint_id = f"{task_id}:{checkpoint.stage}:{checkpoint.stage_version}"
+        existing_checkpoint = session.get(ContentStageCheckpointRow, checkpoint_id)
+        if existing_checkpoint is None:
+            session.add(
+                ContentStageCheckpointRow(
+                    checkpoint_id=checkpoint_id,
+                    task_id=task_id,
+                    stage=checkpoint.stage,
+                    stage_version=checkpoint.stage_version,
+                    status=checkpoint.status,
+                    artifact_ids=list(checkpoint.output_artifact_ids),
+                    artifact_hashes=list(checkpoint.output_hashes),
+                    payload=checkpoint.to_dict(),
+                )
+            )
+            return
+        history = list((existing_checkpoint.payload or {}).get("attempt_history") or [])
+        history.append(dict(existing_checkpoint.payload or {}))
+        payload = checkpoint.to_dict()
+        payload["attempt_history"] = history
+        existing_checkpoint.status = checkpoint.status
+        existing_checkpoint.artifact_ids = list(checkpoint.output_artifact_ids)
+        existing_checkpoint.artifact_hashes = list(checkpoint.output_hashes)
+        existing_checkpoint.payload = payload
 
     def list_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
         """Return the durable stage history in execution order."""
@@ -302,23 +408,24 @@ class SqlArtifactRepository:
 
     def put_claim_members(self, artifact: ArtifactBase) -> None:
         """Persist the reverse membership for a canonical ClaimArtifact."""
-        claims = list(getattr(artifact, "claims", ()) or ())
         with self._sessions.begin() as session:
-            for claim_id in claims:
-                claim_id = str(getattr(claim_id, "claim_id", claim_id))
-                member_id = hashlib.sha256(
-                    f"{artifact.artifact_id}:{claim_id}".encode()
-                ).hexdigest()
-                _insert_ignore(
-                    session,
-                    ClaimArtifactMemberRow,
-                    {
-                        "member_id": member_id,
-                        "artifact_id": artifact.artifact_id,
-                        "claim_id": str(claim_id),
-                    },
-                    [ClaimArtifactMemberRow.member_id],
-                )
+            self.put_claim_members_in_session(session, artifact)
+
+    def put_claim_members_in_session(self, session, artifact: ArtifactBase) -> None:
+        claims = list(getattr(artifact, "claims", ()) or ())
+        for claim_id in claims:
+            claim_id = str(getattr(claim_id, "claim_id", claim_id))
+            member_id = hashlib.sha256(f"{artifact.artifact_id}:{claim_id}".encode()).hexdigest()
+            _insert_ignore(
+                session,
+                ClaimArtifactMemberRow,
+                {
+                    "member_id": member_id,
+                    "artifact_id": artifact.artifact_id,
+                    "claim_id": str(claim_id),
+                },
+                [ClaimArtifactMemberRow.member_id],
+            )
 
     def get_many(self, artifact_ids: Iterable[str]) -> list[ArtifactBase]:
         ids = list(artifact_ids)
@@ -461,7 +568,136 @@ def _put_artifact_in_session(session, artifact: ArtifactBase) -> ArtifactBase:
             },
             [ContentArtifactEdgeRow.edge_id],
         )
+    if isinstance(stored, SourceArtifact):
+        _persist_source_provenance(session, stored)
     return stored
+
+
+def _persist_source_provenance(session, artifact: SourceArtifact) -> None:
+    """Write closed public provenance in the same artifact transaction."""
+    metadata = dict(artifact.source_metadata or {})
+    required = {
+        "source_policy_version": metadata.get("source_policy_version"),
+        "access_classification": metadata.get("access_classification"),
+        "mime_type": metadata.get("mime_type") or "application/octet-stream",
+    }
+    if not all(str(value or "").strip() for value in required.values()):
+        # Legacy/replayed artifacts are not upgraded by guessing provenance.
+        return
+    values = {
+        "artifact_id": artifact.artifact_id,
+        "source_policy_version": str(required["source_policy_version"]),
+        # Candidate enumeration operates on byte classes, not a broad policy
+        # name such as "standard".
+        "retention_class": "raw_media",
+        "access_classification": str(required["access_classification"]),
+        "source_content_hash": str(artifact.source_content_hash or artifact.raw_content_hash),
+        "content_size": int(artifact.raw_content_length or 0),
+        "mime_type": str(required["mime_type"]),
+        "encryption_key_id": _safe_identifier(metadata.get("encryption_key_id")),
+        "canonical_url": _public_url(metadata.get("canonical_url")),
+        "source_type": _safe_identifier(artifact.source_type),
+        "source_id": _safe_identifier(metadata.get("source_id")),
+        "source_part": _safe_identifier(metadata.get("source_part")),
+        "source_identity_hash": _safe_hash(artifact.source_identity_hash),
+        "source_version_id": _safe_identifier(artifact.source_version_id),
+        "author": _safe_identifier(metadata.get("author")),
+        "published_at": _instant(metadata.get("published_at")),
+        "business_as_of": _instant(metadata.get("business_as_of")),
+        "source_available_from": _instant(metadata.get("source_available_from")),
+        "pipeline_version": _safe_identifier(metadata.get("pipeline_version")),
+        "service_version": _safe_identifier(os.getenv("CONTENT_SERVICE_VERSION")),
+    }
+    existing = session.get(SourceArtifactMetadataRow, artifact.artifact_id)
+    if existing is None:
+        session.add(SourceArtifactMetadataRow(**values))
+    else:
+        for key, value in values.items():
+            stored = getattr(existing, key)
+            # SQLite strips timezone metadata from DateTime(timezone=True).
+            # Compare normalized instants so a retry of the exact immutable
+            # artifact cannot be rejected merely by the test backend's
+            # representation change.
+            if key in {"published_at", "business_as_of", "source_available_from"}:
+                stored = _instant(stored)
+            if stored != value:
+                raise ArtifactIntegrityError("source artifact provenance is immutable")
+    _register_private_locator(session, artifact)
+
+
+def _register_private_locator(session, artifact: SourceArtifact) -> None:
+    root_text = os.getenv("CONTENT_RETENTION_PRIVATE_ROOT", "").strip()
+    root_id = os.getenv("CONTENT_RETENTION_PRIVATE_ROOT_ID", "").strip()
+    if not root_text or not root_id or not artifact.raw_storage_uri:
+        return
+    root = Path(root_text)
+    if not root.is_dir():
+        return
+    raw = str(artifact.raw_storage_uri)
+    # ``urlsplit`` mistakes a Windows drive (``D:\\...``) for a URI scheme.
+    # Treat it as a local path before applying the external-locator rejection.
+    local_path = Path(raw)
+    parsed = urlsplit(raw) if not local_path.drive else None
+    # No external/signed locator can become a deletion target.
+    if parsed is not None and parsed.scheme and parsed.scheme != "file":
+        return
+    candidate = Path(parsed.path if parsed is not None and parsed.scheme == "file" else raw)
+    try:
+        resolved_root, resolved_candidate = root.resolve(strict=True), candidate.resolve(strict=True)
+    except OSError:
+        return
+    if (
+        resolved_candidate == resolved_root
+        or resolved_root not in resolved_candidate.parents
+        or not resolved_candidate.is_file()
+    ):
+        return
+    relative = resolved_candidate.relative_to(resolved_root).as_posix()
+    existing = session.get(RetentionArtifactLocatorRow, artifact.artifact_id)
+    if existing is None:
+        session.add(RetentionArtifactLocatorRow(
+            artifact_id=artifact.artifact_id, private_root_id=root_id, relative_locator=relative,
+        ))
+    elif (existing.private_root_id, existing.relative_locator) != (root_id, relative):
+        raise ArtifactIntegrityError("retention locator is immutable")
+
+
+def _public_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        return None
+    return f"https://{parsed.netloc}{parsed.path}"
+
+
+def _safe_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or any(token in candidate.lower() for token in ("cookie", "secret", "token", "signed", "://")):
+        return None
+    return candidate
+
+
+def _safe_hash(value: Any) -> str | None:
+    value = _safe_identifier(value)
+    return value if value and len(value) == 64 and all(char in "0123456789abcdef" for char in value.lower()) else None
+
+
+def _instant(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _insert_ignore(session, model, values: dict, conflict_columns: list | None) -> bool:

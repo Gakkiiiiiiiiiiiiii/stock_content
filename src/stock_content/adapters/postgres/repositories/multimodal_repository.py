@@ -18,6 +18,11 @@ class PostgresMultimodalRepository:
         self, video_id: str, frames: list[dict], ocr: list[dict], vision: list[dict], windows: list[dict]
     ) -> None:
         with self._sessions.begin() as session:
+            self.replace_in_session(session, video_id, frames, ocr, vision, windows)
+
+    def replace_in_session(
+        self, session, video_id: str, frames: list[dict], ocr: list[dict], vision: list[dict], windows: list[dict]
+    ) -> None:
             frame_ids = session.scalars(select(VideoFrameRow.frame_id).where(VideoFrameRow.video_id == video_id)).all()
             if frame_ids:
                 session.execute(delete(OcrEvidenceRow).where(OcrEvidenceRow.frame_id.in_(frame_ids)))

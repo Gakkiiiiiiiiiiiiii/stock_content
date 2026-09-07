@@ -1,0 +1,17 @@
+{
+  "canonicalization_version": "content-bundle-c14n-v1",
+  "vectors": [
+    {"name": "unicode-and-number", "left": {"b": 1.0, "a": "é"}, "right": {"a": "é", "b": 1}},
+    {"name": "timezone", "left": {"at": "2026-09-06T08:00:00+08:00"}, "right": {"at": "2026-09-06T00:00:00Z"}},
+    {"name": "set-order", "left": {"evidence_refs": ["b", "a"]}, "right": {"evidence_refs": ["a", "b"]}},
+    {"name": "nested-item-and-evidence-order", "left": {"items": [{"knowledge_id": "z", "subject": {"type": "EQUITY", "key": "600000"}, "predicate": "margin", "temporal": {"target_start": "2026-09-02T00:00:00Z", "target_end": "2026-09-02T00:00:00Z"}, "occurrence_id": "z", "evidence": [{"evidence_id": "b", "start_ms": 10, "end_ms": 20}, {"evidence_id": "a", "start_ms": 1, "end_ms": 2}]}, {"knowledge_id": "a", "subject": {"type": "EQUITY", "key": "600000"}, "predicate": "margin", "temporal": {"target_start": "2026-09-01T00:00:00Z", "target_end": "2026-09-01T00:00:00Z"}, "occurrence_id": "a"}]}, "right": {"items": [{"knowledge_id": "a", "subject": {"key": "600000", "type": "EQUITY"}, "predicate": "margin", "temporal": {"target_start": "2026-09-01T00:00:00Z", "target_end": "2026-09-01T00:00:00Z"}, "occurrence_id": "a"}, {"knowledge_id": "z", "subject": {"key": "600000", "type": "EQUITY"}, "predicate": "margin", "temporal": {"target_start": "2026-09-02T00:00:00Z", "target_end": "2026-09-02T00:00:00Z"}, "occurrence_id": "z", "evidence": [{"evidence_id": "a", "start_ms": 1, "end_ms": 2}, {"evidence_id": "b", "start_ms": 10, "end_ms": 20}]}]}},
+    {"name": "tamper", "left": {"statement": "收入增长20%"}, "right": {"statement": "收入增长21%"}}
+  ],
+  "rejections": ["NaN", "Infinity"],
+  "schema_rejections": [
+    {"name": "missing-item-grounding-status", "path": ["items", 0, "grounding_status"], "operation": "remove"},
+    {"name": "wrong-nested-temporal-instant", "path": ["items", 0, "temporal", "target_start"], "operation": "replace", "value": "not-an-instant"},
+    {"name": "unknown-evidence-field", "path": ["items", 0, "evidence", 0, "unreviewed"], "operation": "replace", "value": true},
+    {"name": "object-value-must-be-scalar", "path": ["items", 0, "object", "value"], "operation": "replace", "value": {"unreviewed": true}}
+  ]
+}

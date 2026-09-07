@@ -61,9 +61,17 @@ def test_lineage_flows_into_factor_signal(tmp_path):
 
     from stock_content.api.dependencies import build_application
     from stock_content.api.main import create_app
+    from stock_content.api.security import ServiceAuthorizer
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    token = tmp_path / "content-service-token"
+    token.write_text("lineage-fixture-token\n", encoding="utf-8")
+    client = TestClient(create_app(application, authorizer=ServiceAuthorizer((token,), ("stock_agent",))))
+    headers = {
+        "Authorization": "Bearer lineage-fixture-token",
+        "X-Caller-Service": "stock_agent",
+        "X-Trace-Id": "lineage-fixture",
+    }
     client.post(
         "/api/v1/videos/bilibili/ingest",
         json={
@@ -74,6 +82,7 @@ def test_lineage_flows_into_factor_signal(tmp_path):
                 "offline_fixture": True,
             },
         },
+        headers=headers,
     )
     application.process_next("lineage-test")
 

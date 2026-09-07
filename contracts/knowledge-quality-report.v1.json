@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "knowledge-quality-report.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schema_version", "annotation_set_version", "annotation_set_hash", "partition", "status", "release_ready", "metrics", "strata", "blockers"],
+  "properties": {
+    "contract": {"const": "knowledge-quality-report.v1"},
+    "schema_version": {"const": "1.0.0"},
+    "annotation_set_version": {"type": ["string", "null"]},
+    "annotation_set_hash": {"type": ["string", "null"]},
+    "partition": {"const": "frozen_oos"},
+    "status": {"enum": ["PASS", "BLOCKED"]},
+    "release_ready": {"type": "boolean"},
+    "metrics": {"type": "object"},
+    "strata": {"type": "object"},
+    "blockers": {"type": "array", "items": {"type": "string"}}
+  }
+}

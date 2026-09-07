@@ -3,7 +3,6 @@ from pathlib import Path
 
 import yaml
 
-from contracts.fixtures import accept_formal_signal
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.models import ContentPublicationRunRow, ContentSnapshotRow, SignalOutboxRow
 from stock_content.api.readiness import _contract_inventory, _sql_projection_state
@@ -11,6 +10,7 @@ from stock_content.application.quality_report import QualityMetrics, evaluate_qu
 from stock_content.application.readiness_service import ReadinessDependencies, ReadinessService, SnapshotReadiness
 from stock_content.application.retention_service import RetentionService
 from stock_content.application.task_lease_service import TaskLeaseService
+from stock_content.contracts.fixtures import accept_formal_signal
 from stock_content.domain.retention_policy import RetentionPolicy
 from stock_content.domain.source_policy import AccessClassification, SourcePolicy, allow_source
 from stock_content.domain.task_run import Checkpoint, LeaseError

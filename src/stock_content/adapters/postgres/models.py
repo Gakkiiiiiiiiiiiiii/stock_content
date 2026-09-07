@@ -44,15 +44,52 @@ class ContentTaskRow(Base):
     max_retries: Mapped[int] = mapped_column(Integer, default=3)
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    fencing_token: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     options: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     input_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64))
+    task_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="video_pipeline", index=True)
+    source_platform: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy", index=True)
+    canonical_source_ref: Mapped[str | None] = mapped_column(Text)
+    credential_ref_hash: Mapped[str | None] = mapped_column(String(64))
+    locator_secret_hash: Mapped[str | None] = mapped_column(String(64))
+    source_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="0" * 64, index=True)
     trace_id: Mapped[str | None] = mapped_column(String(64), index=True)
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ContentTaskEffectRow(Base):
+    """Durable, idempotent intent for a task-owned business effect."""
+
+    __tablename__ = "content_task_effect"
+    __table_args__ = (UniqueConstraint("task_id", "effect_key", name="uq_content_task_effect_key"),)
+
+    effect_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("content_ingest_task.task_id", ondelete="CASCADE"), index=True)
+    effect_key: Mapped[str] = mapped_column(String(160))
+    effect_kind: Mapped[str] = mapped_column(String(64))
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    # The hash alone cannot replay a projection.  This payload is restricted
+    # to canonical IDs and non-secret effect metadata by EffectIntent callers.
+    projection_payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, nullable=False, default=dict)
+    fencing_token: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Projection effects outlive the ingestion lease.  A separate dispatch
+    # lease prevents two recovery workers from concurrently issuing the same
+    # external call while the deterministic Qdrant point ids provide the
+    # second, provider-side idempotency boundary.
+    dispatch_owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    dispatch_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class VideoAssetRow(Base):
@@ -479,6 +516,13 @@ class ClaimOccurrenceRow(Base):
     extractor_confidence: Mapped[float] = mapped_column(Float, default=0.0)
     raw_temporal_expressions: Mapped[list[Any]] = mapped_column(JSONPayload, default=list)
     provenance: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
+    primary_quote: Mapped[str | None] = mapped_column(Text)
+    normalized_statement: Mapped[str | None] = mapped_column(Text)
+    grounding_status: Mapped[str] = mapped_column(String(32), default="LEGACY_UNGROUNDED", index=True)
+    grounding_reason_codes: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    contradiction_group_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    claim_schema_version: Mapped[str] = mapped_column(String(40), default="claim.legacy.v1")
+    legacy_grounding_incomplete: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
 class ClaimOccurrenceEvidenceRow(Base):
@@ -537,6 +581,19 @@ class ContentSnapshotRow(Base):
     lifecycle_artifact_id: Mapped[str | None] = mapped_column(String(128), index=True)
 
 
+class ContentKnowledgeBundleRow(Base):
+    __tablename__ = "content_knowledge_bundle"
+    bundle_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    bundle_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    content_snapshot_id: Mapped[str] = mapped_column(String(80), index=True)
+    request_hash: Mapped[str] = mapped_column(String(80), index=True)
+    contract_version: Mapped[str] = mapped_column(String(80))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    producer_git_commit: Mapped[str] = mapped_column(String(128))
+    pipeline_version: Mapped[str] = mapped_column(String(80))
+
+
 class ContentArtifactRow(Base):
     __tablename__ = "content_artifact"
     __table_args__ = (
@@ -563,6 +620,20 @@ class SourceArtifactMetadataRow(Base):
     content_size: Mapped[int] = mapped_column(Integer)
     mime_type: Mapped[str] = mapped_column(String(128))
     encryption_key_id: Mapped[str | None] = mapped_column(String(128))
+    # SQL Bundle provenance is normalized here, not reconstructed from an
+    # arbitrary artifact JSON blob at read time.
+    canonical_url: Mapped[str | None] = mapped_column(Text)
+    source_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    source_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    source_part: Mapped[str | None] = mapped_column(String(128))
+    source_identity_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    source_version_id: Mapped[str | None] = mapped_column(String(128))
+    author: Mapped[str | None] = mapped_column(String(255))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    business_as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    source_available_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    pipeline_version: Mapped[str | None] = mapped_column(String(128))
+    service_version: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -574,6 +645,45 @@ class ArtifactTombstoneRow(Base):
     policy_version: Mapped[str] = mapped_column(String(80))
     request_id: Mapped[str] = mapped_column(String(128))
     deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RetentionExecutionRow(Base):
+    """Locator-free durable retention intent and completion audit."""
+
+    __tablename__ = "retention_execution"
+    __table_args__ = (UniqueConstraint("artifact_id", name="uq_retention_execution_artifact"),)
+
+    tombstone_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    artifact_id: Mapped[str] = mapped_column(String(96), index=True)
+    artifact_class: Mapped[str] = mapped_column(String(64))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    source_identity_hash: Mapped[str] = mapped_column(String(64))
+    audit_lineage_id: Mapped[str] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(String(64))
+    expired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="DELETE_PENDING", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RetentionArtifactLocatorRow(Base):
+    """Trusted private-root mapping for the retention worker.
+
+    This is deliberately separate from public artifact payloads and tombstone
+    audit rows.  Only a private-root id and a relative object name are stored;
+    a caller can never provide a filesystem path to the deletion endpoint.
+    """
+
+    __tablename__ = "retention_artifact_locator"
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("content_artifact.artifact_id", ondelete="CASCADE"), primary_key=True
+    )
+    private_root_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    relative_locator: Mapped[str] = mapped_column(String(512), nullable=False)
+    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ContentArtifactEdgeRow(Base):
@@ -624,6 +734,11 @@ class FinancialClaimRow(Base):
     # Claims that predate the append-only ClaimStateEvent stream are denied
     # formal historical projection until an explicit backfill is completed.
     legacy_history_incomplete: Mapped[bool] = mapped_column(Boolean, default=False)
+    normalized_statement: Mapped[str | None] = mapped_column(Text)
+    grounding_status: Mapped[str] = mapped_column(String(32), default="LEGACY_UNGROUNDED", index=True)
+    grounding_reason_codes: Mapped[list[str]] = mapped_column(JSONPayload, default=list)
+    contradiction_group_id: Mapped[str | None] = mapped_column(String(96), index=True)
+    legacy_grounding_incomplete: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONPayload, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

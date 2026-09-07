@@ -15,6 +15,10 @@ from stock_content.adapters.postgres.repositories.claim_repository import (
 from stock_content.adapters.postgres.repositories.content_task_repository import PostgresContentTaskRepository
 from stock_content.adapters.postgres.repositories.entity_repository import PostgresFinancialEntityRepository
 from stock_content.adapters.postgres.repositories.financial_repository import PostgresFinancialRepository
+from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
+    PostgresKnowledgeBundleAuthority,
+    PostgresKnowledgeBundleRepository,
+)
 from stock_content.adapters.postgres.repositories.knowledge_repository import PostgresKnowledgeRepository
 from stock_content.adapters.postgres.repositories.lifecycle_repository import LifecycleRepository
 from stock_content.adapters.postgres.repositories.multimodal_repository import PostgresMultimodalRepository
@@ -65,4 +69,6 @@ __all__ = [
     "VerificationJobIntegrityError",
     "SignalOutboxRepository",
     "SignalOutboxIntegrityError",
+    "PostgresKnowledgeBundleAuthority",
+    "PostgresKnowledgeBundleRepository",
 ]

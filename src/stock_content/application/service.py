@@ -6,6 +6,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from stock_content.application.conflict_service import ConflictService
@@ -17,29 +18,99 @@ from stock_content.application.pipeline import ContentPipeline, PipelineContext
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
+from stock_content.application.source_resolution_service import request_hash_for, source_identity_hash_for
 from stock_content.application.stages import cleanup_work_directory
+from stock_content.application.transcript_quality_service import TranscriptQualityService
 from stock_content.application.verification_service import VerificationService, run_verification_pass
 from stock_content.domain.artifacts import serialize_artifact
 from stock_content.domain.bitemporal_query import FormalContentSignalQueryV2
 from stock_content.domain.claims import FinancialClaim
 from stock_content.domain.governance_evidence import GovernanceEvidenceError, validate_governance_evidence
 from stock_content.domain.models import ContentTask, TranscriptSegment
+from stock_content.domain.security_redaction import contains_sensitive_value, redact_text
+from stock_content.domain.source_materialization import ContentIngestionCommand
 from stock_content.domain.source_policy import allow_source, policy_for_source
+from stock_content.domain.transcript_candidate import AlignmentStatus, TranscriptCandidateSegment, TranscriptSource
+from stock_content.domain.worker_capability import TaskKind
 from stock_content.ports.repositories import (
     ChapterRepository,
     ContentTaskRepository,
     KnowledgeIndex,
     KnowledgeRepository,
+    StaleTaskLease,
     SummaryRepository,
     VideoRepository,
 )
 
 LOGGER = logging.getLogger(__name__)
 
+_EPHEMERAL_URL_KEYS = frozenset({"signature", "sig", "token", "expires", "x-amz-signature", "x-amz-credential"})
+
+
+def _assert_checkpoint_has_no_signed_url(value: Any) -> None:
+    """Fail closed before a transient resolver URL reaches durable state."""
+    if isinstance(value, dict):
+        for item in value.values():
+            _assert_checkpoint_has_no_signed_url(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_checkpoint_has_no_signed_url(item)
+    elif isinstance(value, str):
+        parsed = urlsplit(value)
+        if parsed.scheme and any(key.lower() in _EPHEMERAL_URL_KEYS for key, _ in parse_qsl(parsed.query)):
+            raise ValueError("CHECKPOINT_CONTAINS_SECRET_OR_SIGNED_LOCATOR: EPHEMERAL_SIGNED_URL")
+    if contains_sensitive_value(value):
+        raise ValueError("CHECKPOINT_CONTAINS_SECRET_OR_SIGNED_LOCATOR")
+
 
 def source_identity_hash_of(source_type: str, source_ref: str) -> str:
     """§4 P0-3：source_identity_hash —— 判断是否是同一来源。"""
     return hashlib.sha256(f"{source_type}:{source_ref}".encode("utf-8")).hexdigest()
+
+
+def _restored_transcript_quality(context: PipelineContext, transcript) -> Any:
+    """Rebuild the deterministic quality gate from the frozen transcript.
+
+    Transcript selection stores its authoritative bytes in TranscriptArtifact;
+    the in-memory report is intentionally not a checkpoint payload.  A resumed
+    validator must nevertheless use the same quality gate as the original
+    attempt, rather than silently treating it as NOT_PASS.
+    """
+    segments = []
+    for item in transcript.segments:
+        try:
+            source = TranscriptSource(str(item.source))
+        except ValueError:
+            source = TranscriptSource.ASR
+        try:
+            alignment = AlignmentStatus(str(item.alignment_status))
+        except ValueError:
+            alignment = AlignmentStatus.ALIGNED
+        segments.append(
+            TranscriptCandidateSegment(
+                source=source,
+                source_artifact_id=str(item.source_artifact_id or transcript.artifact_id),
+                start_ms=round(float(item.start_seconds) * 1000),
+                end_ms=round(float(item.end_seconds) * 1000),
+                raw_text=str(item.raw_text or item.text),
+                normalized_text=str(item.normalized_text or item.text),
+                confidence=float(item.confidence or 0.0),
+                alignment_status=alignment,
+            )
+        )
+    metadata = dict(context.state.metadata or {})
+    duration_ms = context.options.get("duration_ms") or metadata.get("duration_ms")
+    if duration_ms is None and metadata.get("duration_seconds") is not None:
+        duration_ms = float(metadata["duration_seconds"]) * 1000
+    if duration_ms is None and context.artifacts.media is not None:
+        duration_ms = context.artifacts.media.duration_ms
+    if duration_ms is None:
+        duration_ms = max((item.end_ms for item in segments), default=0)
+    return TranscriptQualityService().evaluate(
+        tuple(segments),
+        duration_ms=round(float(duration_ms)),
+        language=str(transcript.language or context.options.get("language") or "zh"),
+    )
 
 
 class ContentApplication:
@@ -66,6 +137,10 @@ class ContentApplication:
         claim_event_repository: Any | None = None,
         historical_projector: HistoricalClaimProjector | None = None,
         task_lease_service: Any | None = None,
+        knowledge_bundle_service: Any | None = None,
+        retention_scheduler: Any | None = None,
+        retention_status: str = "RETENTION_DISABLED",
+        knowledge_projection_dispatcher: Any | None = None,
     ) -> None:
         self._tasks = task_repository
         self._videos = video_repository
@@ -109,6 +184,10 @@ class ContentApplication:
         self._signal_service = signal_service or SignalService()
         self._claim_event_repository = claim_event_repository
         self._historical_projector = historical_projector
+        self._knowledge_bundle_service = knowledge_bundle_service
+        self._retention_scheduler = retention_scheduler
+        self._retention_status = retention_status
+        self._knowledge_projection_dispatcher = knowledge_projection_dispatcher
         if self._verification_jobs is None and self._claim_repository is not None:
             sessions = getattr(self._claim_repository, "_sessions", None)
             if sessions is not None:
@@ -138,12 +217,45 @@ class ContentApplication:
         self._conflict_service = ConflictService()
         self._claims_registry: dict[str, FinancialClaim] = {}
 
+    def create_knowledge_bundle(self, request: Any) -> dict:
+        if self._knowledge_bundle_service is None:
+            raise ValueError("KNOWLEDGE_BUNDLE_PRODUCER_NOT_CONFIGURED")
+        return self._knowledge_bundle_service.create(request)
+
+    def get_knowledge_bundle(self, bundle_id: str) -> dict | None:
+        return None if self._knowledge_bundle_service is None else self._knowledge_bundle_service.get(bundle_id)
+
+    def dispatch_knowledge_projections(self, worker_id: str, *, limit: int = 20) -> dict[str, int] | None:
+        """Advance optional Qdrant work without changing ingestion outcomes."""
+        if self._knowledge_projection_dispatcher is None:
+            return None
+        return self._knowledge_projection_dispatcher.dispatch_due(worker_id, limit=limit)
+
     def enqueue(self, source_type: str, source_ref: str, options: dict | None = None) -> dict:
         options = options or {}
+        # Internal compatibility API. HTTP ingress uses the stricter
+        # ``SourceResolutionService`` adapters; pipeline/replay callers may
+        # carry deterministic fixture controls not exposed on the public API.
+        return self.enqueue_ingestion(ContentIngestionCommand(
+            source_type=source_type,
+            canonical_source_ref=source_ref,
+            part=options.get("part"),
+            transcript_policy=str(options.get("transcript_policy") or "subtitle_first"),
+            options={key: value for key, value in options.items() if key not in {
+                "idempotency_key", "part", "transcript_policy", "trace_id", "decision_id",
+            }},
+            idempotency_key=str(options.get("idempotency_key") or "") or None,
+            trace_id=str(options.get("trace_id") or "") or None,
+            decision_id=str(options.get("decision_id") or "") or None,
+        ))
+
+    def enqueue_ingestion(self, command: ContentIngestionCommand) -> dict:
+        """Persist only the canonical, non-secret command projection."""
+        options = dict(command.options)
         if options.get("enforce_source_policy"):
-            policy = policy_for_source(source_type)
+            policy = policy_for_source(command.source_type)
             if not allow_source(policy, "ingest"):
-                raise ValueError(f"source policy denied ingestion: {source_type}")
+                raise ValueError(f"source policy denied ingestion: {command.source_type}")
             if options.get("source_policy_version") != policy.policy_version:
                 raise ValueError("source policy version is required and must match the active policy")
         if self._pipeline_config:
@@ -158,17 +270,24 @@ class ContentApplication:
         #   request_idempotency_key —— 防 HTTP 重试重复创建任务；
         #   source_identity_hash   —— 是否同一来源；
         #   source_content_hash    —— 源内容本身是否变更（由调用方或 resolve 阶段提供）。
-        request_idempotency_key = str(options.get("idempotency_key") or "") or None
-        identity_hash = source_identity_hash_of(source_type, source_ref)
+        request_idempotency_key = command.idempotency_key
+        identity_hash = source_identity_hash_for(command.source_type, command.canonical_source_ref)
+        request_hash = request_hash_for(command)
         source_content_hash = str(options.get("source_content_hash") or "") or None
         task = ContentTask(
             task_id=uuid4().hex,
-            source_type=source_type,
-            source_ref=source_ref,
+            source_type=command.source_type,
+            source_ref=command.canonical_source_ref,
             options=options,
             input_hash=identity_hash,
             idempotency_key=request_idempotency_key,
-            trace_id=str(options.get("trace_id") or "") or None,
+            request_hash=request_hash,
+            source_platform=command.source_type,
+            canonical_source_ref=command.canonical_source_ref,
+            credential_ref_hash=command.credential_ref_hash,
+            locator_secret_hash=command.locator_secret_hash,
+            source_identity_hash=identity_hash,
+            trace_id=command.trace_id,
         )
         created = self._tasks.create(task)
         return {
@@ -184,10 +303,34 @@ class ContentApplication:
         task = self._tasks.get(task_id)
         return task.to_dict() if task else None
 
-    def process_next(self, worker_id: str, lease_seconds: int = 900) -> dict | None:
-        task = self._tasks.claim_pending(worker_id, lease_seconds)
+    def process_next(
+        self,
+        worker_id: str,
+        task_kind: TaskKind = TaskKind.VIDEO_PIPELINE,
+        lease_seconds: int = 900,
+    ) -> dict | None:
+        """Process one explicitly-routed task under its content-task fence."""
+        task = self._tasks.claim_pending(
+            worker_id=worker_id,
+            task_kind=task_kind.value,
+            lease_seconds=lease_seconds,
+        )
         if task is None:
             return None
+        fencing_token = task.fencing_token
+
+        def heartbeat() -> None:
+            self._tasks.renew_lease(task.task_id, worker_id, fencing_token, lease_seconds)
+
+        def progress(stage: str, value: int) -> None:
+            heartbeat()
+            self._tasks.update_progress(task.task_id, stage, value, worker_id, fencing_token)
+
+        def checkpoint(stage: str, value: dict, progress_value: int) -> None:
+            heartbeat()
+            _assert_checkpoint_has_no_signed_url(value)
+            self._tasks.checkpoint(task.task_id, stage, value, worker_id, fencing_token, progress_value)
+
         task_lease = None
         if self._task_lease_service is not None:
             existing_run = self._task_lease_service.repository.get(task.task_id)
@@ -197,19 +340,28 @@ class ContentApplication:
         context = PipelineContext(
             task_id=task.task_id,
             source={"type": task.source_type, "ref": task.source_ref},
-            options=task.options,
+            options={
+                **task.options,
+                # The hash is a durable, one-way selector into the worker's
+                # explicit credential allowlist; never put the reference or
+                # storage-state content into queue/task/checkpoint data.
+                **({"credential_ref_hash": task.credential_ref_hash} if task.credential_ref_hash else {}),
+            },
             trace={
                 key: str(getattr(task, key, None) or task.options.get(key) or "")
                 for key in ("trace_id", "decision_id")
                 if getattr(task, key, None) or task.options.get(key)
             },
+            heartbeat=heartbeat,
+            worker_id=worker_id,
+            fencing_token=fencing_token,
         )
         try:
             resume = self._restore_resume_context(context, task)
             result = self._pipeline.process(
                 context,
-                lambda stage, progress: self._tasks.update_progress(task.task_id, stage, progress),
-                lambda stage, checkpoint, progress: self._tasks.checkpoint(task.task_id, stage, checkpoint, progress),
+                progress,
+                checkpoint,
                 resume=resume,
             )
             payload = {
@@ -222,7 +374,10 @@ class ContentApplication:
             # pipeline 已生成的 typed Artifact 记录；失败时 pipeline 异常 → task FAILED。
             snapshot_id = result.state.content_snapshot_id
             if not snapshot_id:
-                self._tasks.fail(task.task_id, "content_snapshot", "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot")
+                self._tasks.fail(
+                    task.task_id, "content_snapshot", "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot",
+                    worker_id, fencing_token,
+                )
                 return {
                     "task_id": task.task_id,
                     "status": "FAILED",
@@ -230,12 +385,28 @@ class ContentApplication:
                     "error": "CONTENT_SNAPSHOT_PERSIST_FAILED: missing snapshot",
                 }
             payload["content_snapshot_id"] = snapshot_id
-            self._tasks.succeed(task.task_id, payload)
+            # ``commit_effect`` is deliberately the final queue acknowledgement:
+            # a competing or expired worker cannot record a second terminal
+            # publication effect merely by racing the final status update.
+            self._tasks.commit_effect(task.task_id, payload, worker_id, fencing_token)
             if task_lease is not None:
                 self._task_lease_service.transition(task.task_id, "SUCCEEDED", worker_id, task_lease.fencing_token)
             return {"task_id": task.task_id, "status": "SUCCEEDED", **payload}
+        except StaleTaskLease:
+            # Never turn a superseded attempt into a retry: its task writes and
+            # terminal acknowledgement belong solely to the current fence.
+            return {"task_id": task.task_id, "status": "LEASE_LOST"}
         except Exception as exc:
-            self._tasks.fail(task.task_id, context.current_stage, f"{type(exc).__name__}: {exc}")
+            # Worker adapters may receive ephemeral signed locators at runtime.
+            # Keep their diagnostics out of the durable task failure and HTTP
+            # result even if an unexpected dependency echoes an input URL.
+            safe_error = redact_text(f"{type(exc).__name__}: {exc}")
+            try:
+                self._tasks.fail(
+                    task.task_id, context.current_stage, safe_error, worker_id, fencing_token,
+                )
+            except StaleTaskLease:
+                return {"task_id": task.task_id, "status": "LEASE_LOST"}
             if task_lease is not None:
                 try:
                     self._task_lease_service.transition(task.task_id, "FAILED", worker_id, task_lease.fencing_token)
@@ -245,7 +416,7 @@ class ContentApplication:
                 "task_id": task.task_id,
                 "status": "FAILED",
                 "stage": context.current_stage,
-                "error": str(exc),
+                "error": safe_error,
             }
         finally:
             cleanup_work_directory(context)
@@ -269,18 +440,13 @@ class ContentApplication:
             "frame",
             "audio",
             "asr",
+            "transcript_candidate",
+            "transcript_selection",
+            "transcript_quality",
             "diarization",
             "transcript_postprocess",
             "ocr",
             "vision",
-            "semantic_segmentation",
-            "semantic_context",
-            "atomic_claim_extraction",
-            "evidence_grounding",
-            "temporal_normalization",
-            "claim_canonicalization",
-            "claim_occurrence_persistence",
-            "lifecycle_projection",
         }
         prefix: list[Any] = []
         for record in records:
@@ -377,7 +543,13 @@ class ContentApplication:
         source = context.artifacts.source
         transcript = context.artifacts.transcript
         if source:
-            context.state.metadata = dict(source.source_metadata or {})
+            # Resume the same request metadata seen by the original pipeline.
+            # SourceArtifact metadata is enriched after resolution (and may
+            # contain a processing-time availability clock), so replacing the
+            # request envelope with it changes downstream model validation on
+            # a cross-process retry.  Use it only when the task carried no
+            # explicit metadata at all.
+            context.state.metadata = dict(context.options.get("metadata") or source.source_metadata or {})
         if transcript:
             context.state.segments = [
                 TranscriptSegment(
@@ -391,6 +563,7 @@ class ContentApplication:
                 for item in transcript.segments
             ]
             context.state.transcript = " ".join(item.text for item in context.state.segments)
+            context.state.transcript_quality_report = _restored_transcript_quality(context, transcript)
         context.state.frames = [
             {
                 "frame_id": item.frame_id,

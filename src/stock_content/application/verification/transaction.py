@@ -271,8 +271,20 @@ class VerificationTransactionMixin:
             job.lease_expires_at = None
             job.next_retry_at = None
             # ``head`` was locked before parent validation and remains locked
-            # until commit.  Never let an older completion move it backwards.
-            if head is None or parent_is_locked_head:
+            # until commit.  A valid child of that exact locked parent advances
+            # the head even when the immutable effective/PIT timestamp is
+            # equal to the parent's timestamp.  Comparing child ids here
+            # would make a hash lexical tie-breaker silently discard a valid
+            # refresh.  Conversely, a stale or unrelated branch never gets
+            # this path: it did not merge against the locked current head.
+            if head is not None and parent_is_locked_head:
+                if head.latest_snapshot_id != parent.content_snapshot_id:
+                    raise VerificationJobIntegrityError("source head changed during locked refresh")
+                head.latest_snapshot_id = refreshed.content_snapshot_id
+                head.updated_at = refreshed.created_at
+                if effective_result.status in {"VERIFIED", "PARTIALLY_VERIFIED"}:
+                    head.latest_verified_snapshot_id = refreshed.content_snapshot_id
+            elif head is None:
                 _upsert_source_head(
                     session,
                     source_identity_hash=source_hash,

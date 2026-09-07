@@ -17,6 +17,9 @@ class PostgresVerificationRepository:
 
     def append(self, units: list[KnowledgeUnit], trace_id: str | None = None) -> None:
         with self._sessions.begin() as session:
+            self.append_in_session(session, units, trace_id)
+
+    def append_in_session(self, session, units: list[KnowledgeUnit], trace_id: str | None = None) -> None:
             for unit in units:
                 verification = dict((unit.attributes or {}).get("verification") or {})
                 judge = dict(verification.get("judge") or {})

@@ -62,6 +62,19 @@ class ClaimStateEvent:
             "legacy_history_incomplete": self.legacy_history_incomplete,
         }
 
+    def logical_identity_payload(self) -> dict[str, Any]:
+        """Return the immutable business identity without chain placement.
+
+        The predecessor is deliberately excluded: a replay must recognize an
+        initial projection already published at the former chain tail instead
+        of turning the same business event into a second history node.
+        """
+        return {
+            key: value
+            for key, value in self.identity_payload().items()
+            if key != "previous_event_hash"
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {**self.identity_payload(), "event_id": self.event_id, "event_hash": self.event_hash}
 
@@ -123,6 +136,11 @@ def validate_event_chain(events: Iterable[ClaimStateEvent]) -> tuple[ClaimStateE
     return tuple(ordered)
 
 
+def event_logical_identity(event: ClaimStateEvent) -> str:
+    """Canonical, chain-independent key used for idempotent projections."""
+    return canonical_json(event.logical_identity_payload())
+
+
 def _require_utc(value: datetime, field: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None or value.utcoffset() != UTC.utcoffset(value):
         raise ValueError(f"{field} must be timezone-aware UTC")
@@ -136,4 +154,4 @@ def _sort_time(value: datetime | None) -> datetime:
     return value or datetime.min.replace(tzinfo=UTC)
 
 
-__all__ = ["ClaimStateEvent", "validate_event_chain"]
+__all__ = ["ClaimStateEvent", "event_logical_identity", "validate_event_chain"]

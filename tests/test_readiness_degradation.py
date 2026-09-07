@@ -109,10 +109,11 @@ def test_readiness_endpoint_exposes_capabilities_and_reason_codes() -> None:
     assert payload["search"]["blocking_reasons"] == ["index_rebuilding"]
 
 
-def test_compose_keeps_qdrant_a_started_dependency_while_postgres_is_authoritative() -> None:
+def test_compose_keeps_qdrant_optional_while_postgres_is_authoritative() -> None:
     compose_path = Path(__file__).parents[1] / "docker-compose.yml"
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
     dependencies = compose["services"]["stock-content"]["depends_on"]
 
     assert dependencies["postgres"]["condition"] == "service_healthy"
-    assert dependencies["qdrant"]["condition"] == "service_started"
+    assert "qdrant" not in dependencies
+    assert compose["services"]["qdrant"]["profiles"] == ["search"]

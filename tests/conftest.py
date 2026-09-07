@@ -9,6 +9,12 @@ from __future__ import annotations
 
 import pytest
 
+# PostgreSQL acceptance fixtures are intentionally opt-in, but they must be
+# registered at the test root.  Registering them only from
+# ``tests/postgres/conftest.py`` makes fixture visibility depend on which
+# command-line path pytest happens to collect first.
+pytest_plugins = ("tests.postgres.conftest",)
+
 
 @pytest.fixture(autouse=True)
 def prepared_application_database(monkeypatch):

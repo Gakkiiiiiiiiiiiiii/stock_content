@@ -14,29 +14,38 @@ class PostgresVideoRepository:
 
     def upsert(self, video: VideoAsset, segments: list[TranscriptSegment]) -> None:
         with self._sessions.begin() as session:
-            row = session.get(VideoAssetRow, video.video_id)
-            values = vars(video).copy()
-            values["source_metadata"] = values.pop("metadata")
-            if row is None:
-                row = VideoAssetRow(**values)
-                session.add(row)
-            else:
-                for name, value in values.items():
-                    setattr(row, name, value)
-            session.execute(delete(VideoSegmentRow).where(VideoSegmentRow.video_id == video.video_id))
-            rows = []
-            for segment in segments:
-                segment_values = vars(segment).copy()
-                if not segment_values.get("segment_id"):
-                    segment_values["segment_id"] = legacy_transcript_segment_id(
-                        segment.segment_index,
-                        segment.start_seconds,
-                        segment.end_seconds,
-                        segment.raw_text or segment.text,
-                        legacy_namespace=video.video_id,
-                    )
-                rows.append(VideoSegmentRow(video_id=video.video_id, **segment_values))
-            session.add_all(rows)
+            self.upsert_in_session(session, video, segments)
+
+    def upsert_in_session(self, session, video: VideoAsset, segments: list[TranscriptSegment]) -> None:
+        row = session.get(VideoAssetRow, video.video_id)
+        values = vars(video).copy()
+        values["source_metadata"] = values.pop("metadata")
+        if row is None:
+            row = VideoAssetRow(**values)
+            session.add(row)
+        else:
+            for name, value in values.items():
+                setattr(row, name, value)
+        session.execute(delete(VideoSegmentRow).where(VideoSegmentRow.video_id == video.video_id))
+        rows = []
+        for segment in segments:
+            segment_values = vars(segment).copy()
+            # Candidate provenance belongs to the immutable Transcript
+            # artifact.  The legacy video_segment projection has no
+            # corresponding columns and must remain schema-compatible.
+            segment_values.pop("source", None)
+            segment_values.pop("source_artifact_id", None)
+            segment_values.pop("alignment_status", None)
+            if not segment_values.get("segment_id"):
+                segment_values["segment_id"] = legacy_transcript_segment_id(
+                    segment.segment_index,
+                    segment.start_seconds,
+                    segment.end_seconds,
+                    segment.raw_text or segment.text,
+                    legacy_namespace=video.video_id,
+                )
+            rows.append(VideoSegmentRow(video_id=video.video_id, **segment_values))
+        session.add_all(rows)
 
     def get(self, video_id: str) -> dict | None:
         with self._sessions() as session:

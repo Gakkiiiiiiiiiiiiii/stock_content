@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
-import re
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
+from stock_content.adapters.credentials.file_secret_provider import FileSecretProvider, SecretUnavailable
+from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer, MaterializedMedia
+from stock_content.adapters.sources.bilibili_resolver import BilibiliResolver, canonical_bilibili_url
 from stock_content.adapters.sources.security import preflight_source_url, safe_download_url, validate_source_url
+from stock_content.domain.source_materialization import SourceMaterialization
 
 BILIBILI_ALLOWED_DOMAINS = frozenset(
     {"bilibili.com", "www.bilibili.com", "b23.tv", "bilibili.tv", "bilivideo.com", "biliapi.com"}
@@ -18,20 +21,21 @@ BILIBILI_ALLOWED_DOMAINS = frozenset(
 class BilibiliSourceAdapter:
     """Bilibili adapter backed by yt-dlp, loaded only in the media worker."""
 
+    def __init__(self, *, credential_provider: FileSecretProvider | None = None) -> None:
+        self._credential_provider = credential_provider
+
+    @classmethod
+    def from_environment(cls) -> "BilibiliSourceAdapter":
+        reference = os.getenv("CONTENT_BILIBILI_CREDENTIAL_REF", "").strip()
+        cookiefile = os.getenv("CONTENT_BILIBILI_COOKIEFILE", "").strip()
+        provider = FileSecretProvider({reference: cookiefile}) if reference and cookiefile else None
+        return cls(credential_provider=provider)
+
     @staticmethod
     def _url(source_ref: str) -> str:
-        if not re.fullmatch(r"BV[0-9A-Za-z]+", source_ref):
-            parsed = urlparse(source_ref)
-            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-                raise ValueError("invalid Bilibili URL or BV id")
-            if parsed.hostname.lower().rstrip(".") not in {"bilibili.com", "www.bilibili.com"}:
-                # Preserve the stable URL-policy error for untrusted input.
-                validate_source_url(source_ref, allowed_domains=BILIBILI_ALLOWED_DOMAINS, resolve_host=False)
-            match = re.fullmatch(r"/video/(BV[0-9A-Za-z]+)/?", parsed.path)
-            if match is None or parsed.username is not None or parsed.password is not None:
-                raise ValueError("invalid Bilibili canonical URL")
-            source_ref = match.group(1)
-        return f"https://www.bilibili.com/video/{source_ref}"
+        # Share the exact BV/AV/b23/page handling used by the materialization
+        # resolver.  Redirect expansion remains there, behind URL policy.
+        return canonical_bilibili_url(source_ref)[0]
 
     @staticmethod
     def _run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -39,13 +43,17 @@ class BilibiliSourceAdapter:
         try:
             return subprocess.run(command, check=True, capture_output=True, text=True, encoding="utf-8")
         except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise RuntimeError(f"yt-dlp failed: {detail[-1500:]}") from exc
+            # Extractor diagnostics can echo a cookie-file path, redirect, or
+            # signed media URL.  Persist/log only the stable public code.
+            raise RuntimeError("BILIBILI_RESOLUTION_FAILED") from exc
 
     def resolve(self, source_ref: str) -> dict[str, Any]:
         url = self._url(source_ref)
         checked_url = preflight_source_url(url)
-        completed = self._run(["--dump-single-json", "--skip-download", "--no-playlist", checked_url])
+        completed = self._run([
+            "--ignore-config", "--use-extractors", "Bilibili", "--dump-single-json", "--skip-download", "--no-playlist",
+            checked_url,
+        ])
         payload = json.loads(completed.stdout)
         return {
             "source_ref": url,
@@ -55,6 +63,43 @@ class BilibiliSourceAdapter:
             "duration_seconds": payload.get("duration"),
             "published_at": payload.get("timestamp"),
         }
+
+    def resolve_materialization(
+        self, source_ref: str, *, part: int | None = None, credential_ref_hash: str | None = None
+    ) -> SourceMaterialization:
+        """New ephemeral resolution seam; legacy pipeline methods stay compatible."""
+        def extract(arguments: list[str]) -> dict[str, Any]:
+            return json.loads(self._run(arguments).stdout)
+
+        cookiefile = None
+        if credential_ref_hash:
+            if self._credential_provider is None:
+                raise RuntimeError("SOURCE_SESSION_EXPIRED")
+            try:
+                cookiefile = self._credential_provider.resolve_hash(credential_ref_hash)
+            except SecretUnavailable as exc:
+                raise RuntimeError(exc.code) from exc
+        return BilibiliResolver(extractor=extract, cookiefile=cookiefile).resolve(source_ref, part=part)
+
+    def materialize(
+        self,
+        materialization: SourceMaterialization,
+        target_dir: Path,
+        *,
+        request_video: bool = True,
+        expected_duration: float | None = None,
+        expected_sha256: str | None = None,
+        reresolve: Any | None = None,
+    ) -> MaterializedMedia:
+        """Register the safe materializer without placing locators in pipeline state."""
+        return BilibiliMaterializer().materialize(
+            materialization,
+            target_dir,
+            request_video=request_video,
+            expected_duration=expected_duration,
+            expected_sha256=expected_sha256,
+            reresolve=reresolve,
+        )
 
     @staticmethod
     def _media_streams(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -106,7 +151,15 @@ class BilibiliSourceAdapter:
         target_dir.mkdir(parents=True, exist_ok=True)
         checked_url = preflight_source_url(self._url(source_ref))
         metadata = json.loads(
-            self._run(["--dump-single-json", "--skip-download", "--no-playlist", checked_url]).stdout
+            self._run([
+                "--ignore-config",
+                "--use-extractors",
+                "Bilibili",
+                "--dump-single-json",
+                "--skip-download",
+                "--no-playlist",
+                checked_url,
+            ]).stdout
         )
         streams = self._media_streams(metadata)
         for stream in streams:

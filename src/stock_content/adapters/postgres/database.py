@@ -22,6 +22,11 @@ from stock_content.domain.artifacts import legacy_transcript_segment_id
 class SchemaNotReadyError(RuntimeError):
     """Raised when a deployment has not applied the schema required by this release."""
 
+    code = "SCHEMA_NOT_READY"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{self.code}: {message}")
+
 
 class Database:
     """Owns the Content database engine and transaction boundary."""
@@ -134,6 +139,13 @@ class Database:
                 "schema_version": "VARCHAR(48)",
                 "lease_owner": "VARCHAR(128)",
                 "lease_expires_at": "TIMESTAMP",
+            },
+            "content_task_effect": {
+                "projection_payload": "JSON",
+                "dispatch_owner": "VARCHAR(128)",
+                "dispatch_expires_at": "TIMESTAMP",
+                "next_attempt_at": "TIMESTAMP",
+                "last_error_code": "VARCHAR(64)",
             },
         }
         with self.engine.begin() as connection:

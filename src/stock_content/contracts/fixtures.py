@@ -1,10 +1,9 @@
-"""Vendored strict consumer checks used by producer contract CI."""
+"""Installed fixtures for strict contract-consumer tests."""
 from __future__ import annotations
 
 from typing import Any
 
 from stock_content.domain.signal_contract_v5_1 import validate_signal_v5_1
-
 
 REQUIRED = frozenset({
     "contract", "contract_checksum", "authority", "formal_eligible", "signal_id",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+from pathlib import Path
 
 from stock_content.adapters.http import ContentModelClient, HttpExternalFactProvider, QuantExternalFactProvider
 from stock_content.adapters.media import (
@@ -20,6 +22,8 @@ from stock_content.adapters.postgres.repositories import (
     PostgresContentTaskRepository,
     PostgresFinancialEntityRepository,
     PostgresFinancialRepository,
+    PostgresKnowledgeBundleAuthority,
+    PostgresKnowledgeBundleRepository,
     PostgresKnowledgeRepository,
     PostgresMultimodalRepository,
     PostgresSummaryRepository,
@@ -36,10 +40,16 @@ from stock_content.adapters.postgres.repositories import (
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex, QdrantKnowledgeIndex
 from stock_content.adapters.reference import QuantTemporalReferenceAdapter
-from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter
+from stock_content.adapters.retention.sql_candidates import SqlRetentionCandidateRepository
+from stock_content.adapters.retention.sql_retention import SqlRetentionExecutionRepository
+from stock_content.adapters.sources import BilibiliSourceAdapter, XiaoeHlsSourceAdapter, XiaoePageSourceAdapter
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
+from stock_content.application.knowledge_bundle_service import BundleProducerMetadata, KnowledgeBundleService
+from stock_content.application.knowledge_projection_dispatcher import KnowledgeProjectionDispatcher
 from stock_content.application.pipeline import ContentPipeline
 from stock_content.application.publication_unit_of_work import PublicationUnitOfWork
+from stock_content.application.retention_scheduler import RetentionScheduler
+from stock_content.application.retention_service import RetentionService
 from stock_content.application.service import ContentApplication
 from stock_content.application.signal_service import SignalService
 from stock_content.application.snapshot_service import SnapshotService
@@ -47,6 +57,7 @@ from stock_content.application.stage_runner import wrap_all
 from stock_content.application.stages import (
     ASRStage,
     AtomicClaimExtractionStage,
+    AtomicClaimValidationStage,
     AudioStage,
     BuildVideoStage,
     ChapterStage,
@@ -71,7 +82,10 @@ from stock_content.application.stages import (
     SummaryStage,
     TemporalNormalizationStage,
     TemporalWindowStage,
+    TranscriptCandidateStage,
     TranscriptPostprocessStage,
+    TranscriptQualityStage,
+    TranscriptSelectionStage,
     VerificationStage,
     VisionStage,
 )
@@ -81,11 +95,14 @@ from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
+from stock_content.domain.retention import RetentionPolicy
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
 from stock_content.domain.signal_contract import validate_signal_v4
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_window_builder import TemporalWindowBuilder
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
+
+LOGGER = logging.getLogger(__name__)
 
 # P0 C-01：生产 Stage 版本常量（稳定、可追溯，断点恢复依赖版本兼容判定）。
 STAGE_VERSIONS: dict[str, str] = {
@@ -94,6 +111,9 @@ STAGE_VERSIONS: dict[str, str] = {
     "frame": "1.0.0",
     "audio": "1.0.0",
     "asr": "1.0.0",
+    "transcript_candidate": "1.0.0",
+    "transcript_selection": "1.0.0",
+    "transcript_quality": "1.0.0",
     "diarization": "1.0.0",
     "transcript_postprocess": "1.0.0",
     "ocr": "1.0.0",
@@ -103,6 +123,7 @@ STAGE_VERSIONS: dict[str, str] = {
     "semantic_segmentation": "1.0.0",
     "semantic_context": "1.0.0",
     "atomic_claim_extraction": "1.0.0",
+    "atomic_claim_validation": "1.0.0",
     "evidence_grounding": "1.0.0",
     "temporal_normalization": "final.1.0",
     "claim_canonicalization": "1.0.0",
@@ -143,15 +164,9 @@ def pipeline_config_from_env() -> dict[str, object]:
         "temporal_normalization_version": os.getenv(
             "CONTENT_TEMPORAL_NORMALIZATION_VERSION", "temporal-normalization.final.v1"
         ),
-        "semantic_global_max_safe_tokens": int(
-            os.getenv("CONTENT_SEMANTIC_GLOBAL_MAX_SAFE_TOKENS", "3200")
-        ),
-        "semantic_long_video_block_tokens": int(
-            os.getenv("CONTENT_SEMANTIC_LONG_VIDEO_BLOCK_TOKENS", "3200")
-        ),
-        "semantic_block_overlap_segments": int(
-            os.getenv("CONTENT_SEMANTIC_BLOCK_OVERLAP_SEGMENTS", "2")
-        ),
+        "semantic_global_max_safe_tokens": int(os.getenv("CONTENT_SEMANTIC_GLOBAL_MAX_SAFE_TOKENS", "3200")),
+        "semantic_long_video_block_tokens": int(os.getenv("CONTENT_SEMANTIC_LONG_VIDEO_BLOCK_TOKENS", "3200")),
+        "semantic_block_overlap_segments": int(os.getenv("CONTENT_SEMANTIC_BLOCK_OVERLAP_SEGMENTS", "2")),
         "legacy_chapter_extraction_enabled": _env_bool("CONTENT_LEGACY_CHAPTER_EXTRACTION_ENABLED", False),
         "public_pit_default_mode": os.getenv("CONTENT_PUBLIC_PIT_DEFAULT_MODE", "PUBLIC_STRICT"),
         # Compatibility aliases retained for callers using the first draft.
@@ -162,18 +177,23 @@ def pipeline_config_from_env() -> dict[str, object]:
     # Keep the disabled/offline configuration byte-for-byte compatible with
     # historical snapshot identities.  Reference settings enter the config
     # hash only when the feature is explicitly configured.
-    if _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False) or any(os.getenv(name) is not None for name in (
-        "CONTENT_TEMPORAL_REFERENCE_REQUIRED", "CONTENT_TEMPORAL_REFERENCE_URL", "CONTENT_TEMPORAL_REFERENCE_API_KEY",
-        "CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS",
-    )):
-        config.update({
-            "temporal_reference_enabled": _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False),
-            "temporal_reference_required": _env_bool("CONTENT_TEMPORAL_REFERENCE_REQUIRED", False),
-            "temporal_reference_url": os.getenv("CONTENT_TEMPORAL_REFERENCE_URL", ""),
-            "temporal_reference_timeout_seconds": os.getenv(
-                "CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS", "10"
-            ),
-        })
+    if _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False) or any(
+        os.getenv(name) is not None
+        for name in (
+            "CONTENT_TEMPORAL_REFERENCE_REQUIRED",
+            "CONTENT_TEMPORAL_REFERENCE_URL",
+            "CONTENT_TEMPORAL_REFERENCE_API_KEY",
+            "CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS",
+        )
+    ):
+        config.update(
+            {
+                "temporal_reference_enabled": _env_bool("CONTENT_TEMPORAL_REFERENCE_ENABLED", False),
+                "temporal_reference_required": _env_bool("CONTENT_TEMPORAL_REFERENCE_REQUIRED", False),
+                "temporal_reference_url": os.getenv("CONTENT_TEMPORAL_REFERENCE_URL", ""),
+                "temporal_reference_timeout_seconds": os.getenv("CONTENT_TEMPORAL_REFERENCE_TIMEOUT_SECONDS", "10"),
+            }
+        )
     return config
 
 
@@ -198,9 +218,7 @@ def build_application(
     if reference_provider is None and bool(config.get("temporal_reference_enabled", False)):
         url = str(config.get("temporal_reference_url", "") or "").strip()
         if not url:
-            raise ValueError(
-                "CONTENT_TEMPORAL_REFERENCE_URL is required when temporal reference provider is enabled"
-            )
+            raise ValueError("CONTENT_TEMPORAL_REFERENCE_URL is required when temporal reference provider is enabled")
         try:
             timeout = float(config.get("temporal_reference_timeout_seconds", "10"))
         except (TypeError, ValueError) as exc:
@@ -213,9 +231,10 @@ def build_application(
             timeout=timeout,
         )
     if reference_snapshot_provider is None and reference_provider is not None:
-        if all(hasattr(reference_provider, name) for name in (
-            "get_exchange_calendar_snapshot", "get_fiscal_calendar_snapshot", "get_period_snapshot"
-        )):
+        if all(
+            hasattr(reference_provider, name)
+            for name in ("get_exchange_calendar_snapshot", "get_fiscal_calendar_snapshot", "get_period_snapshot")
+        ):
             reference_snapshot_provider = reference_provider
     if bool(config.get("temporal_reference_required", False)) and reference_provider is None:
         raise ValueError(
@@ -237,10 +256,39 @@ def build_application(
     verifications = PostgresVerificationRepository(database.session_factory)
     artifacts = SqlArtifactRepository(database.session_factory)
     claims = SqlClaimRepository(database.session_factory)
+    bundle_service = None
+    bundle_environment = (
+        os.getenv("CONTENT_SERVICE_VERSION"),
+        os.getenv("CONTENT_GIT_COMMIT"),
+        os.getenv("CONTENT_PIPELINE_VERSION"),
+    )
+    if all(value and value.lower() != "unknown" for value in bundle_environment):
+        from hashlib import sha256
+
+        checksum = (
+            "sha256:"
+            + sha256((Path(__file__).parents[3] / "contracts" / "content-knowledge-bundle.v1.json").read_bytes())
+            .hexdigest()
+            .upper()
+        )
+        bundle_service = KnowledgeBundleService(
+            PostgresKnowledgeBundleAuthority(database.session_factory),
+            PostgresKnowledgeBundleRepository(database.session_factory),
+            BundleProducerMetadata("stock_content", *bundle_environment, checksum),
+        )
     verification_jobs = PostgresVerificationJobRepository(database.session_factory)
     summaries = PostgresSummaryRepository(database.session_factory)
     use_qdrant = enable_qdrant if enable_qdrant is not None else bool(os.getenv("CONTENT_QDRANT_URL"))
-    index = QdrantKnowledgeIndex() if use_qdrant else NullKnowledgeIndex()
+    if use_qdrant:
+        try:
+            # Do not probe or require this optional derived-search adapter at
+            # API/worker startup.  Its durable outbox catches up later.
+            index = QdrantKnowledgeIndex()
+        except Exception as error:  # noqa: BLE001 - optional adapter boundary
+            LOGGER.warning("Qdrant projection disabled at startup: %s", type(error).__name__)
+            index = NullKnowledgeIndex()
+    else:
+        index = NullKnowledgeIndex()
     # §87：可选 QuantFactClient 仅用于 external fact verification；
     # 核心 ingestion 不强依赖 Quant。
     if os.getenv("CONTENT_EXTERNAL_FACT_PROVIDER", "").lower() == "quant":
@@ -248,10 +296,46 @@ def build_application(
         external_provider = quant_provider if quant_provider.configured() else HttpExternalFactProvider()
     else:
         external_provider = HttpExternalFactProvider()
-    sources = {"bilibili": BilibiliSourceAdapter(), "xiaoe_hls": XiaoeHlsSourceAdapter()}
+    sources = {
+        "bilibili": BilibiliSourceAdapter.from_environment(),
+        "xiaoe_hls": XiaoeHlsSourceAdapter.from_environment(),
+        "xiaoe": XiaoePageSourceAdapter.from_environment(),
+    }
     # P0 C-03/C-04：快照在 persist 前基于 pipeline 已生成 Artifact 记录；失败即 task 失败。
     snapshot_service = SnapshotService(SqlSnapshotStore(database.session_factory))
     signal_outbox = SignalOutboxRepository(database.session_factory)
+    from stock_content.application.fenced_effects import PostgresFencedEffectUnitOfWork
+
+    fenced_effects = PostgresFencedEffectUnitOfWork(database.session_factory)
+    projection_dispatcher = KnowledgeProjectionDispatcher(
+        database.session_factory,
+        index,
+        max_attempts=int(os.getenv("CONTENT_QDRANT_MAX_ATTEMPTS", "10")),
+        retry_base_seconds=int(os.getenv("CONTENT_QDRANT_RETRY_BASE_SECONDS", "5")),
+    )
+    retention_scheduler = None
+    retention_enabled = _env_bool("CONTENT_RETENTION_ENABLED", False)
+    retention_root = os.getenv("CONTENT_RETENTION_PRIVATE_ROOT", "").strip()
+    retention_root_id = os.getenv("CONTENT_RETENTION_PRIVATE_ROOT_ID", "").strip()
+    if retention_enabled:
+        if not retention_root or not retention_root_id:
+            # Retention is operationally fail-closed: no caller-supplied
+            # paths, and no best-effort deletion when its private mapping is
+            # absent.  Readiness exposes this as degraded.
+            retention_status = "RETENTION_PRIVATE_MAPPING_NOT_READY"
+        elif not Path(retention_root).is_dir():
+            retention_status = "RETENTION_PRIVATE_ROOT_NOT_READY"
+        else:
+            retention_scheduler = RetentionScheduler(
+                RetentionService(
+                    RetentionPolicy.from_environment(), SqlRetentionExecutionRepository(database.session_factory)
+                ),
+                SqlRetentionCandidateRepository(database.session_factory, private_root_id=retention_root_id),
+                private_root=Path(retention_root),
+            )
+            retention_status = "READY"
+    else:
+        retention_status = "RETENTION_DISABLED"
     claim_events = ClaimStateEventRepository(database.session_factory)
     publication_repository = PublicationRepository(database.session_factory)
 
@@ -277,12 +361,14 @@ def build_application(
     )
     occurrences = ClaimOccurrenceRepository(database.session_factory)
     lifecycle = LifecycleRepository(database.session_factory)
+
     def snapshot_membership(snapshot_id: str, claim_id: str) -> bool:
         from stock_content.adapters.postgres.models import ContentArtifactRow, ContentSnapshotRow
         from stock_content.domain.artifacts import deserialize_artifact
+
         with database.session_factory() as session:
             snapshot = session.get(ContentSnapshotRow, snapshot_id)
-            claims_artifact = (dict(snapshot.artifact_ids or {}).get("claims") if snapshot else None)
+            claims_artifact = dict(snapshot.artifact_ids or {}).get("claims") if snapshot else None
             artifact_row = session.get(ContentArtifactRow, claims_artifact) if claims_artifact else None
             if artifact_row is None:
                 return False
@@ -294,6 +380,7 @@ def build_application(
     def snapshot_claim_ids(snapshot_id: str) -> list[str]:
         from stock_content.adapters.postgres.models import ContentArtifactRow, ContentSnapshotRow
         from stock_content.domain.artifacts import deserialize_artifact
+
         with database.session_factory() as session:
             snapshot = session.get(ContentSnapshotRow, snapshot_id)
             claims_artifact = dict(snapshot.artifact_ids or {}).get("claims") if snapshot else None
@@ -330,30 +417,42 @@ def build_application(
     )
     semantic_enabled = bool(config["semantic_segmentation_enabled"])
     legacy_enabled = bool(config["legacy_chapter_extraction_enabled"]) or not semantic_enabled
-    semantic_stages = [
-        ChapterStage(ChapterSegmenter()),
-        TemporalWindowStage(TemporalWindowBuilder()),
-        SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
-        SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
-        AtomicClaimExtractionStage(extractor=atomic_extractor),
-        EvidenceGroundingStage(),
-        TemporalNormalizationStage(
-            normalization_version=str(config["temporal_normalization_version"]),
-            reference_provider=reference_provider,
-        ),
-        ClaimCanonicalizationStage(),
-        ClaimOccurrencePersistenceStage(occurrences),
-    ] if semantic_enabled else []
-    compatibility_stages = [] if semantic_enabled else [
-        ChapterStage(ChapterSegmenter()),
-        TemporalWindowStage(TemporalWindowBuilder()),
-    ]
+    semantic_stages = (
+        [
+            ChapterStage(ChapterSegmenter()),
+            TemporalWindowStage(TemporalWindowBuilder()),
+            SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
+            SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
+            AtomicClaimExtractionStage(extractor=atomic_extractor),
+            AtomicClaimValidationStage(),
+            EvidenceGroundingStage(),
+            TemporalNormalizationStage(
+                normalization_version=str(config["temporal_normalization_version"]),
+                reference_provider=reference_provider,
+            ),
+            ClaimCanonicalizationStage(),
+            ClaimOccurrencePersistenceStage(occurrences),
+        ]
+        if semantic_enabled
+        else []
+    )
+    compatibility_stages = (
+        []
+        if semantic_enabled
+        else [
+            ChapterStage(ChapterSegmenter()),
+            TemporalWindowStage(TemporalWindowBuilder()),
+        ]
+    )
     stages = [
         ResolveSourceStage(sources),
         DownloadStage(sources),
         FrameExtractionStage(FfmpegFrameExtractor()),
+        TranscriptCandidateStage(),
         AudioStage(FfmpegAudioExtractor()),
         ASRStage(FasterWhisperRecognizer()),
+        TranscriptSelectionStage(),
+        TranscriptQualityStage(),
         SpeakerDiarizationStage(PyannoteDiarizer()),
         TranscriptPostprocessStage(TranscriptPostprocessor()),
         OCRStage(PaddleOcrEngine()),
@@ -372,14 +471,18 @@ def build_application(
         FinancialEnrichmentStage(),
         LifecycleProjectionStage(lifecycle),
         SummaryStage(SummaryGenerator()),
-        ClaimPersistenceStage(claims, artifacts),
+        ClaimPersistenceStage(claims, artifacts, fenced_effects=fenced_effects),
         SnapshotRecordingStage(
-            snapshot_service, artifacts, occurrences, lifecycle,
+            snapshot_service,
+            artifacts,
+            occurrences,
+            lifecycle,
             verification_repository=verification_jobs,
             verification_job_repository=verification_jobs,
             claim_event_repository=claim_events,
             signal_service=signal_service,
             publication_uow=publication_uow,
+            fenced_effects=fenced_effects,
         ),
         PersistStage(
             videos,
@@ -396,8 +499,12 @@ def build_application(
             signal_service=signal_service,
             signal_outbox=signal_outbox,
             publication_uow=publication_uow,
+            # Persist is a business-effect stage.  It shares this same UoW
+            # with snapshot publication rather than opening repository-local
+            # transactions after a lease check.
+            fenced_effects=fenced_effects,
         ),
-        IndexStage(index),
+        IndexStage(index, fenced_effects=fenced_effects),
     ]
     # P0 C-01：生产主链路全部经 StageRunner，产出 Artifact Checkpoint v2。
     # 版本号来自稳定常量，不得随机生成。
@@ -431,4 +538,8 @@ def build_application(
         claim_event_repository=claim_events,
         historical_projector=historical_projector,
         task_lease_service=TaskLeaseService(PostgresTaskRunRepository(database.session_factory)),
+        knowledge_bundle_service=bundle_service,
+        retention_scheduler=retention_scheduler,
+        retention_status=retention_status,
+        knowledge_projection_dispatcher=projection_dispatcher,
     )

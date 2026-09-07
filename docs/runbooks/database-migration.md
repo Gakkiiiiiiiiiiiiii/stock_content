@@ -24,6 +24,23 @@ For explicit local fixtures only, `Database(...sqlite...).create_schema()`
 creates a SQLite schema.  It rejects PostgreSQL URLs and is never an API or
 worker startup operation.
 
-The migrations are expand/contract history and do not include automatic
-destructive rollback.  Roll forward with a corrected numbered migration; use
-the deployment backup and an approved restore procedure for a rollback.
+The migrations are expand/contract schema history and do not include automatic
+destructive rollback or legacy-row rewrites.  Roll forward with a corrected
+numbered migration; use the deployment backup and an approved restore
+procedure for a rollback.
+
+## EPIC-043 legacy rows
+
+Migrations 030 and 032 are DDL-only.  Their defaults classify rows without
+canonical EPIC-043 evidence as unresolved or legacy-un-grounded, so runtime
+Bundle eligibility remains fail-closed.  If an approved change plan needs the
+same explicit safety markers for a pre-EPIC-043 database, run the separate,
+idempotent procedure only after schema migration and backup review:
+
+```text
+python scripts/backfill_epic043_legacy_rows.py --database-url <approved-postgres-url> --confirm
+```
+
+That script is not called by `content-migrate`, schema bootstrap, the API, or
+workers.  It never promotes historical claims; re-running SC-07A is required
+before a claim can become `GROUNDED` and Bundle-eligible.

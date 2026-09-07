@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime, time
 from typing import Any
 
 from .artifacts import canonical_json
@@ -61,6 +62,23 @@ class ClaimCanonicalizer:
             or next(iter(binding_versions), None)
             or "normalization.v1"
         )
+        # The strict Bundle needs concrete target instants, and the temporal
+        # normalizer is the sole authority for them.  Do not derive a period
+        # from model prose: only a normalized binding can populate these
+        # scalar canonical fields.
+        dated_bindings = [
+            binding
+            for binding in bindings
+            if getattr(binding, "start_date", None) is not None
+            or getattr(binding, "start_time", None) is not None
+        ]
+        dated_bindings.sort(key=lambda binding: str(getattr(binding, "temporal_binding_id", "")))
+        primary_binding = dated_bindings[0] if dated_bindings else None
+        period_start = getattr(primary_binding, "start_date", None) if primary_binding else None
+        period_end = getattr(primary_binding, "end_date", None) if primary_binding else None
+        fact_time = getattr(primary_binding, "start_time", None) if primary_binding else None
+        if fact_time is None and period_start is not None:
+            fact_time = datetime.combine(period_start, time.min, tzinfo=UTC)
         claim = FinancialClaim(
             claim_type=draft.claim_type,
             # Stage 2 may not promote an arbitrary knowledge_kind into the
@@ -74,9 +92,17 @@ class ClaimCanonicalizer:
             value=draft.value,
             unit=draft.unit,
             currency=draft.currency,
+            fact_time=fact_time,
+            period_start=period_start,
+            period_end=period_end,
             condition_text=draft.condition_text,
             invalidation_text=draft.invalidation_text,
             condition_key=condition_key_of(draft.condition_text, bindings),
+            normalized_statement=draft.normalized_statement or draft.conclusion,
+            grounding_status=draft.grounding_status,
+            grounding_reason_codes=list(draft.grounding_reason_codes),
+            contradiction_group_id=draft.contradiction_group_id,
+            legacy_grounding_incomplete=draft.legacy_grounding_incomplete,
             temporal_bindings=bindings,
             temporal_relations=relations,
             # Final canonical claims intentionally own no source evidence.
@@ -84,7 +110,7 @@ class ClaimCanonicalizer:
             source_support_status="SUPPORTED",
             source_confidence=draft.extraction_confidence,
             extractor_confidence=draft.extraction_confidence,
-            claim_schema_version="claim.final.v1",
+            claim_schema_version=draft.claim_schema_version,
             normalization_version=effective_normalization_version,
         )
         return claim

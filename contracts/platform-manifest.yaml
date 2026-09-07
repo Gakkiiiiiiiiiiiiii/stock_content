@@ -1,5 +1,34 @@
 manifest_version: platform-manifest.v1
 contracts:
+  - id: content-knowledge-bundle.v1
+    schema: contracts/content-knowledge-bundle.v1.json
+    checksum: sha256:EBFD13B78622C3846890438A4FB3CB858278F571FDAB247CDD72EF18CA211621
+    producer: stock_content
+    consumers: [stock_agent]
+    compatibility: formal
+    formal_expected: true
+    deprecated: false
+    sunset: null
+    owner: content-platform
+  - id: content-ingestion.v1
+    schema: contracts/content-ingestion.v1.json
+    checksum: sha256:F1BE4AD5855EB96647B09F8E1DAB19616EDF0C91B480762A792B319F762DA2A1
+    producer: stock_content
+    consumers: [stock_agent]
+    compatibility: additive
+    deprecated: false
+    sunset: null
+    owner: content-platform
+  - id: knowledge-quality-report.v1
+    schema: contracts/knowledge-quality-report.v1.json
+    checksum: sha256:05F2FAEF417FA714B7BAFCF316B668AF2979D60F463F876264F92D615EECBD07
+    producer: stock_content
+    consumers: [stock_content]
+    compatibility: compatibility
+    formal_expected: false
+    deprecated: false
+    sunset: null
+    owner: content-platform
   - id: content.v1
     schema: contracts/content.v1.yaml
     checksum: sha256:D8E784B2EB62B522E70645CAE779E702F630ED37DE085E3998660F6F33C4808D

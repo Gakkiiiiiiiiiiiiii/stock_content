@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from stock_content.adapters.http.model_client import ContentModelClient
+from stock_content.application.fenced_effects import EffectIntent
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.snapshot_service import SnapshotService, choose_snapshot_commit_candidate
 from stock_content.application.stage_runner import StageResult
+from stock_content.application.transcript_quality_service import TranscriptQualityService
+from stock_content.application.transcript_selection_service import TranscriptSelectionError, TranscriptSelectionService
 from stock_content.domain.artifacts import (
     ClaimArtifact,
     ClaimOccurrenceArtifact,
@@ -35,13 +38,14 @@ from stock_content.domain.artifacts import (
     canonical_json,
 )
 from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
+from stock_content.domain.atomic_claim_validator import AtomicClaimDraftValidator
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.claim_canonicalizer import ClaimCanonicalizer
-from stock_content.domain.claim_draft import ClaimOccurrenceDraft
+from stock_content.domain.claim_draft import ClaimOccurrenceDraft, TemporalExpressionDraft
 from stock_content.domain.claim_draft_grounder import ClaimDraftGrounder
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.claim_occurrence import ClaimOccurrence
-from stock_content.domain.claim_state_event import ClaimStateEvent
+from stock_content.domain.claim_state_event import ClaimStateEvent, event_logical_identity
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
@@ -70,6 +74,12 @@ from stock_content.domain.temporal_semantics import (
     TemporalAssertionStatus,
     TemporalRole,
     TemporalScope,
+)
+from stock_content.domain.transcript_candidate import (
+    AlignmentStatus,
+    TranscriptCandidate,
+    TranscriptCandidateSegment,
+    TranscriptSource,
 )
 from stock_content.domain.transcript_postprocessor import TranscriptPostprocessor
 from stock_content.ports.media import AudioExtractor, SourceAdapter, SpeechRecognizer
@@ -140,9 +150,29 @@ class ResolveSourceStage:
     def __init__(self, adapters: dict[str, SourceAdapter]) -> None:
         self._adapters = adapters
 
+    @staticmethod
+    def _resolve_materialization(adapter: Any, context: PipelineContext):
+        kwargs: dict[str, Any] = {"part": context.options.get("part")}
+        if context.source["type"] in {"bilibili", "xiaoe", "xiaoe_hls"} and context.options.get("credential_ref_hash"):
+            # This is a one-way reference recovered only against the worker's
+            # configured allowlist.  It is safe in a checkpoint but never
+            # reveals a credential name, storage state, cookie, or locator.
+            kwargs["credential_ref_hash"] = context.options.get("credential_ref_hash")
+        return adapter.resolve_materialization(context.source["ref"], **kwargs)
+
     def execute(self, context: PipelineContext) -> PipelineContext:
         fixture = context.options.get("metadata")
-        context.state["metadata"] = fixture or self._adapters[context.source["type"]].resolve(context.source["ref"])
+        adapter = self._adapters[context.source["type"]]
+        if fixture:
+            context.state["metadata"] = fixture
+        elif hasattr(adapter, "resolve_materialization"):
+            materialization = self._resolve_materialization(adapter, context)
+            # The Pydantic JSON projection has no SecretStr value; ephemeral
+            # stream/subtitle URLs remain in RuntimeWorkspace only.
+            context.runtime.source_materialization = materialization
+            context.state["metadata"] = materialization.public.model_dump(mode="json")
+        else:
+            context.state["metadata"] = adapter.resolve(context.source["ref"])
         return _stage_result(context)
 
 
@@ -197,6 +227,42 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
     source_type = existing.source_type if existing else str(context.source.get("type") or "")
     source_ref = existing.source_ref if existing else str(context.source.get("ref") or "")
     metadata = dict(existing.source_metadata if existing else context.state.metadata)
+    # Materializers expose only a public projection. Normalize the finite
+    # provenance fields while runtime-only stream URLs remain out of it.
+    canonical_ref = metadata.get("canonical_source_ref") or metadata.get("canonical_url")
+    if not canonical_ref and source_type == "bilibili" and str(source_ref).upper().startswith("BV"):
+        canonical_ref = f"https://www.bilibili.com/video/{source_ref.upper()}"
+    if isinstance(canonical_ref, str) and canonical_ref.startswith(("https://", "http://")):
+        from urllib.parse import urlsplit, urlunsplit
+
+        parsed = urlsplit(canonical_ref)
+        canonical_ref = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    else:
+        canonical_ref = None
+    metadata.update(
+        {
+            "canonical_url": canonical_ref,
+            "source_id": metadata.get("platform_id") or metadata.get("source_id") or source_ref,
+            "source_part": metadata.get("part_id") or metadata.get("source_part") or context.options.get("part"),
+            "source_available_from": (
+                context.options.get("replay_source_available_at")
+                or
+                context.options.get("source_available_at")
+                or metadata.get("source_available_at")
+                or metadata.get("available_at")
+            ),
+            "business_as_of": (
+                context.options.get("replay_source_business_as_of")
+                or context.options.get("business_as_of")
+                or metadata.get("business_as_of")
+            ),
+            "pipeline_version": (
+                context.options.get("replay_source_pipeline_version")
+                or context.options.get("replay_pipeline_version")
+                or "pipeline.v3"
+            ),
+        }
+    )
     if context.options.get("source_artifact_metadata_required"):
         policy = policy_for_source(source_type)
         required = {
@@ -207,13 +273,15 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
         if any(not value for value in required.values()):
             raise ValueError("source artifact policy metadata is required for new ingestion")
         metadata.update(required)
-        metadata.update({
-            "source_content_hash": raw_hash,
-            "content_size": length,
-            "mime_type": context.options.get("mime_type") or "application/octet-stream",
-            "encryption_key_id": context.options.get("encryption_key_id"),
-            "governance_evidence": governance_evidence_for(policy),
-        })
+        metadata.update(
+            {
+                "source_content_hash": raw_hash,
+                "content_size": length,
+                "mime_type": context.options.get("mime_type") or "application/octet-stream",
+                "encryption_key_id": context.options.get("encryption_key_id"),
+                "governance_evidence": governance_evidence_for(policy),
+            }
+        )
     identity_hash = hashlib.sha256(f"{source_type}:{source_ref}".encode()).hexdigest()
     source = SourceArtifact(
         artifact_id="source-pending",
@@ -241,11 +309,19 @@ class DownloadStage:
         self._adapters = adapters
         self._work_root = work_root
 
+    @staticmethod
+    def _resolve_materialization(adapter: Any, context: PipelineContext):
+        kwargs: dict[str, Any] = {"part": context.options.get("part")}
+        if context.source["type"] in {"bilibili", "xiaoe", "xiaoe_hls"} and context.options.get("credential_ref_hash"):
+            kwargs["credential_ref_hash"] = context.options.get("credential_ref_hash")
+        return adapter.resolve_materialization(context.source["ref"], **kwargs)
+
     def execute(self, context: PipelineContext) -> PipelineContext:
         fixture = bool(
             context.options.get("offline_fixture")
             or "transcript" in context.options
             or "segments" in context.options
+            or "test_subtitle_candidates" in context.options
         )
         if fixture:
             # Offline fixtures are synthetic, deterministic sources.  Give
@@ -313,11 +389,13 @@ class DownloadStage:
                     extractor_version="download.v1",
                     parent_artifact_ids=(source.artifact_id,),
                 )
-                context.artifacts.media = MediaArtifact(
-                    **{**media.__dict__, "artifact_id": artifact_id_of(media)}
-                )
+                context.artifacts.media = MediaArtifact(**{**media.__dict__, "artifact_id": artifact_id_of(media)})
             return _stage_result(context, "source", "media")
-        if "transcript" in context.options or "segments" in context.options:
+        if (
+            "transcript" in context.options
+            or "segments" in context.options
+            or "test_subtitle_candidates" in context.options
+        ):
             raw_hash, length = _stable_fixture_media_hash(context)
             _refresh_source_artifact(context, raw_hash, length, "fixture://media")
             source = context.artifacts.source
@@ -335,7 +413,25 @@ class DownloadStage:
             return _stage_result(context, "source", "media")
         directory = Path(tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-", dir=self._work_root))
         context.runtime.work_dir = directory
-        context.runtime.video_path = self._adapters[context.source["type"]].download(context.source["ref"], directory)
+        adapter = self._adapters[context.source["type"]]
+        materialization = context.runtime.source_materialization
+        if hasattr(adapter, "resolve_materialization"):
+            if materialization is None:
+                materialization = self._resolve_materialization(adapter, context)
+            materialized = adapter.materialize(
+                materialization,
+                directory,
+                expected_duration=materialization.public.duration_seconds,
+                reresolve=lambda: self._resolve_materialization(adapter, context),
+            )
+            context.runtime.video_path = materialized.path
+            context.state.metadata["subtitle"] = materialized.subtitle_metadata
+            context.runtime.subtitle_tracks = materialized.subtitle_tracks
+            # The probe is the authoritative local-media duration.  It also
+            # bounds parsed subtitle cues before they reach candidate stages.
+            context.options.setdefault("duration_ms", round(materialized.duration_seconds * 1000))
+        else:
+            context.runtime.video_path = adapter.download(context.source["ref"], directory)
         raw = hashlib.sha256()
         length = 0
         with Path(context.runtime.video_path).open("rb") as handle:
@@ -440,9 +536,7 @@ class FrameExtractionStage:
                     parent_artifact_ids=(media.artifact_id,),
                 )
                 frame_artifacts.append(
-                    FrameArtifact(
-                        **{**frame_artifact.__dict__, "artifact_id": artifact_id_of(frame_artifact)}
-                    )
+                    FrameArtifact(**{**frame_artifact.__dict__, "artifact_id": artifact_id_of(frame_artifact)})
                 )
             context.artifacts.frames = frame_artifacts
         return _stage_result(context, "frames")
@@ -465,6 +559,7 @@ class ASRStage:
     name = "asr"
     required_inputs = ("media",)
     output_types = ("transcript",)
+    optional_output_types = ("transcript",)
 
     def __init__(self, recognizer: SpeechRecognizer) -> None:
         self._recognizer = recognizer
@@ -488,6 +583,10 @@ class ASRStage:
         ]
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        # SubtitleCandidateStage records whether speech is needed.  A direct
+        # ASRStage invocation keeps its historical behaviour for callers/tests.
+        if context.options.get("_transcript_candidate_mode") and not context.options.get("_asr_required"):
+            return _stage_result(context)
         segments = self._fixture(context.options)
         if not segments and context.runtime.audio_path is not None:
             segments = self._recognizer.transcribe(context.runtime.audio_path, context.options.get("language"))
@@ -507,11 +606,16 @@ class ASRStage:
                 segment.normalized_text = normalized.text
                 detected_types.update(normalized.detected_types)
         if detected_types:
-            context.state.quality_warnings.extend(
-                f"PII_REDACTED:{category}" for category in sorted(detected_types)
-            )
+            context.state.quality_warnings.extend(f"PII_REDACTED:{category}" for category in sorted(detected_types))
         context.state["segments"] = segments
         context.state["transcript"] = " ".join(segment.text for segment in segments)
+        if context.options.get("_transcript_candidate_mode"):
+            candidate = _asr_candidate(context, segments)
+            context.state.transcript_candidates.append(candidate)
+            return StageResult(
+                context=context,
+                produced_artifacts=(context.state.transcript_candidate_artifacts[-1],),
+            )
         _register_transcript_artifact(context, producer_stage="asr")
         return _stage_result(context, "transcript")
 
@@ -527,6 +631,9 @@ def _register_transcript_artifact(
             end_seconds=item.end_seconds,
             text=item.text,
             confidence=item.confidence,
+            source=item.source,
+            source_artifact_id=item.source_artifact_id,
+            alignment_status=item.alignment_status,
             speaker_id=item.speaker_id,
         )
         for item in context.state["segments"]
@@ -537,22 +644,264 @@ def _register_transcript_artifact(
         artifact_type="transcript",
         producer_stage=producer_stage,
         media_artifact_id=(
-            context.artifacts.media.artifact_id
-            if context.artifacts.media
-            else (source.artifact_id if source else "")
+            context.artifacts.media.artifact_id if context.artifacts.media else (source.artifact_id if source else "")
         ),
         language=context.options.get("language"),
         segments=segments,
         # ASR model/version 进入 lineage（默认 faster-whisper，可被 options 覆盖）。
         asr_model=str(context.options.get("asr_model") or "faster-whisper"),
         asr_model_version=str(context.options.get("asr_model_version") or "1.0"),
-        parent_artifact_ids=(parent_artifact_id,) if parent_artifact_id else (
-            (context.artifacts.media.artifact_id,) if context.artifacts.media else ()
-        ),
+        parent_artifact_ids=(parent_artifact_id,)
+        if parent_artifact_id
+        else ((context.artifacts.media.artifact_id,) if context.artifacts.media else ()),
     )
     context.artifacts.transcript = TranscriptArtifact(
         **{**transcript.__dict__, "artifact_id": artifact_id_of(transcript)}
     )
+
+
+def _duration_ms(context: PipelineContext) -> int:
+    value = context.options.get("duration_ms")
+    if value is None:
+        value = context.state.metadata.get("duration_ms")
+    if value is None:
+        seconds = context.state.metadata.get("duration_seconds")
+        value = float(seconds) * 1000 if seconds is not None else None
+    if value is None and context.artifacts.media is not None:
+        value = context.artifacts.media.duration_ms
+    if value is None:
+        value = max((round(item.end_seconds * 1000) for item in context.state.segments), default=0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+        raise ValueError("TRANSCRIPT_DURATION_INVALID")
+    rounded = round(float(value))
+    if rounded <= 0:
+        raise ValueError("TRANSCRIPT_DURATION_INVALID")
+    return rounded
+
+
+def _candidate_artifact(
+    context: PipelineContext, candidate: TranscriptCandidate, producer_stage: str
+) -> TranscriptArtifact:
+    media_id = context.artifacts.media.artifact_id if context.artifacts.media else ""
+    transcript = TranscriptArtifact(
+        artifact_id="transcript-pending",
+        artifact_type="transcript",
+        producer_stage=producer_stage,
+        media_artifact_id=media_id,
+        language=candidate.language,
+        segments=[
+            TranscriptSegmentItem(
+                segment_index=index,
+                start_seconds=item.start_ms / 1000,
+                end_seconds=item.end_ms / 1000,
+                text=item.normalized_text,
+                raw_text=item.raw_text,
+                normalized_text=item.normalized_text,
+                confidence=item.confidence,
+                source=item.source.value,
+                source_artifact_id=item.source_artifact_id,
+                alignment_status=item.alignment_status.value,
+            )
+            for index, item in enumerate(candidate.ordered_segments)
+        ],
+        asr_model=str(context.options.get("asr_model") or "candidate"),
+        asr_model_version=str(context.options.get("asr_model_version") or "1.0"),
+        parent_artifact_ids=(context.artifacts.media.artifact_id,) if context.artifacts.media else (),
+    )
+    return TranscriptArtifact(**{**transcript.__dict__, "artifact_id": artifact_id_of(transcript)})
+
+
+def _asr_candidate(context: PipelineContext, segments: list[TranscriptSegment]) -> TranscriptCandidate:
+    source_id = (
+        "asr-"
+        + hashlib.sha256(
+            canonical_json(
+                [(item.start_seconds, item.end_seconds, item.raw_text or item.text) for item in segments]
+            ).encode()
+        ).hexdigest()[:24]
+    )
+    converted = tuple(
+        TranscriptCandidateSegment(
+            source=TranscriptSource.ASR,
+            source_artifact_id=source_id,
+            start_ms=round(item.start_seconds * 1000),
+            end_ms=round(item.end_seconds * 1000),
+            raw_text=item.raw_text or item.text,
+            normalized_text=item.normalized_text or item.text,
+            confidence=0.0 if item.confidence is None else float(item.confidence),
+            alignment_status=AlignmentStatus(item.alignment_status),
+        )
+        for item in segments
+    )
+    candidate = TranscriptCandidate(
+        "asr-" + source_id,
+        TranscriptSource.ASR,
+        str(context.options.get("language") or "zh"),
+        source_id,
+        converted,
+    )
+    context.state.transcript_candidate_artifacts = getattr(context.state, "transcript_candidate_artifacts", [])
+    context.state.transcript_candidate_artifacts.append(_candidate_artifact(context, candidate, "asr"))
+    return candidate
+
+
+class TranscriptCandidateStage:
+    """Convert worker-materialized subtitle cues into immutable candidates."""
+
+    name = "transcript_candidate"
+    required_inputs = ("media",)
+    output_types = ("transcript",)
+    optional_output_types = ("transcript",)
+
+    @staticmethod
+    def _source(value: object) -> TranscriptSource:
+        normalized = str(value or "").upper()
+        aliases = {"OFFICIAL": "OFFICIAL_SUBTITLE", "MANUAL": "OFFICIAL_SUBTITLE", "AUTOMATIC": "AUTO_SUBTITLE"}
+        return TranscriptSource(aliases.get(normalized, normalized))
+
+    @staticmethod
+    def _runtime_candidates(context: PipelineContext) -> list[dict[str, object]]:
+        """Adapt the secret-free materializer output without serialising it.
+
+        The source materializer is the sole production authority for subtitle
+        bytes.  The small test adapter below exists only for deterministic
+        unit fixtures and is not admitted by the canonical ingestion request.
+        """
+        result: list[dict[str, object]] = []
+        for track in context.runtime.subtitle_tracks:
+            origin = getattr(track, "source", None)
+            if origin not in {"official", "automatic"}:
+                raise ValueError("TRANSCRIPT_CANDIDATES_INVALID")
+            result.append({
+                "candidate_id": getattr(track, "artifact_id"),
+                "source": "OFFICIAL_SUBTITLE" if origin == "official" else "AUTO_SUBTITLE",
+                "source_artifact_id": getattr(track, "artifact_id"),
+                "language": getattr(track, "language"),
+                "segments": [
+                    {
+                        "start_ms": getattr(cue, "start_ms"),
+                        "end_ms": getattr(cue, "end_ms"),
+                        "raw_text": getattr(cue, "raw_text"),
+                        "normalized_text": getattr(cue, "normalized_text"),
+                        "confidence": 1.0 if origin == "official" else 0.8,
+                    }
+                    for cue in getattr(track, "cues", ())
+                ],
+            })
+        return result
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        raw_candidates = self._runtime_candidates(context)
+        if not raw_candidates and context.options.get("_test_subtitle_candidate_adapter") is True:
+            raw_candidates = context.options.get("test_subtitle_candidates") or []
+        if not isinstance(raw_candidates, list):
+            raise ValueError("TRANSCRIPT_CANDIDATES_INVALID")
+        candidates: list[TranscriptCandidate] = []
+        artifacts: list[TranscriptArtifact] = []
+        for index, raw in enumerate(raw_candidates):
+            if not isinstance(raw, dict):
+                raise ValueError("TRANSCRIPT_CANDIDATES_INVALID")
+            source = self._source(raw.get("source"))
+            if source is TranscriptSource.ASR:
+                raise ValueError("ASR must be provided by the ASR port")
+            source_id = str(raw.get("source_artifact_id") or f"subtitle-{index}")
+            converted = []
+            for segment in raw.get("segments") or []:
+                if not isinstance(segment, dict):
+                    raise ValueError("TRANSCRIPT_SEGMENT_INVALID")
+                raw_text = str(segment.get("raw_text") or segment.get("text") or "")
+                normalized = str(segment.get("normalized_text") or raw_text)
+                converted.append(
+                    TranscriptCandidateSegment(
+                        source=source,
+                        source_artifact_id=source_id,
+                        start_ms=int(segment.get("start_ms", round(float(segment.get("start_seconds", 0)) * 1000))),
+                        end_ms=int(segment.get("end_ms", round(float(segment.get("end_seconds", 0)) * 1000))),
+                        raw_text=raw_text,
+                        normalized_text=normalized,
+                        confidence=float(segment.get("confidence", 1.0)),
+                        alignment_status=AlignmentStatus(str(segment.get("alignment_status") or "ALIGNED").upper()),
+                    )
+                )
+            candidate = TranscriptCandidate(
+                str(raw.get("candidate_id") or f"subtitle-{index}"),
+                source,
+                str(raw.get("language") or "zh"),
+                source_id,
+                tuple(converted),
+            )
+            candidates.append(candidate)
+            artifacts.append(_candidate_artifact(context, candidate, "transcript_candidate"))
+        context.state.transcript_candidates = candidates
+        context.state.transcript_candidate_artifacts = artifacts
+        context.options["_transcript_candidate_mode"] = True
+        # ASR is only invoked when no candidate has already met the formal gate.
+        if not candidates:
+            context.options["_asr_required"] = True
+        else:
+            quality = TranscriptQualityService()
+            duration = _duration_ms(context)
+            context.options["_asr_required"] = not any(
+                candidate.is_chinese
+                and quality.evaluate(
+                    candidate.ordered_segments, duration_ms=duration, language=candidate.language
+                ).quality_status.value
+                == "PASS"
+                for candidate in candidates
+                if candidate.source in {TranscriptSource.OFFICIAL_SUBTITLE, TranscriptSource.AUTO_SUBTITLE}
+            )
+        return StageResult(context=context, produced_artifacts=tuple(artifacts))
+
+
+class TranscriptSelectionStage:
+    name = "transcript_selection"
+    required_inputs = ("media",)
+    output_types = ("transcript",)
+
+    def __init__(self, service: TranscriptSelectionService | None = None) -> None:
+        self._service = service or TranscriptSelectionService()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        try:
+            selection = self._service.select(
+                tuple(context.state.transcript_candidates), duration_ms=_duration_ms(context)
+            )
+        except TranscriptSelectionError as exc:
+            context.state.transcript_quality_report = exc.report
+            context.state.quality_warnings.append("TRANSCRIPT_NEEDS_REVIEW")
+            raise
+        context.state.segments = [
+            TranscriptSegment(
+                segment_index=index,
+                start_seconds=item.start_ms / 1000,
+                end_seconds=item.end_ms / 1000,
+                text=item.normalized_text,
+                raw_text=item.raw_text,
+                normalized_text=item.normalized_text,
+                confidence=item.confidence,
+                source=item.source.value,
+                source_artifact_id=item.source_artifact_id,
+                alignment_status=item.alignment_status.value,
+            )
+            for index, item in enumerate(selection.segments)
+        ]
+        context.state.transcript = " ".join(item.text for item in context.state.segments)
+        context.state.transcript_quality_report = selection.report
+        _register_transcript_artifact(context, producer_stage="transcript_selection")
+        return _stage_result(context, "transcript")
+
+
+class TranscriptQualityStage:
+    name = "transcript_quality"
+    required_inputs = ("transcript",)
+    output_types = ()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        report = context.state.transcript_quality_report
+        if report is None or report.quality_status.value != "PASS":
+            context.state.quality_warnings.append("TRANSCRIPT_NEEDS_REVIEW")
+            raise RuntimeError("NEEDS_REVIEW: transcript quality gate")
+        return _stage_result(context)
 
 
 class SpeakerDiarizationStage:
@@ -572,9 +921,7 @@ class SpeakerDiarizationStage:
         context.state["diarization_status"] = status
         if status in {"UNAVAILABLE", "FAILED", "DEGRADED"}:
             context.state.setdefault("quality_warnings", []).append(f"DIARIZATION_{status}")
-        _register_transcript_artifact(
-            context, producer_stage="diarization", parent_artifact_id=previous_transcript
-        )
+        _register_transcript_artifact(context, producer_stage="diarization", parent_artifact_id=previous_transcript)
         return _stage_result(context, "transcript")
 
 
@@ -780,18 +1127,22 @@ class SemanticSegmentationStage:
         context.runtime.metrics.update(result.metrics)
         durations = sorted(max(0, item.end_ms - item.start_ms) for item in result.segments)
         count = len(durations)
+
         def _percentile(percent: float) -> float:
             if not durations:
                 return 0.0
             index = max(0, min(count - 1, int((count - 1) * percent)))
             return float(durations[index])
-        context.runtime.metrics.update({
-            "semantic_segments_per_video": float(count),
-            "semantic_segment_duration_p50": _percentile(0.50),
-            "semantic_segment_duration_p95": _percentile(0.95),
-            "segmentation_repair_rate": float(result.metrics.get("repair_count", 0.0)) / max(1.0, float(count)),
-            "segmentation_failure_rate": float(result.metrics.get("failure_count", 0.0)) / max(1.0, float(count)),
-        })
+
+        context.runtime.metrics.update(
+            {
+                "semantic_segments_per_video": float(count),
+                "semantic_segment_duration_p50": _percentile(0.50),
+                "semantic_segment_duration_p95": _percentile(0.95),
+                "segmentation_repair_rate": float(result.metrics.get("repair_count", 0.0)) / max(1.0, float(count)),
+                "segmentation_failure_rate": float(result.metrics.get("failure_count", 0.0)) / max(1.0, float(count)),
+            }
+        )
         context.artifacts.semantic_segments = result.artifact
         if self._repository is not None:
             video = context.state.get("video")
@@ -865,8 +1216,10 @@ class AtomicClaimExtractionStage:
         context.state["claim_drafts"] = drafts
         context.runtime.metrics["claim_count"] = float(len(drafts))
         context.runtime.metrics["zero_claim_context_count"] = float(
-            sum(not any(item.semantic_segment_id == c.semantic_segment_id for item in drafts)
-                for c in context.state.get("semantic_contexts") or ())
+            sum(
+                not any(item.semantic_segment_id == c.semantic_segment_id for item in drafts)
+                for c in context.state.get("semantic_contexts") or ()
+            )
         )
         segment_count = len(context.state.get("semantic_segments") or ())
         zero_claim_count = sum(
@@ -876,6 +1229,185 @@ class AtomicClaimExtractionStage:
         context.runtime.metrics["claims_per_semantic_segment"] = len(drafts) / max(1.0, float(segment_count))
         context.runtime.metrics["zero_claim_segment_ratio"] = zero_claim_count / max(1.0, float(segment_count))
         return _stage_result(context)
+
+
+class AtomicClaimValidationStage:
+    """Validate the structured atomic-claim seam before evidence grounding.
+
+    Legacy ``ClaimOccurrenceDraft`` extraction remains an explicit compatibility
+    path until the projection packet adopts AtomicClaimDraft as its input.  A
+    structured model payload is never allowed to bypass the transcript-quality
+    or semantic-coordinate gate.
+    """
+
+    name = "atomic_claim_validation"
+    required_inputs = ("transcript", "semantic_segments")
+    output_types = ()
+
+    def __init__(self, validator: AtomicClaimDraftValidator | None = None) -> None:
+        self._validator = validator or AtomicClaimDraftValidator()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        if transcript is None:
+            raise ValueError("atomic claim validation requires transcript")
+        # Canonical ingestion never accepts ``atomic_claim_payload`` as a
+        # request option.  The compatibility seam is retained for isolated
+        # stage tests, but production always validates the extractor's actual
+        # ClaimOccurrenceDraft output.  In particular, an empty extractor
+        # result is a valid, empty formal projection rather than a legacy
+        # bypass.
+        extracted = list(context.state.get("claim_drafts") or ())
+        payload = (
+            {"claims": [_extractor_draft_to_atomic_payload(item, transcript) for item in extracted]}
+            if extracted
+            else context.options.get("atomic_claim_payload")
+        )
+        if payload is None:
+            context.state["validated_atomic_claims"] = []
+            context.state["atomic_claim_rejections"] = []
+            context.state["claim_drafts"] = []
+            context.runtime.metrics["atomic_claim_accept_count"] = 0.0
+            context.runtime.metrics["atomic_claim_reject_count"] = 0.0
+            return _stage_result(context)
+        report = context.state.transcript_quality_report
+        result = self._validator.validate_payloads(
+            payload,
+            transcript,
+            context.state.get("semantic_segments") or (),
+            transcript_quality_status=(getattr(report, "quality_status", "NOT_PASS")),
+        )
+        context.state["validated_atomic_claims"] = list(result.accepted)
+        context.state["atomic_claim_rejections"] = list(result.rejected)
+        # An explicit structured payload is usable only after SC-07A accepts
+        # it; replace any parallel raw draft list at this boundary.
+        context.state["claim_drafts"] = [_accepted_atomic_to_claim_draft(item) for item in result.accepted]
+        context.runtime.metrics["atomic_claim_accept_count"] = float(len(result.accepted))
+        context.runtime.metrics["atomic_claim_reject_count"] = float(len(result.rejected))
+        return _stage_result(context)
+
+
+def _extractor_draft_to_atomic_payload(
+    draft: ClaimOccurrenceDraft, transcript: TranscriptArtifact
+) -> dict[str, Any]:
+    """Build validator input from an untrusted extractor DTO and authority text.
+
+    This adapter deliberately has no path for extractor-supplied acceptance
+    flags.  Coordinates, statement, subject and hard-fact candidates remain
+    untrusted and the validator checks them against the selected transcript.
+    When a legacy-shaped model response omitted a quote, the quote is a direct
+    projection of its selected authority coordinates, not model-generated
+    evidence or a new fact.
+    """
+    text_by_index = {
+        item.segment_index: str(getattr(item, "raw_text", None) or getattr(item, "text", ""))
+        for item in transcript.segments
+    }
+    evidence_indices = list(draft.evidence_segment_indices)
+    authority_quote = " ".join(
+        text_by_index[index] for index in evidence_indices if index in text_by_index
+    )
+    temporal = []
+    for expression in draft.temporal_expressions:
+        role = str(expression.role).upper()
+        pit_meaning = {
+            "REPORTING_PERIOD": "REPORTING_PERIOD",
+            "FORECAST_TARGET": "FORECAST_TARGET",
+        }.get(role, "UNKNOWN")
+        temporal.append(
+            {
+                "raw_expression": expression.raw_expression,
+                # ``scope_hint`` is not necessarily a textual period (for
+                # example INTERVAL), so never claim it as one.
+                "target_period": None,
+                "pit_meaning": pit_meaning,
+                "evidence_segment_indices": list(expression.evidence_segment_indices),
+                "confidence": expression.confidence,
+            }
+        )
+    value = draft.value
+    object_value = None
+    if value is not None:
+        object_value = {
+            "text": str(value) if isinstance(value, str) else "",
+            "value": value if isinstance(value, (str, int, float)) else None,
+            "unit": draft.unit,
+            "currency": draft.currency,
+        }
+    return {
+        "semantic_segment_id": draft.semantic_segment_id,
+        "claim_type": draft.claim_type,
+        "knowledge_kind": draft.knowledge_kind,
+        "verbatim_quote": draft.verbatim_quote or authority_quote,
+        "normalized_statement": draft.normalized_statement or draft.conclusion,
+        "subject": {
+            "subject_type": draft.subject_type or "UNKNOWN",
+            "subject_key": draft.subject_key,
+            "subject_name": draft.subject_name,
+        },
+        "predicate": draft.predicate_key,
+        "object": object_value,
+        "condition_text": draft.condition_text,
+        "invalidation_text": draft.invalidation_text,
+        "sentiment": draft.sentiment,
+        # These are not persisted model assertions in ClaimOccurrenceDraft.
+        # The validator independently checks statement polarity/tense against
+        # the evidence; leaving tense UNKNOWN avoids inventing a temporal fact.
+        "polarity": "ASSERTS",
+        "assertion_tense": "UNKNOWN",
+        "evidence_segment_indices": evidence_indices,
+        "condition_evidence_segment_indices": list(draft.condition_evidence_segment_indices),
+        "invalidation_evidence_segment_indices": list(draft.invalidation_evidence_segment_indices),
+        "temporal_expressions": temporal,
+        "visual_anchors": [],
+        "extraction_confidence": draft.extraction_confidence,
+    }
+
+
+def _accepted_atomic_to_claim_draft(item) -> ClaimOccurrenceDraft:
+    """Adapt only a validator-accepted atomic draft into the legacy stage DTO."""
+    draft = item.draft
+    return ClaimOccurrenceDraft(
+        semantic_segment_id=draft.semantic_segment_id,
+        knowledge_kind=draft.knowledge_kind,
+        claim_type=draft.claim_type,
+        subject_type=draft.subject.subject_type,
+        subject_key=draft.subject.subject_key or (draft.subject.subject_name or ""),
+        subject_name=draft.subject.subject_name,
+        predicate_key=draft.predicate,
+        conclusion=draft.normalized_statement,
+        value=(draft.object.value if draft.object and draft.object.value is not None else
+               (draft.object.text if draft.object else draft.normalized_statement)),
+        unit=draft.object.unit if draft.object else None,
+        currency=draft.object.currency if draft.object else None,
+        sentiment=draft.sentiment,
+        condition_text=draft.condition_text,
+        invalidation_text=draft.invalidation_text,
+        evidence_segment_indices=list(draft.evidence_segment_indices),
+        condition_evidence_segment_indices=list(draft.condition_evidence_segment_indices),
+        invalidation_evidence_segment_indices=list(draft.invalidation_evidence_segment_indices),
+        temporal_expressions=[
+            TemporalExpressionDraft(
+                role=(
+                    "REPORTING_PERIOD" if expression.pit_meaning == "REPORTING_PERIOD"
+                    else "FORECAST_TARGET" if expression.pit_meaning == "FORECAST_TARGET"
+                    else "VALID_AT"
+                ), raw_expression=expression.raw_expression,
+                scope_hint=None,
+                evidence_segment_indices=list(expression.evidence_segment_indices), confidence=expression.confidence,
+            ) for expression in draft.temporal_expressions
+        ],
+        extraction_confidence=draft.extraction_confidence,
+        extraction_model_id="atomic-claim-validator",
+        extraction_prompt_version="atomic-claim-validator.v1",
+        verbatim_quote=draft.verbatim_quote,
+        normalized_statement=draft.normalized_statement,
+        grounding_status="GROUNDED",
+        grounding_reason_codes=[],
+        contradiction_group_id=item.contradiction_group_id,
+        claim_schema_version="claim.atomic.v1",
+        legacy_grounding_incomplete=False,
+    )
 
 
 class EvidenceGroundingStage:
@@ -920,9 +1452,7 @@ class EvidenceGroundingStage:
             # Semantic segmentation is the authoritative boundary producer;
             # transcript remains an explicit compatibility reference.
             parent_artifact_ids=tuple(
-                item.artifact_id
-                for item in (context.artifacts.semantic_segments, transcript)
-                if item is not None
+                item.artifact_id for item in (context.artifacts.semantic_segments, transcript) if item is not None
             ),
         )
         context.artifacts.evidence = EvidenceArtifact(
@@ -1007,9 +1537,7 @@ class TemporalNormalizationStage:
                             except ValueError as exc:
                                 # Do not silently convert an unknown symbolic
                                 # anchor into the task-level as_of timestamp.
-                                raise ValueError(
-                                    f"unknown temporal anchor: {expression.anchor}"
-                                ) from exc
+                                raise ValueError(f"unknown temporal anchor: {expression.anchor}") from exc
                 draft_text = " ".join((draft.conclusion or "", draft.condition_text or ""))
                 normalized_words = "".join(draft_text.split()).casefold()
                 assertion_status = None
@@ -1025,8 +1553,7 @@ class TemporalNormalizationStage:
                     if any(marker in expression_text for marker in ("YTD", "TTM", "LTM", "NTM")):
                         metric_nature = None  # let the normalizer's exact labels win
                     elif any(
-                        marker in expression_text
-                        for marker in ("期末", "余额", "截至", "END", "ENDING", "AS OF")
+                        marker in expression_text for marker in ("期末", "余额", "截至", "END", "ENDING", "AS OF")
                     ):
                         metric_nature = MetricTemporalNature.INSTANT
                     elif (
@@ -1035,9 +1562,7 @@ class TemporalNormalizationStage:
                         or any(marker in expression_text for marker in ("Q", "季度", "FY", "年", "月"))
                     ):
                         metric_nature = MetricTemporalNature.DURATION
-                elif draft.claim_type in {"PRICE", "VALUATION"} and scope_hint in {
-                    None, TemporalScope.POINT
-                }:
+                elif draft.claim_type in {"PRICE", "VALUATION"} and scope_hint in {None, TemporalScope.POINT}:
                     metric_nature = MetricTemporalNature.SNAPSHOT
                 draft_bindings.append(
                     normalizer.normalize(
@@ -1068,9 +1593,7 @@ class TemporalNormalizationStage:
             for binding in (item for values in bindings_by_draft.values() for item in values):
                 available = getattr(binding, "reference_available_at", None)
                 if available is not None and available > candidate:
-                    raise ValueError(
-                        "REFERENCE_AS_OF_VIOLATION: reference available_at is after snapshot candidate"
-                    )
+                    raise ValueError("REFERENCE_AS_OF_VIOLATION: reference available_at is after snapshot candidate")
         context.state["temporal_bindings"] = [item for values in bindings_by_draft.values() for item in values]
         context.state["temporal_bindings_by_draft"] = bindings_by_draft
         context.runtime.metrics["temporal_normalized_count"] = float(
@@ -1084,45 +1607,47 @@ class TemporalNormalizationStage:
         )
         bindings = list(context.state["temporal_bindings"])
         binding_count = len(bindings)
-        context.runtime.metrics.update({
-            "temporal_binding_count": float(binding_count),
-            "temporal_normalization_success_rate": sum(
-                item.normalization_status == "NORMALIZED" for item in bindings
-            ) / max(1.0, float(binding_count)),
-            "temporal_normalization_partial_rate": sum(
-                item.normalization_status == "PARTIAL" for item in bindings
-            ) / max(1.0, float(binding_count)),
-            "temporal_normalization_unresolved_rate": sum(
-                item.normalization_status == "UNRESOLVED" for item in bindings
-            ) / max(1.0, float(binding_count)),
-            "temporal_partial_rate": sum(
-                item.normalization_status == "PARTIAL" for item in bindings
-            ) / max(1.0, float(binding_count)),
-            "temporal_unresolved_rate": sum(
-                item.normalization_status == "UNRESOLVED" for item in bindings
-            ) / max(1.0, float(binding_count)),
-            "temporal_role_distribution": {
-                str(getattr(item.role, "value", item.role)): sum(
-                    getattr(other.role, "value", other.role) == getattr(item.role, "value", item.role)
-                    for other in bindings
+        context.runtime.metrics.update(
+            {
+                "temporal_binding_count": float(binding_count),
+                "temporal_normalization_success_rate": sum(
+                    item.normalization_status == "NORMALIZED" for item in bindings
                 )
-                for item in sorted(bindings, key=lambda value: str(getattr(value.role, "value", value.role)))
-            },
-        })
+                / max(1.0, float(binding_count)),
+                "temporal_normalization_partial_rate": sum(item.normalization_status == "PARTIAL" for item in bindings)
+                / max(1.0, float(binding_count)),
+                "temporal_normalization_unresolved_rate": sum(
+                    item.normalization_status == "UNRESOLVED" for item in bindings
+                )
+                / max(1.0, float(binding_count)),
+                "temporal_partial_rate": sum(item.normalization_status == "PARTIAL" for item in bindings)
+                / max(1.0, float(binding_count)),
+                "temporal_unresolved_rate": sum(item.normalization_status == "UNRESOLVED" for item in bindings)
+                / max(1.0, float(binding_count)),
+                "temporal_role_distribution": {
+                    str(getattr(item.role, "value", item.role)): sum(
+                        getattr(other.role, "value", other.role) == getattr(item.role, "value", item.role)
+                        for other in bindings
+                    )
+                    for item in sorted(bindings, key=lambda value: str(getattr(value.role, "value", value.role)))
+                },
+            }
+        )
         unresolved = [item.expression_key for item in bindings if item.normalization_status == "UNRESOLVED"]
         context.runtime.metrics["unresolved_expression_collision_rate"] = (
             len(unresolved) - len(set(unresolved))
         ) / max(1.0, float(len(unresolved)))
         forecast_drafts = [item for item in context.state.get("claim_drafts") or () if item.claim_type == "FORECAST"]
         forecast_with_target = {
-            index for index, values in bindings_by_draft.items()
+            index
+            for index, values in bindings_by_draft.items()
             if any(getattr(binding, "role", None) is TemporalRole.FORECAST_TARGET for binding in values)
         }
-        context.runtime.metrics["forecast_target_missing_rate"] = (
-            sum(index not in forecast_with_target for index, item in enumerate(context.state.get("claim_drafts") or ())
-                if item.claim_type == "FORECAST")
-            / max(1.0, float(len(forecast_drafts)))
-        )
+        context.runtime.metrics["forecast_target_missing_rate"] = sum(
+            index not in forecast_with_target
+            for index, item in enumerate(context.state.get("claim_drafts") or ())
+            if item.claim_type == "FORECAST"
+        ) / max(1.0, float(len(forecast_drafts)))
         fiscal = [item for item in bindings if getattr(item.calendar_type, "value", item.calendar_type) == "FISCAL"]
         context.runtime.metrics["fiscal_period_unresolved_rate"] = sum(
             item.normalization_status in {"PARTIAL", "UNRESOLVED"} for item in fiscal
@@ -1130,19 +1655,17 @@ class TemporalNormalizationStage:
         market = [
             item
             for item in bindings
-            if item.market_session
-            or getattr(item.calendar_type, "value", item.calendar_type) == "EXCHANGE"
+            if item.market_session or getattr(item.calendar_type, "value", item.calendar_type) == "EXCHANGE"
         ]
         context.runtime.metrics["market_session_unresolved_rate"] = sum(
             not item.market_session for item in market
         ) / max(1.0, float(len(market)))
         metric_drafts = [
-            item
-            for item in context.state.get("claim_drafts") or ()
-            if item.claim_type == "FINANCIAL_METRIC"
+            item for item in context.state.get("claim_drafts") or () if item.claim_type == "FINANCIAL_METRIC"
         ]
         metric_binding_items = [
-            binding for index, values in bindings_by_draft.items()
+            binding
+            for index, values in bindings_by_draft.items()
             if index < len(context.state.get("claim_drafts") or ())
             and context.state["claim_drafts"][index].claim_type == "FINANCIAL_METRIC"
             for binding in values
@@ -1151,12 +1674,8 @@ class TemporalNormalizationStage:
             getattr(item.metric_temporal_nature, "value", item.metric_temporal_nature) in {None, "UNKNOWN"}
             for item in metric_binding_items
         ) / max(1.0, float(len(metric_binding_items) or len(metric_drafts)))
-        planned = sum(
-            getattr(item.assertion_status, "value", item.assertion_status) == "PLANNED" for item in bindings
-        )
-        actual = sum(
-            getattr(item.assertion_status, "value", item.assertion_status) == "ACTUAL" for item in bindings
-        )
+        planned = sum(getattr(item.assertion_status, "value", item.assertion_status) == "PLANNED" for item in bindings)
+        actual = sum(getattr(item.assertion_status, "value", item.assertion_status) == "ACTUAL" for item in bindings)
         context.runtime.metrics["planned_vs_actual_ratio"] = planned / max(1.0, float(actual))
         return _stage_result(context)
 
@@ -1178,7 +1697,8 @@ class ClaimCanonicalizationStage:
                 temporal_bindings=(context.state.get("temporal_bindings_by_draft") or {}).get(index, []),
                 evidence_refs=[],
                 normalization_version=str(configured_normalization_version)
-                if configured_normalization_version else None,
+                if configured_normalization_version
+                else None,
             )
             for index, draft in enumerate(context.state.get("claim_drafts") or ())
         ]
@@ -1204,10 +1724,14 @@ def _stage_timestamp(context: PipelineContext) -> datetime:
     # transcript boundary as the source run unless an explicit replay clock
     # was supplied.
     replay_without_explicit_clock = context.options.get("replay_lifecycle_timestamp") == "derive_transcript_boundary"
-    value = None if replay_without_explicit_clock else (
-        context.options.get("snapshot_commit_candidate")
-        or context.options.get("available_from")
-        or context.options.get("as_of")
+    value = (
+        None
+        if replay_without_explicit_clock
+        else (
+            context.options.get("snapshot_commit_candidate")
+            or context.options.get("available_from")
+            or context.options.get("as_of")
+        )
     )
     if value is None and not (
         context.options.get("offline_fixture") or "transcript" in context.options or "segments" in context.options
@@ -1239,13 +1763,13 @@ class ClaimOccurrencePersistenceStage:
         if transcript is None or semantic_artifact is None:
             raise ValueError("occurrence persistence requires transcript and semantic segments")
         timestamp = _stage_timestamp(context)
+
         def _time(name: str, fallback: datetime | None = None) -> datetime | None:
             value = context.options.get(name, fallback)
             return _resolved_datetime(value, name)
+
         fixture_clock = bool(
-            context.options.get("offline_fixture")
-            or "transcript" in context.options
-            or "segments" in context.options
+            context.options.get("offline_fixture") or "transcript" in context.options or "segments" in context.options
         )
         # Production clocks describe actual processing events.  ``as_of`` is
         # a business/query clock and must never become a Unix-epoch-like
@@ -1306,9 +1830,7 @@ class ClaimOccurrencePersistenceStage:
                 ClaimOccurrence(
                     claim_id=claim.claim_id,
                     source_artifact_id=(
-                        context.artifacts.source.artifact_id
-                        if context.artifacts.source
-                        else transcript.artifact_id
+                        context.artifacts.source.artifact_id if context.artifacts.source else transcript.artifact_id
                     ),
                     transcript_artifact_id=transcript.artifact_id,
                     semantic_segment_id=draft.semantic_segment_id,
@@ -1325,16 +1847,18 @@ class ClaimOccurrencePersistenceStage:
                             "anchor": expression.anchor,
                             "confidence": expression.confidence,
                             "evidence_segment_indices": list(expression.evidence_segment_indices),
-                            "grounded_evidence_refs": list(next(
-                                (
-                                    binding.source_evidence_refs
-                                    for binding in context.state.get("temporal_bindings_by_draft", {}).get(
-                                        draft_index, []
-                                    )
-                                    if getattr(binding, "raw_expression", None) == expression.raw_expression
-                                ),
-                                [],
-                            )),
+                            "grounded_evidence_refs": list(
+                                next(
+                                    (
+                                        binding.source_evidence_refs
+                                        for binding in context.state.get("temporal_bindings_by_draft", {}).get(
+                                            draft_index, []
+                                        )
+                                        if getattr(binding, "raw_expression", None) == expression.raw_expression
+                                    ),
+                                    [],
+                                )
+                            ),
                         }
                         for expression in draft.temporal_expressions
                     ],
@@ -1342,6 +1866,13 @@ class ClaimOccurrencePersistenceStage:
                         "model_id": draft.extraction_model_id,
                         "prompt_version": draft.extraction_prompt_version,
                     },
+                    primary_quote=draft.verbatim_quote,
+                    normalized_statement=draft.normalized_statement,
+                    grounding_status=draft.grounding_status,
+                    grounding_reason_codes=list(draft.grounding_reason_codes),
+                    contradiction_group_id=draft.contradiction_group_id,
+                    claim_schema_version=draft.claim_schema_version,
+                    legacy_grounding_incomplete=draft.legacy_grounding_incomplete,
                 )
             )
         occurrence_artifact = ClaimOccurrenceArtifact(
@@ -1400,9 +1931,7 @@ class LifecycleProjectionStage:
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         fixture_clock = bool(
-            context.options.get("offline_fixture")
-            or "transcript" in context.options
-            or "segments" in context.options
+            context.options.get("offline_fixture") or "transcript" in context.options or "segments" in context.options
         )
         # A fixture without an explicit business clock must be replayable.  The
         # download compatibility adapter may expose a wall-clock source
@@ -1410,8 +1939,7 @@ class LifecycleProjectionStage:
         # is not a lifecycle business clock.  Use the immutable transcript
         # boundary for both the initial run and replay.
         if fixture_clock and not any(
-            context.options.get(key)
-            for key in ("as_of", "available_from", "replay_lifecycle_timestamp")
+            context.options.get(key) for key in ("as_of", "available_from", "replay_lifecycle_timestamp")
         ):
             end_ms = max(
                 (item.end_ms for item in context.artifacts.transcript.segments),
@@ -1424,8 +1952,8 @@ class LifecycleProjectionStage:
         occurrences = list(context.state.get("occurrences") or ())
         events = []
         for target_type, target_id in [
-            *(('CLAIM', item.claim_id) for item in claims),
-            *(('OCCURRENCE', item.occurrence_id) for item in occurrences),
+            *(("CLAIM", item.claim_id) for item in claims),
+            *(("OCCURRENCE", item.occurrence_id) for item in occurrences),
         ]:
             events.append(
                 KnowledgeLifecycleEvent(
@@ -1443,9 +1971,7 @@ class LifecycleProjectionStage:
             artifact_id="lifecycle-pending",
             artifact_type="lifecycle",
             producer_stage=self.name,
-            claim_lifecycle_event_ids=[
-                item.lifecycle_event_id for item in events if item.target_type.value == "CLAIM"
-            ],
+            claim_lifecycle_event_ids=[item.lifecycle_event_id for item in events if item.target_type.value == "CLAIM"],
             occurrence_lifecycle_event_ids=[
                 item.lifecycle_event_id for item in events if item.target_type.value == "OCCURRENCE"
             ],
@@ -1453,9 +1979,7 @@ class LifecycleProjectionStage:
             lifecycle_knowledge_as_of=timestamp,
             policy_version="lifecycle.v1",
             parent_artifact_ids=tuple(
-                item.artifact_id
-                for item in (occurrence_artifact, context.artifacts.verification)
-                if item is not None
+                item.artifact_id for item in (occurrence_artifact, context.artifacts.verification) if item is not None
             ),
         )
         context.artifacts.lifecycle = LifecycleArtifact(
@@ -1477,8 +2001,7 @@ class LifecycleProjectionStage:
                 artifact_type="knowledge",
                 producer_stage="knowledge_projection",
                 verification_artifact_id=(
-                    context.artifacts.verification.artifact_id
-                    if context.artifacts.verification else ""
+                    context.artifacts.verification.artifact_id if context.artifacts.verification else ""
                 ),
                 knowledge_units=[unit.knowledge_uid for unit in context.state.get("knowledge") or ()],
                 parent_artifact_ids=(lifecycle_id,),
@@ -1489,10 +2012,9 @@ class LifecycleProjectionStage:
         # Durable event inserts are deferred to the snapshot commit boundary.
         context.runtime.metrics["lifecycle_event_count"] = float(len(events))
         context.runtime.metrics["lifecycle_transition_count"] = float(len(events))
-        correction_count = float(sum(
-            str(item.reason_code).upper() in {"CORRECTION", "CORRECTED", "REVISED"}
-            for item in events
-        ))
+        correction_count = float(
+            sum(str(item.reason_code).upper() in {"CORRECTION", "CORRECTED", "REVISED"} for item in events)
+        )
         context.runtime.metrics["correction_count"] = correction_count
         context.runtime.metrics["lifecycle_correction_count"] = correction_count
         return _stage_result(context, "lifecycle", "knowledge")
@@ -1663,10 +2185,7 @@ class KnowledgeExtractionStage:
                     "statement": unit.statement,
                     "claim_type": (
                         "FINANCIAL_METRIC"
-                        if any(
-                            term in unit.statement
-                            for term in ("营收", "收入", "利润", "业绩", "毛利率")
-                        )
+                        if any(term in unit.statement for term in ("营收", "收入", "利润", "业绩", "毛利率"))
                         else "INDUSTRY_RELATION"
                     ),
                     "knowledge_kind": "STATE",
@@ -1708,15 +2227,16 @@ class KnowledgeExtractionStage:
                     "start_ms": int(segment.start_seconds * 1000),
                     "end_ms": int(segment.end_seconds * 1000),
                 }
-                evidence_id = "evidence-" + hashlib.sha256(
-                    canonical_json(
-                        {"source": transcript.artifact_id, "locator": locator, "raw": raw}
-                    ).encode()
-                ).hexdigest()[:32]
+                evidence_id = (
+                    "evidence-"
+                    + hashlib.sha256(
+                        canonical_json({"source": transcript.artifact_id, "locator": locator, "raw": raw}).encode()
+                    ).hexdigest()[:32]
+                )
                 evidence_items.append(
                     EvidenceItem(
                         evidence_id=evidence_id,
-                        source_type="ASR",
+                        source_type=segment.source,
                         evidence_text=raw,
                         start_ms=locator["start_ms"],
                         end_ms=locator["end_ms"],
@@ -1729,8 +2249,14 @@ class KnowledgeExtractionStage:
                 )
         ocr_sources: dict[tuple[str, str], list[str]] = {}
         for artifact in context.artifacts.ocr:
-            frame_id = next((frame.frame_id for frame in context.artifacts.frames
-                             if frame.artifact_id == artifact.frame_artifact_id), "")
+            frame_id = next(
+                (
+                    frame.frame_id
+                    for frame in context.artifacts.frames
+                    if frame.artifact_id == artifact.frame_artifact_id
+                ),
+                "",
+            )
             ocr_sources.setdefault((frame_id, artifact.text), []).append(artifact.artifact_id)
         for item in context.state.ocr_evidence:
             raw = str(item.get("evidence_text") or item.get("text") or "")
@@ -1745,9 +2271,12 @@ class KnowledgeExtractionStage:
                 "timestamp_ms": item.get("timestamp_ms"),
                 "bbox": item.get("bbox"),
             }
-            evidence_id = "evidence-" + hashlib.sha256(
-                canonical_json({"source": source, "locator": locator, "raw": raw}).encode()
-            ).hexdigest()[:32]
+            evidence_id = (
+                "evidence-"
+                + hashlib.sha256(
+                    canonical_json({"source": source, "locator": locator, "raw": raw}).encode()
+                ).hexdigest()[:32]
+            )
             evidence_items.append(
                 EvidenceItem(
                     evidence_id=evidence_id,
@@ -1764,8 +2293,14 @@ class KnowledgeExtractionStage:
             )
         vision_sources: dict[tuple[str, str], list[str]] = {}
         for artifact in context.artifacts.vision:
-            frame_id = next((frame.frame_id for frame in context.artifacts.frames
-                             if frame.artifact_id == artifact.frame_artifact_id), "")
+            frame_id = next(
+                (
+                    frame.frame_id
+                    for frame in context.artifacts.frames
+                    if frame.artifact_id == artifact.frame_artifact_id
+                ),
+                "",
+            )
             vision_sources.setdefault((frame_id, artifact.label), []).append(artifact.artifact_id)
         for item in context.state.frame_insights:
             raw = str(item.get("description") or item.get("label") or "")
@@ -1779,9 +2314,12 @@ class KnowledgeExtractionStage:
                 "frame_id": item.get("frame_id"),
                 "timestamp_ms": item.get("timestamp_ms"),
             }
-            evidence_id = "evidence-" + hashlib.sha256(
-                canonical_json({"source": source, "locator": locator, "raw": raw}).encode()
-            ).hexdigest()[:32]
+            evidence_id = (
+                "evidence-"
+                + hashlib.sha256(
+                    canonical_json({"source": source, "locator": locator, "raw": raw}).encode()
+                ).hexdigest()[:32]
+            )
             evidence_items.append(
                 EvidenceItem(
                     evidence_id=evidence_id,
@@ -1810,8 +2348,7 @@ class KnowledgeExtractionStage:
             dict.fromkeys(
                 [
                     *source_ids,
-                    context.artifacts.semantic_segments.artifact_id
-                    if context.artifacts.semantic_segments else "",
+                    context.artifacts.semantic_segments.artifact_id if context.artifacts.semantic_segments else "",
                 ]
             )
         )
@@ -1824,10 +2361,9 @@ class KnowledgeExtractionStage:
             source_artifact_ids=source_ids,
             parent_artifact_ids=tuple(item for item in evidence_parent_ids if item),
         )
-        context.artifacts.evidence = EvidenceArtifact(
-            **{**evidence.__dict__, "artifact_id": artifact_id_of(evidence)}
-        )
+        context.artifacts.evidence = EvidenceArtifact(**{**evidence.__dict__, "artifact_id": artifact_id_of(evidence)})
         context.state.evidence = evidence_items
+
         def support_status(value: object) -> str:
             normalized = str(value or "").upper()
             return {
@@ -1851,8 +2387,7 @@ class KnowledgeExtractionStage:
                     (
                         item
                         for item in evidence_items
-                        if item.evidence_text == text
-                        and (not source_type or item.source_type == source_type)
+                        if item.evidence_text == text and (not source_type or item.source_type == source_type)
                     ),
                     None,
                 )
@@ -1893,23 +2428,17 @@ class KnowledgeExtractionStage:
                     subject_id=str(record.get("subject_key") or record.get("knowledge_uid")),
                     predicate=str(record.get("predicate_key") or "statement"),
                     value=(
-                        record.get("value")
-                        if record.get("value") is not None
-                        else str(record.get("statement") or "")
+                        record.get("value") if record.get("value") is not None else str(record.get("statement") or "")
                     ),
                     unit=record.get("unit"),
                     currency=record.get("currency"),
                     fact_time=record.get("as_of_time"),
-                    published_at=(
-                        context.state.video.published_at if context.state.video else None
-                    ),
+                    published_at=(context.state.video.published_at if context.state.video else None),
                     evidence_refs=claim_refs,
                     source_support_status=support_status(record.get("support_status")),
                     source_confidence=float(record.get("support_score") or 0.75),
                     extractor_confidence=float(record.get("extraction_confidence") or 0.75),
-                    extraction_model_id=str(
-                        (record.get("attributes") or {}).get("model") or "fixture"
-                    ),
+                    extraction_model_id=str((record.get("attributes") or {}).get("model") or "fixture"),
                     extraction_prompt_version=str(
                         (record.get("attributes") or {}).get("prompt_version") or "fixture.v1"
                     ),
@@ -1930,9 +2459,7 @@ class KnowledgeExtractionStage:
         results = [
             VerificationResult(
                 claim_id=claim.claim_id,
-                status=(
-                    "VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED"
-                ),
+                status=("VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED"),
             )
             for claim in claims
         ]
@@ -1953,9 +2480,7 @@ class KnowledgeExtractionStage:
                 artifact_type="lifecycle",
                 producer_stage="lifecycle_projection",
                 claim_lifecycle_event_ids=list(context.artifacts.lifecycle.claim_lifecycle_event_ids or ()),
-                occurrence_lifecycle_event_ids=list(
-                    context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ()
-                ),
+                occurrence_lifecycle_event_ids=list(context.artifacts.lifecycle.occurrence_lifecycle_event_ids or ()),
                 lifecycle_business_as_of=context.artifacts.lifecycle.lifecycle_business_as_of,
                 lifecycle_knowledge_as_of=context.artifacts.lifecycle.lifecycle_knowledge_as_of,
                 policy_version=context.artifacts.lifecycle.policy_version,
@@ -1987,21 +2512,24 @@ class KnowledgeExtractionStage:
         for record, claim, occurrence in zip(records, claims, occurrences):
             record["claim_type"] = claim.claim_type
             attributes = dict(record.get("attributes") or {})
-            attributes.update({
-                "claim_id": claim.claim_id,
-                "occurrence_id": occurrence.occurrence_id,
-                "semantic_segment_id": occurrence.semantic_segment_id,
-                "asserted_at": occurrence.times.asserted_at.isoformat()
-                if occurrence.times.asserted_at else None,
-                "source_published_at": occurrence.times.source_published_at.isoformat()
-                if occurrence.times.source_published_at else None,
-                "source_available_at": occurrence.times.source_available_at.isoformat()
-                if occurrence.times.source_available_at else None,
-                "source_availability_quality": occurrence.times.source_availability_quality.value,
-                "ingested_at": occurrence.times.ingested_at.isoformat(),
-                "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
-                "available_from": occurrence.times.available_from.isoformat(),
-            })
+            attributes.update(
+                {
+                    "claim_id": claim.claim_id,
+                    "occurrence_id": occurrence.occurrence_id,
+                    "semantic_segment_id": occurrence.semantic_segment_id,
+                    "asserted_at": occurrence.times.asserted_at.isoformat() if occurrence.times.asserted_at else None,
+                    "source_published_at": occurrence.times.source_published_at.isoformat()
+                    if occurrence.times.source_published_at
+                    else None,
+                    "source_available_at": occurrence.times.source_available_at.isoformat()
+                    if occurrence.times.source_available_at
+                    else None,
+                    "source_availability_quality": occurrence.times.source_availability_quality.value,
+                    "ingested_at": occurrence.times.ingested_at.isoformat(),
+                    "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
+                    "available_from": occurrence.times.available_from.isoformat(),
+                }
+            )
             record["attributes"] = attributes
             record["_claim_id"] = claim.claim_id
         return True
@@ -2009,9 +2537,7 @@ class KnowledgeExtractionStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         available_from = self._timestamp(context.options.get("available_from") or context.options.get("as_of"))
         fixture = bool(
-            context.options.get("offline_fixture")
-            or "transcript" in context.options
-            or "segments" in context.options
+            context.options.get("offline_fixture") or "transcript" in context.options or "segments" in context.options
         )
         if self._authoritative_only and not fixture:
             return self._project_authoritative(context, available_from)
@@ -2030,9 +2556,7 @@ class KnowledgeExtractionStage:
             results = [
                 VerificationResult(
                     claim_id=claim.claim_id,
-                    status=(
-                        "VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED"
-                    ),
+                    status=("VERIFICATION_PENDING" if claim.fact_category == "FACT" else "NOT_REQUIRED"),
                 )
                 for claim in context.state.get("claims") or ()
             ]
@@ -2073,13 +2597,9 @@ class KnowledgeExtractionStage:
                 artifact_type="occurrences",
                 producer_stage="claim_occurrence_persistence",
                 semantic_segment_artifact_id=(
-                    context.artifacts.semantic_segments.artifact_id
-                    if context.artifacts.semantic_segments
-                    else ""
+                    context.artifacts.semantic_segments.artifact_id if context.artifacts.semantic_segments else ""
                 ),
-                evidence_artifact_id=(
-                    context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""
-                ),
+                evidence_artifact_id=(context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""),
                 occurrence_ids=list(context.artifacts.occurrences.occurrence_ids or ()),
                 parent_artifact_ids=tuple(
                     item.artifact_id
@@ -2094,9 +2614,7 @@ class KnowledgeExtractionStage:
                 artifact_id="claims-fixture-chain-pending",
                 artifact_type="claims",
                 producer_stage="claim_occurrence_persistence",
-                evidence_artifact_id=(
-                    context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""
-                ),
+                evidence_artifact_id=(context.artifacts.evidence.artifact_id if context.artifacts.evidence else ""),
                 claims=[claim.claim_id for claim in context.state.claims],
                 parent_artifact_ids=(context.artifacts.occurrences.artifact_id,),
             )
@@ -2106,10 +2624,7 @@ class KnowledgeExtractionStage:
         context.state["knowledge"] = self._to_domain(context.state["video"].video_id, records, available_from)
         claims_by_id = {claim.claim_id: claim for claim in context.state.claims}
         claims_by_uid = {
-            str(record.get("knowledge_uid")): (
-                claims_by_id.get(str(record.get("_claim_id")))
-                or claim
-            )
+            str(record.get("knowledge_uid")): (claims_by_id.get(str(record.get("_claim_id"))) or claim)
             for record, claim in zip(records, context.state.claims)
         }
         for unit in context.state.knowledge:
@@ -2129,15 +2644,11 @@ class KnowledgeExtractionStage:
             artifact_type="knowledge",
             producer_stage="knowledge",
             verification_artifact_id=(
-                context.artifacts.verification.artifact_id
-                if context.artifacts.verification
-                else ""
+                context.artifacts.verification.artifact_id if context.artifacts.verification else ""
             ),
             knowledge_units=[unit.knowledge_uid for unit in knowledge_units],
             parent_artifact_ids=(
-                (context.artifacts.verification.artifact_id,)
-                if context.artifacts.verification
-                else ()
+                (context.artifacts.verification.artifact_id,) if context.artifacts.verification else ()
             ),
         )
         context.artifacts.knowledge = KnowledgeArtifact(
@@ -2199,37 +2710,42 @@ class KnowledgeExtractionStage:
             projection = KnowledgeProjectionBuilder().build(claim, occurrence, verification_results[len(records)])
             projected_attributes = dict(projection.get("attributes", {}))
             if occurrence is not None:
-                projected_attributes.update({
-                    "source_available_at": (
-                        occurrence.times.source_available_at.isoformat()
-                        if occurrence.times.source_available_at else None
-                    ),
-                    "source_availability_quality": occurrence.times.source_availability_quality.value,
-                    "ingested_at": occurrence.times.ingested_at.isoformat(),
-                    "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
-                    "available_from": occurrence.times.available_from.isoformat(),
-                })
-            records.append({
-                "knowledge_uid": projection["knowledge_uid"],
-                "statement": str(claim.value if isinstance(claim.value, str) else claim.predicate),
-                "knowledge_kind": claim.fact_category,
-                "subject_key": claim.subject_id,
-                "ticker": claim.ticker,
-                "sentiment": "NEUTRAL",
-                "support_status": {
-                    "SUPPORTED": "SOURCE_SUPPORTED",
-                    "PARTIALLY_SUPPORTED": "SOURCE_PARTIAL",
-                }.get(claim.source_support_status, "SOURCE_UNSUPPORTED"),
-                "truth_status": "NOT_CHECKED",
-                "lifecycle_status": "ACTIVE",
-                "support_score": claim.source_confidence,
-                "extraction_confidence": claim.extractor_confidence,
-                "as_of_time": available_from,
-                "attributes": projected_attributes,
-                "extractor_version": claim.extraction_prompt_version,
-                "schema_version": claim.claim_schema_version,
-                "semantic_hash": claim.claim_id,
-            })
+                projected_attributes.update(
+                    {
+                        "source_available_at": (
+                            occurrence.times.source_available_at.isoformat()
+                            if occurrence.times.source_available_at
+                            else None
+                        ),
+                        "source_availability_quality": occurrence.times.source_availability_quality.value,
+                        "ingested_at": occurrence.times.ingested_at.isoformat(),
+                        "extraction_completed_at": occurrence.times.extraction_completed_at.isoformat(),
+                        "available_from": occurrence.times.available_from.isoformat(),
+                    }
+                )
+            records.append(
+                {
+                    "knowledge_uid": projection["knowledge_uid"],
+                    "statement": projection["statement"],
+                    "knowledge_kind": claim.fact_category,
+                    "subject_key": claim.subject_id,
+                    "ticker": claim.ticker,
+                    "sentiment": "NEUTRAL",
+                    "support_status": {
+                        "SUPPORTED": "SOURCE_SUPPORTED",
+                        "PARTIALLY_SUPPORTED": "SOURCE_PARTIAL",
+                    }.get(claim.source_support_status, "SOURCE_UNSUPPORTED"),
+                    "truth_status": "NOT_CHECKED",
+                    "lifecycle_status": "ACTIVE",
+                    "support_score": claim.source_confidence,
+                    "extraction_confidence": claim.extractor_confidence,
+                    "as_of_time": available_from,
+                    "attributes": projected_attributes,
+                    "extractor_version": claim.extraction_prompt_version,
+                    "schema_version": claim.claim_schema_version,
+                    "semantic_hash": claim.claim_id,
+                }
+            )
         context.state["knowledge"] = self._to_domain(context.state["video"].video_id, records, available_from)
         knowledge = KnowledgeArtifact(
             artifact_id="knowledge-pending",
@@ -2365,8 +2881,17 @@ class SnapshotRecordingStage:
 
     name = "content_snapshot"
     required_inputs = (
-        "source", "media", "transcript", "semantic_segments", "evidence", "claims", "occurrences",
-        "verification", "lifecycle", "knowledge", "summary",
+        "source",
+        "media",
+        "transcript",
+        "semantic_segments",
+        "evidence",
+        "claims",
+        "occurrences",
+        "verification",
+        "lifecycle",
+        "knowledge",
+        "summary",
     )
     output_types = ()
 
@@ -2381,6 +2906,7 @@ class SnapshotRecordingStage:
         claim_event_repository=None,
         signal_service=None,
         publication_uow=None,
+        fenced_effects=None,
     ) -> None:
         self._snapshots = snapshot_service
         self._artifact_repository = artifact_repository
@@ -2391,38 +2917,58 @@ class SnapshotRecordingStage:
         self._claim_events = claim_event_repository
         self._signal_service = signal_service
         self._publication_uow = publication_uow
+        self._fenced_effects = fenced_effects
 
     def execute(self, context: PipelineContext) -> PipelineContext:
         """Plan and publish under one repository-owned verification UoW."""
+        return self._execute_with_planning_uow(context)
+
+    def _execute_with_planning_uow(self, context: PipelineContext) -> PipelineContext:
         keys = [
             (claim.claim_id, str(context.options.get("verification_provider") or "quant"))
             for claim in (context.state.get("claims") or ())
         ]
         planner_uow = getattr(self._verification_jobs, "planning_uow", None)
-        scope = (
-            planner_uow(keys)
-            if planner_uow is not None and keys
-            else nullcontext(None)
-        )
+        if planner_uow is not None and keys:
+            scope = planner_uow(keys)
+        elif self._fenced_effects is not None and context.worker_id and context.fencing_token is not None:
+            # An empty claim set has no verification-planner lock to borrow.
+            # Use the same task-fenced UoW rather than passing ``None`` to a
+            # production snapshot effect.
+            scope = self._fenced_effects.fenced_transaction(
+                context.task_id,
+                context.worker_id,
+                context.fencing_token,
+            )
+        else:
+            scope = nullcontext(None)
         with scope as session:
             return self._execute_in_uow(context, session=session)
 
     def _execute_in_uow(self, context: PipelineContext, *, session=None) -> PipelineContext:
+        self._require_effect_fence(context, session)
         registry = context.artifacts
         mandatory = {
-            "source": registry.source, "media": registry.media, "transcript": registry.transcript,
-            "evidence": registry.evidence, "claims": registry.claims, "verification": registry.verification,
-            "knowledge": registry.knowledge, "summary": registry.summary,
+            "source": registry.source,
+            "media": registry.media,
+            "transcript": registry.transcript,
+            "evidence": registry.evidence,
+            "claims": registry.claims,
+            "verification": registry.verification,
+            "knowledge": registry.knowledge,
+            "summary": registry.summary,
         }
-        semantic_enabled = bool((context.options.get("pipeline_config") or {}).get(
-            "semantic_segmentation_enabled", True
-        ))
+        semantic_enabled = bool(
+            (context.options.get("pipeline_config") or {}).get("semantic_segmentation_enabled", True)
+        )
         if semantic_enabled:
-            mandatory.update({
-                "semantic_segments": registry.semantic_segments,
-                "occurrences": registry.occurrences,
-                "lifecycle": registry.lifecycle,
-            })
+            mandatory.update(
+                {
+                    "semantic_segments": registry.semantic_segments,
+                    "occurrences": registry.occurrences,
+                    "lifecycle": registry.lifecycle,
+                }
+            )
         missing = [slot for slot, artifact in mandatory.items() if artifact is None]
         if missing:
             raise ContentSnapshotPersistError(
@@ -2434,7 +2980,8 @@ class SnapshotRecordingStage:
         # ensures the exact job/result lineage is what gets committed.
         snapshot_candidate = (
             context.state.occurrences[0].times.snapshot_committed_at
-            if context.state.get("occurrences") else _stage_timestamp(context)
+            if context.state.get("occurrences")
+            else _stage_timestamp(context)
         )
         for binding in context.state.get("temporal_bindings") or ():
             available_at = getattr(binding, "reference_available_at", None)
@@ -2454,9 +3001,7 @@ class SnapshotRecordingStage:
                 snapshot_candidate_time=snapshot_candidate,
                 verification_repository=self._verification_repository or self._verification_jobs,
                 job_repository=self._verification_jobs,
-                current_policy_version=str(
-                    context.options.get("verification_rule_version") or "verification_rule.v1"
-                ),
+                current_policy_version=str(context.options.get("verification_rule_version") or "verification_rule.v1"),
                 trace_id=context.trace.get("trace_id"),
                 session=session,
             )
@@ -2499,26 +3044,28 @@ class SnapshotRecordingStage:
                         getattr(binding, "start_date", None) is not None
                         and getattr(binding, "end_date", None) is not None
                     )
-                    reference_type = "exchange_calendar" if calendar == "EXCHANGE" else (
-                        "fiscal_period" if has_resolved_period else "fiscal_calendar"
+                    reference_type = (
+                        "exchange_calendar"
+                        if calendar == "EXCHANGE"
+                        else ("fiscal_period" if has_resolved_period else "fiscal_calendar")
                     )
                     period_label = str(getattr(binding, "period_label", "") or "")
                     binding_key = f"{reference_type}|{subject_key}|{period_label}"
                     reference_snapshot_ids.add(str(snapshot_id))
-                    reference_records.append({
-                        "reference_type": reference_type,
-                        "subject_key": subject_key,
-                        "period_label": period_label,
-                        "binding_key": binding_key,
-                        "reference_snapshot_id": str(snapshot_id),
-                        "data_version": str(data_version),
-                        "available_at": available_at.isoformat(),
-                    })
+                    reference_records.append(
+                        {
+                            "reference_type": reference_type,
+                            "subject_key": subject_key,
+                            "period_label": period_label,
+                            "binding_key": binding_key,
+                            "reference_snapshot_id": str(snapshot_id),
+                            "data_version": str(data_version),
+                            "available_at": available_at.isoformat(),
+                        }
+                    )
             # De-duplicate by the complete lookup contract, then sort to make
             # manifest identity independent of draft/expression iteration.
-            reference_records = sorted({
-                tuple(sorted(item.items())) for item in reference_records
-            })
+            reference_records = sorted({tuple(sorted(item.items())) for item in reference_records})
             reference_records = [dict(item) for item in reference_records]
             if reference_records:
                 producer_manifest["reference_data"] = reference_records
@@ -2542,12 +3089,8 @@ class SnapshotRecordingStage:
                 code_sha=str(producer_manifest["code_sha"]),
                 prompt_versions={
                     "extraction": context.options.get("extraction_prompt_version", "extraction.v1"),
-                    "normalization": context.options.get(
-                        "normalization_prompt_version", "normalization.v1"
-                    ),
-                    "verification": context.options.get(
-                        "verification_prompt_version", "verification.v1"
-                    ),
+                    "normalization": context.options.get("normalization_prompt_version", "normalization.v1"),
+                    "verification": context.options.get("verification_prompt_version", "verification.v1"),
                     "summary": context.options.get("summary_prompt_version", "summary.v1"),
                 },
                 configuration={
@@ -2568,14 +3111,12 @@ class SnapshotRecordingStage:
                 ),
                 policy_versions={
                     "claim": context.options.get("claim_policy_version", "claim_policy.v1"),
-                    "verification": context.options.get(
-                        "verification_policy_version", "verification_policy.v1"
-                    ),
+                    "verification": context.options.get("verification_policy_version", "verification_policy.v1"),
                     "signal": context.options.get("signal_policy_version", "signal_policy.v1"),
                 },
-                quant_market_snapshot_ids=sorted({
-                    str(item) for item in (context.options.get("quant_market_snapshot_ids") or ())
-                }),
+                quant_market_snapshot_ids=sorted(
+                    {str(item) for item in (context.options.get("quant_market_snapshot_ids") or ())}
+                ),
                 config_hash=str(producer_manifest["configs"]["config_hash"]),
                 snapshot_kind=str(context.options.get("replay_snapshot_kind") or "INITIAL"),
                 parent_snapshot_id=context.options.get("replay_parent_snapshot_id"),
@@ -2588,15 +3129,18 @@ class SnapshotRecordingStage:
                 "occurrences": tuple(context.state.get("occurrences") or ()),
                 "lifecycle_events": tuple(context.state.get("lifecycle_events") or ()),
                 "verification_results": (
-                    tuple(verification_plan.terminal_results_to_insert)
-                    if verification_plan is not None else ()
+                    tuple(verification_plan.terminal_results_to_insert) if verification_plan is not None else ()
                 ),
                 "verification_jobs": (
-                    tuple(verification_plan.pending_jobs_to_insert)
-                    if verification_plan is not None else ()
+                    tuple(verification_plan.pending_jobs_to_insert) if verification_plan is not None else ()
                 ),
             }
             if self._publication_uow is not None:
+                # The publication, snapshot membership, signal rows and
+                # outbox share this session. Check the lease immediately
+                # before the irreversible SQL publication boundary as well as
+                # when the stage begins.
+                self._require_effect_fence(context, session)
                 signals = []
                 if self._signal_service is not None and context.artifacts.verification is not None:
                     for result in context.artifacts.verification.results:
@@ -2604,9 +3148,7 @@ class SnapshotRecordingStage:
                             (item for item in context.state.claims if item.claim_id == result.claim_id),
                             None,
                         )
-                        if claim is None or claim.claim_type in {
-                            "PRICE", "RETURN", "VALUATION", "FINANCIAL_METRIC"
-                        }:
+                        if claim is None or claim.claim_type in {"PRICE", "RETURN", "VALUATION", "FINANCIAL_METRIC"}:
                             continue
                         verification_view = result.model_dump(mode="json") | {"provider": "none"}
                         payload = self._signal_service.build_signal(
@@ -2617,9 +3159,7 @@ class SnapshotRecordingStage:
                             trace_id=context.trace.get("trace_id"),
                             decision_id=context.trace.get("decision_id"),
                         )
-                        if self._signal_service.policy.evaluate(
-                            claim, verification_view, snapshot=snapshot
-                        ).allowed:
+                        if self._signal_service.policy.evaluate(claim, verification_view, snapshot=snapshot).allowed:
                             signals.append(payload)
                 publication_manifest = dict(snapshot.producer_manifest)
                 publication_manifest["artifact_membership"] = dict(snapshot.artifact_ids)
@@ -2627,9 +3167,7 @@ class SnapshotRecordingStage:
                 self._publication_uow.publish(
                     content_snapshot_id=snapshot.content_snapshot_id,
                     query_hash="ingest:" + snapshot.content_snapshot_id,
-                    signal_policy_version=str(
-                        context.options.get("signal_policy_version") or "signal-policy.v1"
-                    ),
+                    signal_policy_version=str(context.options.get("signal_policy_version") or "signal-policy.v1"),
                     manifest=publication_manifest,
                     signals=signals,
                     outbox_events=signals,
@@ -2658,9 +3196,20 @@ class SnapshotRecordingStage:
                 # even when the event itself is idempotent.
                 tails: dict[str, str] = {}
                 existing_ids: dict[str, set[str]] = {}
+                existing_initial_keys: dict[str, set[str]] = {}
                 for claim_id in {str(item.claim_id) for item in context.state.get("claims") or ()}:
                     existing_events = self._claim_events.list_for_claim(claim_id)
                     existing_ids[claim_id] = {item.event_id for item in existing_events}
+                    initial_keys = [
+                        event_logical_identity(item)
+                        for item in existing_events
+                        if item.event_type == "VERIFICATION_INITIAL"
+                    ]
+                    if len(initial_keys) != len(set(initial_keys)):
+                        raise ContentSnapshotPersistError(
+                            "CONTENT_SNAPSHOT_PERSIST_FAILED: ambiguous verification initial projection"
+                        )
+                    existing_initial_keys[claim_id] = set(initial_keys)
                     if existing_events:
                         tails[claim_id] = existing_events[-1].event_hash
                 pending_events: list[ClaimStateEvent] = []
@@ -2684,22 +3233,29 @@ class SnapshotRecordingStage:
                         claim, occurrence, entry, snapshot.content_snapshot_id, producer_commit
                     )
                     state_payload["status"] = status
-                    pending_events.append(ClaimStateEvent(
-                        claim_id=str(claim.claim_id), event_type="VERIFICATION_INITIAL",
-                        payload=state_payload,
-                        known_from=known_from,
-                        source_available_from=getattr(getattr(occurrence, "times", None), "available_from", None),
-                    ))
+                    pending_events.append(
+                        ClaimStateEvent(
+                            claim_id=str(claim.claim_id),
+                            event_type="VERIFICATION_INITIAL",
+                            payload=state_payload,
+                            known_from=known_from,
+                            source_available_from=getattr(getattr(occurrence, "times", None), "available_from", None),
+                        )
+                    )
                 for event in context.state.get("lifecycle_events") or ():
                     target_type = str(getattr(event, "target_type", ""))
                     if target_type not in {"LifecycleTargetType.CLAIM", "CLAIM"}:
                         continue
-                    pending_events.append(ClaimStateEvent(
-                        claim_id=str(event.target_id), event_type="LIFECYCLE",
-                        payload={"status": event.to_status, "artifact_id": event.lifecycle_event_id},
-                        known_from=event.recorded_at, business_valid_from=event.effective_at,
-                        source_available_from=event.recorded_at,
-                    ))
+                    pending_events.append(
+                        ClaimStateEvent(
+                            claim_id=str(event.target_id),
+                            event_type="LIFECYCLE",
+                            payload={"status": event.to_status, "artifact_id": event.lifecycle_event_id},
+                            known_from=event.recorded_at,
+                            business_valid_from=event.effective_at,
+                            source_available_from=event.recorded_at,
+                        )
+                    )
                 for state_event in sorted(
                     pending_events,
                     key=lambda item: (item.claim_id, item.known_from or snapshot.created_at, item.event_id),
@@ -2709,13 +3265,22 @@ class SnapshotRecordingStage:
                     # predecessor when a later snapshot extends the chain.
                     if state_event.event_id in existing_ids.get(state_event.claim_id, set()):
                         continue
+                    if (
+                        state_event.event_type == "VERIFICATION_INITIAL"
+                        and event_logical_identity(state_event)
+                        in existing_initial_keys.get(state_event.claim_id, set())
+                    ):
+                        continue
                     prior = tails.get(state_event.claim_id)
                     if prior:
                         state_event = ClaimStateEvent(
-                            claim_id=state_event.claim_id, event_type=state_event.event_type,
-                            payload=dict(state_event.payload), known_from=state_event.known_from,
+                            claim_id=state_event.claim_id,
+                            event_type=state_event.event_type,
+                            payload=dict(state_event.payload),
+                            known_from=state_event.known_from,
                             business_valid_from=state_event.business_valid_from,
-                            business_valid_to=state_event.business_valid_to, known_to=state_event.known_to,
+                            business_valid_to=state_event.business_valid_to,
+                            known_to=state_event.known_to,
                             source_available_from=state_event.source_available_from,
                             previous_event_hash=prior,
                             legacy_history_incomplete=state_event.legacy_history_incomplete,
@@ -2741,6 +3306,18 @@ class SnapshotRecordingStage:
             attributes["content_snapshot_id"] = snapshot.content_snapshot_id
             unit.attributes = attributes
         return _stage_result(context)
+
+    def _require_effect_fence(self, context: PipelineContext, session) -> None:
+        if self._fenced_effects is None or not context.worker_id or context.fencing_token is None:
+            return
+        if session is None:
+            # Production SnapshotRecordingStage always has the verification
+            # planning transaction. Refuse a configured fence without its
+            # transaction instead of silently downgrading the guarantee.
+            raise ContentSnapshotPersistError("CONTENT_SNAPSHOT_PERSIST_FAILED: fenced publication session unavailable")
+        self._fenced_effects.require_current_in_session(
+            session, context.task_id, context.worker_id, context.fencing_token
+        )
 
     @staticmethod
     def _replace_verification_lineage(context: PipelineContext, entries: list[Any]) -> None:
@@ -2775,7 +3352,8 @@ class SnapshotRecordingStage:
                 lifecycle_knowledge_as_of=lifecycle.lifecycle_knowledge_as_of,
                 policy_version=lifecycle.policy_version,
                 parent_artifact_ids=tuple(
-                    item.artifact_id for item in (context.artifacts.occurrences, context.artifacts.verification)
+                    item.artifact_id
+                    for item in (context.artifacts.occurrences, context.artifacts.verification)
                     if item is not None
                 ),
             )
@@ -2810,9 +3388,7 @@ class SnapshotRecordingStage:
                 core_summary=summary.core_summary,
                 parent_artifact_ids=(context.artifacts.knowledge.artifact_id,),
             )
-            context.artifacts.summary = SummaryArtifact(
-                **{**rebuilt.__dict__, "artifact_id": artifact_id_of(rebuilt)}
-            )
+            context.artifacts.summary = SummaryArtifact(**{**rebuilt.__dict__, "artifact_id": artifact_id_of(rebuilt)})
 
 
 def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
@@ -2823,11 +3399,7 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     # nested manifest value.  Otherwise preserve an explicitly supplied
     # manifest value, then fall back to the deployment/default release SHA.
     manifest_code_sha = manifest.get("code_sha")
-    effective_code_sha = (
-        context.options.get("code_sha")
-        or manifest_code_sha
-        or default_code_sha()
-    )
+    effective_code_sha = context.options.get("code_sha") or manifest_code_sha or default_code_sha()
     manifest["code_sha"] = str(effective_code_sha)
     manifest.setdefault(
         "container_digest",
@@ -2842,15 +3414,11 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     models = dict(manifest.get("models") or {})
     models.setdefault(
         "asr",
-        (transcript.asr_model if transcript else None)
-        or context.options.get("asr_model")
-        or "unknown",
+        (transcript.asr_model if transcript else None) or context.options.get("asr_model") or "unknown",
     )
     models.setdefault(
         "asr_version",
-        (transcript.asr_model_version if transcript else None)
-        or context.options.get("asr_model_version")
-        or "unknown",
+        (transcript.asr_model_version if transcript else None) or context.options.get("asr_model_version") or "unknown",
     )
     models.setdefault("ocr", context.options.get("ocr_model") or "fixture")
     models.setdefault("ocr_version", context.options.get("ocr_model_version") or "1")
@@ -2876,15 +3444,15 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
             or (context.options.get("pipeline_config") or {}).get(
                 "segmentation_prompt_version", "semantic-segmentation.prompt.v1"
             ),
-            "schema": getattr(semantic_artifact, "segmentation_schema_version", None)
-            or "semantic-segment.v1",
+            "schema": getattr(semantic_artifact, "segmentation_schema_version", None) or "semantic-segment.v1",
         },
     )
     manifest.setdefault(
         "atomic_claim_extraction",
         {
             "model": pipeline_config.get("extraction_model")
-            or context.options.get("llm_model") or models.get("llm", "unknown"),
+            or context.options.get("llm_model")
+            or models.get("llm", "unknown"),
             "prompt": context.options.get("atomic_claim_prompt_version")
             or (context.options.get("pipeline_config") or {}).get(
                 "extraction_prompt_version", "atomic-claim-extraction.prompt.v1"
@@ -2922,30 +3490,87 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
 
 
 class ClaimPersistenceStage:
-    """Persist canonical evidence/claims before creating a snapshot row."""
+    """Persist canonical pre-snapshot state under the task fencing boundary.
+
+    Claim, evidence and ClaimArtifact membership are a single logical effect:
+    a snapshot must never observe only some of them, and a worker that lost its
+    lease must not leave an otherwise resumable partial projection behind.
+    """
 
     name = "claim_persistence"
     required_inputs = ("evidence", "claims")
     output_types = ()
 
-    def __init__(self, claims: Any, artifacts: Any) -> None:
+    def __init__(self, claims: Any, artifacts: Any, fenced_effects=None) -> None:
         self._claims = claims
         self._artifacts = artifacts
+        self._fenced_effects = fenced_effects
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        # A production queue attempt supplies both values.  Treat a partial
+        # fence context as a configuration error before doing any write.
+        fenced_attempt = context.worker_id is not None or context.fencing_token is not None
+        if fenced_attempt:
+            if (
+                self._fenced_effects is None
+                or not context.task_id
+                or not context.worker_id
+                or context.fencing_token is None
+            ):
+                raise RuntimeError("CLAIM_PERSISTENCE_FENCED_UOW_REQUIRED")
+            intent = EffectIntent(
+                "pre-snapshot:claim-persistence",
+                "PRE_SNAPSHOT_CLAIM_PERSISTENCE",
+                {
+                    "claim_ids": sorted(str(item.claim_id) for item in context.state.claims),
+                    "evidence_artifact_id": str(getattr(context.artifacts.evidence, "artifact_id", "") or ""),
+                    "claims_artifact_id": str(getattr(context.artifacts.claims, "artifact_id", "") or ""),
+                },
+            )
+            self._fenced_effects.execute_sql(
+                context.task_id,
+                context.worker_id,
+                context.fencing_token,
+                intent,
+                lambda session: self._persist(context, session=session),
+            )
+        else:
+            self._persist(context)
+        # ``execute_sql`` returns None for a completed stable effect.  That is
+        # a successful resume, not a reason for PersistStage to reopen a
+        # repository-local write transaction.
+        context.state.claims_persisted = True
+        return _stage_result(context)
+
+    def _persist(self, context: PipelineContext, *, session=None) -> PipelineContext:
+        def write(repository, method: str, *args) -> None:
+            if repository is None:
+                return
+            if session is not None:
+                in_session = getattr(repository, f"{method}_in_session", None)
+                if in_session is not None:
+                    in_session(session, *args)
+                    return
+                # SQL-shaped repositories may not silently create an
+                # independent transaction inside the claimed task effect.
+                if getattr(repository, "_sessions", None) is not None:
+                    raise RuntimeError(
+                        f"CLAIM_PERSISTENCE_SESSION_CAPABLE_REPOSITORY_REQUIRED:{type(repository).__name__}"
+                    )
+            getattr(repository, method)(*args)
+
         if self._artifacts is not None and context.artifacts.evidence is not None:
-            self._artifacts.put(context.artifacts.evidence)
+            write(self._artifacts, "put", context.artifacts.evidence)
         for claim in context.state.claims:
             # Final canonical claims deliberately do not own source-specific
             # evidence.  Occurrence role memberships are persisted by the
             # occurrence stage and remain the sole evidence ownership path.
-            self._claims.save(claim)
+            write(self._claims, "save", claim)
         if self._artifacts is not None and context.artifacts.claims is not None:
-            self._artifacts.put(context.artifacts.claims)
+            write(self._artifacts, "put", context.artifacts.claims)
             if hasattr(self._artifacts, "put_claim_members"):
-                self._artifacts.put_claim_members(context.artifacts.claims)
-        context.state.claims_persisted = True
-        return _stage_result(context)
+                write(self._artifacts, "put_claim_members", context.artifacts.claims)
+        return context
 
 
 def _config_hash_of(config: dict | None) -> str:
@@ -2964,6 +3589,7 @@ def _claim_state_payload(
 ) -> dict[str, Any]:
     """Capture formal projection inputs in the immutable state event."""
     times = getattr(occurrence, "times", None)
+
     def value(item: Any) -> Any:
         if item is None or isinstance(item, (str, int, float, bool)):
             return item
@@ -2974,6 +3600,7 @@ def _claim_state_payload(
         if hasattr(item, "isoformat"):
             return item.isoformat()
         return str(item)
+
     support_status = str(getattr(claim, "source_support_status", "") or "UNSUPPORTED").upper()
     support_count = {
         # Formal min_support is a two-level source-support threshold:
@@ -2984,6 +3611,13 @@ def _claim_state_payload(
         "UNSUPPORTED": 0,
         "AMBIGUOUS": 0,
     }.get(support_status, 0)
+    # Canonical FinancialClaim retains its established storage vocabulary
+    # (SUPPORTED/PARTIALLY_SUPPORTED).  The immutable public ledger owns the
+    # current public support vocabulary used by content-knowledge-bundle.v1.
+    public_support_status = {
+        "SUPPORTED": "SOURCE_SUPPORTED",
+        "PARTIALLY_SUPPORTED": "SOURCE_LOCATED",
+    }.get(support_status, support_status)
     asserted_at = getattr(times, "asserted_at", None)
     source_quality = getattr(times, "source_availability_quality", "UNKNOWN")
     return {
@@ -2998,7 +3632,7 @@ def _claim_state_payload(
         "temporal_bindings": value(getattr(claim, "temporal_bindings", ())),
         "evidence_refs": value(getattr(occurrence, "evidence_refs", ())),
         "symbol": str(getattr(claim, "subject_id", "") or ""),
-        "support_status": support_status,
+        "support_status": public_support_status,
         "support_count": support_count,
         "producer_commit": str(producer_commit),
         "signal_policy_version": "signal-policy.v1",
@@ -3027,6 +3661,7 @@ class PersistStage:
         signal_service=None,
         signal_outbox=None,
         publication_uow=None,
+        fenced_effects=None,
     ) -> None:
         self._videos = videos
         self._chapters = chapters
@@ -3042,29 +3677,68 @@ class PersistStage:
         self._signal_service = signal_service
         self._signal_outbox = signal_outbox
         self._publication_uow = publication_uow
+        self._fenced_effects = fenced_effects
 
     def execute(self, context: PipelineContext) -> PipelineContext:
+        # A queued production task must never fall back to independent
+        # repository transactions.  That would make the lease check a
+        # best-effort precondition rather than part of the business write.
+        if context.worker_id and context.fencing_token is not None:
+            if self._fenced_effects is None:
+                raise RuntimeError("PERSIST_FENCED_EFFECTS_REQUIRED")
+            intent = EffectIntent(
+                "projection:video-persist",
+                "SQL_PROJECTION",
+                {"artifacts": sorted(context.artifacts.artifact_ids()), "task_id": context.task_id},
+            )
+            return self._fenced_effects.execute_sql(
+                context.task_id,
+                context.worker_id,
+                context.fencing_token,
+                intent,
+                lambda session: self._persist(context, session=session),
+            ) or context
+        return self._persist(context)
+
+    def _persist(self, context: PipelineContext, *, session=None) -> PipelineContext:
+        def write(repository, method: str, *args) -> None:
+            """Use the caller-owned fenced transaction for SQL adapters.
+
+            Production adapters expose ``<method>_in_session``.  A test
+            double without a SQL session remains a valid pure-stage seam, but
+            a production-shaped adapter without the method is rejected rather
+            than silently opening a second transaction.
+            """
+            if repository is None:
+                return
+            if session is not None:
+                in_session = getattr(repository, f"{method}_in_session", None)
+                if in_session is not None:
+                    in_session(session, *args)
+                    return
+                if getattr(repository, "_sessions", None) is not None:
+                    raise RuntimeError(f"PERSIST_SESSION_CAPABLE_REPOSITORY_REQUIRED:{type(repository).__name__}")
+            getattr(repository, method)(*args)
+
         if self._artifacts:
             for artifact in context.artifacts.artifacts():
-                self._artifacts.put(artifact)
+                write(self._artifacts, "put", artifact)
         if self._claims and not context.state.claims_persisted:
             for claim in context.state.claims:
-                self._claims.save(claim)
-        if self._artifacts and context.artifacts.claims is not None and hasattr(
-            self._artifacts, "put_claim_members"
-        ):
-            self._artifacts.put_claim_members(context.artifacts.claims)
+                write(self._claims, "save", claim)
+        if self._artifacts and context.artifacts.claims is not None and hasattr(self._artifacts, "put_claim_members"):
+            write(self._artifacts, "put_claim_members", context.artifacts.claims)
         video = context.state["video"]
-        self._videos.upsert(video, context.state["segments"])
-        self._chapters.replace_for_video(video.video_id, context.state["chapters"])
-        self._knowledge.replace_for_video(video.video_id, context.state["knowledge"])
+        write(self._videos, "upsert", video, context.state["segments"])
+        write(self._chapters, "replace_for_video", video.video_id, context.state["chapters"])
+        write(self._knowledge, "replace_for_video", video.video_id, context.state["knowledge"])
         if self._verifications:
             # Verification ledger trace must identify the request lineage, not
             # the task UUID.  The latter is an operational identifier and is
             # already persisted on the task/checkpoint rows.
-            self._verifications.append(context.state["knowledge"], context.trace.get("trace_id"))
+            write(self._verifications, "append", context.state["knowledge"], context.trace.get("trace_id"))
         if self._multimodal:
-            self._multimodal.replace(
+            write(self._multimodal, "replace",
                 video.video_id,
                 list(context.state.get("frames") or []),
                 list(context.state.get("ocr_evidence") or []),
@@ -3072,14 +3746,14 @@ class PersistStage:
                 list(context.state.get("temporal_windows") or []),
             )
         if self._financial:
-            self._financial.replace(
+            write(self._financial, "replace",
                 video.video_id,
                 list(context.state.get("financial_numeric_facts") or []),
                 list(context.state.get("financial_events") or []),
             )
         if self._entities:
-            self._entities.replace(video.video_id, context.state["knowledge"])
-        self._summaries.upsert(context.state["summary"])
+            write(self._entities, "replace", video.video_id, context.state["knowledge"])
+        write(self._summaries, "upsert", context.state["summary"])
         return _stage_result(context)
 
 
@@ -3088,13 +3762,37 @@ class IndexStage:
     required_inputs = ("knowledge",)
     output_types = ()
 
-    def __init__(self, index: KnowledgeIndex) -> None:
+    def __init__(self, index: KnowledgeIndex, fenced_effects=None) -> None:
         self._index = index
+        self._fenced_effects = fenced_effects
 
     def execute(self, context: PipelineContext) -> PipelineContext:
-        self._index.index(context.state["knowledge"])
+        if context.worker_id and context.fencing_token is not None:
+            if self._fenced_effects is None:
+                raise RuntimeError("INDEX_FENCED_EFFECTS_REQUIRED")
+            intent = EffectIntent(
+                "index:knowledge",
+                "KNOWLEDGE_INDEX",
+                {
+                    "knowledge_ids": sorted(str(item.knowledge_uid) for item in context.state["knowledge"]),
+                    "snapshot_id": str(context.state.content_snapshot_id or ""),
+                },
+            )
+            # Qdrant is a derived, optional projection.  Persisting this
+            # intent under the ingestion fence is the only main-pipeline
+            # obligation; the worker's durable projection dispatcher invokes
+            # the external index after task completion.  In particular, a
+            # Qdrant timeout must never turn completed SQL publication into a
+            # failed ingestion task.
+            self._fenced_effects.prepare_external(
+                context.task_id,
+                context.worker_id,
+                context.fencing_token,
+                intent,
+            )
+        else:
+            self._index.index(context.state["knowledge"])
         return _stage_result(context)
-
 
 class BuildVideoStage:
     name = "transcript"
@@ -3105,6 +3803,7 @@ class BuildVideoStage:
         metadata = context.state.get("metadata") or {}
         if not isinstance(metadata, dict):
             raise ValueError("source metadata must be an object")
+
         def _resolved_value(name: str) -> Any:
             # Explicit options are the caller-visible resolution override;
             # otherwise use the authoritative adapter metadata unchanged.

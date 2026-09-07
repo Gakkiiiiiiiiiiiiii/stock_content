@@ -44,6 +44,10 @@ KNOWN_SOURCE_POLICIES: dict[str, SourcePolicy] = {
         "xiaoe_hls", "licensed_feed", frozenset({"ingest", "transcribe", "derive"}),
         "standard", AccessClassification.RESTRICTED, "licensed-feed:contract", 10,
     ),
+    "xiaoe": SourcePolicy(
+        "xiaoe", "licensed_feed", frozenset({"ingest", "transcribe", "derive"}),
+        "standard", AccessClassification.RESTRICTED, "licensed-feed:contract", 10,
+    ),
 }
 
 

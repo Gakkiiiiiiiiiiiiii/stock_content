@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from stock_content.domain.artifacts import canonical_json
+from stock_content.domain.security_redaction import redact_for_serialization
 
 PIPELINE_VERSION = "pipeline.v3"
 CONTENT_SNAPSHOT_SCHEMA_VERSION = "content.snapshot.v2"
@@ -59,7 +60,7 @@ class ContentSnapshot:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["quant_market_snapshot_ids"] = list(self.quant_market_snapshot_ids)
-        return payload
+        return redact_for_serialization(payload)
 
     @property
     def kind(self) -> str:

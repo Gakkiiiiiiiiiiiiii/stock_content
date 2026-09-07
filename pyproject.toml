@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.8"]
+test = ["pytest>=8.2", "pytest-cov>=5.0", "ruff>=0.8", "jsonschema>=4.23"]
 core = []
 postgres = ["psycopg[binary]>=3.2"]
 search = ["qdrant-client>=1.12"]

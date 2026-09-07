@@ -112,7 +112,10 @@ class ClaimDraftGrounder:
             )
             evidence_by_index[index] = EvidenceItem(
                 evidence_id=eid,
-                source_type="ASR",
+                # Preserve the selected transcript provenance.  A manual or
+                # automatic subtitle must not be relabelled as ASR while its
+                # exact coordinate and quote are promoted to evidence.
+                source_type=item.source,
                 source_artifact_id=transcript.artifact_id,
                 evidence_text=raw,
                 raw_text=raw,

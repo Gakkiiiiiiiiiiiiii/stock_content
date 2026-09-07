@@ -20,6 +20,15 @@ jobs:
       - run: pip install -e ".[test]"
       - run: ruff check src tests scripts
 
+  artifact-secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Scan publishable contracts and workflow artifacts without match echo
+        run: python scripts/scan_artifacts.py contracts .github
+
   contract:
     runs-on: ubuntu-latest
     steps:
@@ -93,7 +102,7 @@ jobs:
           if-no-files-found: error
 
   quality-gate:
-    needs: [deterministic-closure, postgres-closure]
+    needs: [deterministic-closure, postgres-closure, artifact-secret-scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,6 +133,7 @@ jobs:
     if: always()
     needs:
       - lint
+      - artifact-secret-scan
       - contract
       - deterministic-closure
       - postgres-closure
@@ -139,6 +149,7 @@ jobs:
       - name: Require every release prerequisite to succeed
         run: |
           test "${{ needs.lint.result }}" = "success"
+          test "${{ needs.artifact-secret-scan.result }}" = "success"
           test "${{ needs.contract.result }}" = "success"
           test "${{ needs.deterministic-closure.result }}" = "success"
           test "${{ needs.postgres-closure.result }}" = "success"

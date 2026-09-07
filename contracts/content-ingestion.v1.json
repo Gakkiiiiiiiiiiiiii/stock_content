@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "content-ingestion.v1",
+  "title": "Canonical Content Ingestion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_type", "source_ref", "part", "transcript_policy", "options"],
+  "properties": {
+    "source_type": {"enum": ["bilibili", "xiaoe"]},
+    "source_ref": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Bilibili BV/AV/public URL or an authorized Xiaoe course/lesson identity; Xiaoe also accepts a query-free public .m3u8 identity only with credential_ref. Signed locators and cookie bytes are never request fields."
+    },
+    "credential_ref": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["credential_ref", "provider"],
+      "properties": {
+        "credential_ref": {"type": "string", "minLength": 1, "description": "Operator-allowlisted secret reference only; its value is never stored in a queued task."},
+        "provider": {"enum": ["file-secret", "vault", "k8s-secret"]}
+      }
+    },
+    "part": {"type": "integer", "minimum": 1, "default": 1},
+    "transcript_policy": {"const": "subtitle_first"},
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"language": {"type": "string"}}
+    },
+    "idempotency_key": {"type": ["string", "null"], "maxLength": 128}
+  }
+}

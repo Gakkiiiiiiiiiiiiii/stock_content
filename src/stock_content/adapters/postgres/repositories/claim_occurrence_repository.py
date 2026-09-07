@@ -44,7 +44,9 @@ class ClaimOccurrenceRepository:
                 "source_available_at", "source_availability_quality", "ingested_at",
                 "extraction_completed_at", "snapshot_committed_at", "available_from",
                 "source_support_status", "source_confidence", "extractor_confidence",
-                "raw_temporal_expressions", "provenance",
+                "raw_temporal_expressions", "provenance", "primary_quote", "normalized_statement",
+                "grounding_status", "grounding_reason_codes", "contradiction_group_id",
+                "claim_schema_version", "legacy_grounding_incomplete",
             )
         }
         # Claim the immutable occurrence row atomically.  A loser must read
@@ -163,6 +165,13 @@ def _row_payload(row: ClaimOccurrenceRow) -> dict:
         "extractor_confidence": row.extractor_confidence,
         "raw_temporal_expressions": list(row.raw_temporal_expressions or []),
         "provenance": dict(row.provenance or {}),
+        "primary_quote": row.primary_quote,
+        "normalized_statement": row.normalized_statement,
+        "grounding_status": row.grounding_status,
+        "grounding_reason_codes": list(row.grounding_reason_codes or []),
+        "contradiction_group_id": row.contradiction_group_id,
+        "claim_schema_version": row.claim_schema_version,
+        "legacy_grounding_incomplete": row.legacy_grounding_incomplete,
     }
 
 

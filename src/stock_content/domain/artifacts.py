@@ -157,6 +157,9 @@ class TranscriptSegmentItem:
     raw_text: str | None = None
     normalized_text: str | None = None
     confidence: float | None = None
+    source: str = "ASR"
+    source_artifact_id: str = ""
+    alignment_status: str = "ALIGNED"
     speaker_id: str | None = None
     media_artifact_id: str = ""
     asr_model: str = "unknown"
@@ -229,6 +232,9 @@ class TranscriptArtifact(ArtifactBase):
                     raw_text=item.raw_text,
                     normalized_text=item.normalized_text,
                     confidence=item.confidence,
+                    source=item.source,
+                    source_artifact_id=item.source_artifact_id,
+                    alignment_status=item.alignment_status,
                     speaker_id=item.speaker_id,
                     media_artifact_id=self.media_artifact_id,
                     asr_model=self.asr_model,

@@ -46,9 +46,21 @@ class ClaimOccurrence(BaseModel):
     extractor_confidence: float = Field(default=0.0, ge=0, le=1)
     raw_temporal_expressions: list[dict[str, Any]] = Field(default_factory=list)
     provenance: dict[str, Any] = Field(default_factory=dict)
+    primary_quote: str | None = None
+    normalized_statement: str | None = None
+    grounding_status: str = "LEGACY_UNGROUNDED"
+    grounding_reason_codes: list[str] = Field(default_factory=list)
+    contradiction_group_id: str | None = None
+    claim_schema_version: str = "claim.legacy.v1"
+    legacy_grounding_incomplete: bool = True
 
     @model_validator(mode="after")
     def _identity(self) -> "ClaimOccurrence":
+        if self.grounding_status == "GROUNDED":
+            if not self.evidence_refs or not self.primary_quote or not self.normalized_statement:
+                raise ValueError("grounded occurrence requires primary evidence, quote, and normalized statement")
+            if self.legacy_grounding_incomplete:
+                raise ValueError("grounded occurrence cannot be marked legacy incomplete")
         all_refs = self.evidence_refs + self.condition_evidence_refs + self.invalidation_evidence_refs
         locator = self.assertion_locator_hash or assertion_locator_hash_of(
             self.source_artifact_id,

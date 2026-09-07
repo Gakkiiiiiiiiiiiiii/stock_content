@@ -9,7 +9,7 @@ from stock_content.domain.models import KnowledgeUnit
 
 
 class NullKnowledgeIndex:
-    def index(self, units: list[KnowledgeUnit]) -> None:
+    def index(self, units: list[KnowledgeUnit], *, idempotency_key: str | None = None) -> None:
         return None
 
     def search(self, query: str, limit: int) -> list[str]:
@@ -42,12 +42,17 @@ class QdrantKnowledgeIndex:
                 vectors_config=VectorParams(size=self._vector_size, distance=Distance.COSINE),
             )
 
-    def index(self, units: list[KnowledgeUnit]) -> None:
+    def index(self, units: list[KnowledgeUnit], *, idempotency_key: str | None = None) -> None:
         if not units:
             return
         from qdrant_client.models import PointStruct
 
         self._ensure_collection()
+        # ``wait=True`` makes the durable effect receipt the only completion
+        # acknowledgement after Qdrant has accepted this idempotent batch.
+        # Qdrant point ids are deterministic; the effect id is also carried
+        # in payload so operators can reconcile a retry without exposing it
+        # through the public search API.
         self._client.upsert(
             self._collection,
             points=[
@@ -57,10 +62,10 @@ class QdrantKnowledgeIndex:
                     # Qdrant is only a search projection.  Keep the complete
                     # filtering/lineage envelope in the payload, while the
                     # relational row remains authoritative for hydration.
-                    payload=_projection_payload(unit),
+                    payload={**_projection_payload(unit), "index_effect_key": idempotency_key},
                 )
                 for unit in units
-            ],
+            ], wait=True,
         )
 
     def search(self, query: str, limit: int) -> list[str]:

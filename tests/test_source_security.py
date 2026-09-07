@@ -12,7 +12,7 @@ from stock_content.adapters.sources import bilibili as bilibili_module
 from stock_content.adapters.sources import security
 from stock_content.adapters.sources import xiaoe as xiaoe_module
 from stock_content.adapters.sources.bilibili import BilibiliSourceAdapter
-from stock_content.adapters.sources.security import UnsafeSourceURL
+from stock_content.adapters.sources.security import SourceDownloadHTTPError, UnsafeSourceURL
 from stock_content.adapters.sources.xiaoe import XiaoeHlsSourceAdapter
 
 
@@ -330,6 +330,28 @@ def test_safe_get_allowlisted_redirect_writes_bytes_without_external_downloader(
     final = security.safe_download_url("https://www.bilibili.com/video/BV1", output)
     assert final == "https://cdn.bilivideo.com/video.mp4"
     assert output.read_bytes() == b"media"
+
+
+def test_safe_download_exposes_only_a_typed_http_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeConnection:
+        def __init__(self, *_: object, **__: object) -> None:
+            return None
+
+        def request(self, *_: object, **__: object) -> None:
+            return None
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(403, body=b"signature=secret-canary")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(security, "_PinnedHTTPSConnection", FakeConnection)
+    monkeypatch.setattr(security.socket, "getaddrinfo", _dns({"www.bilibili.com": "93.184.216.34"}))
+    with pytest.raises(SourceDownloadHTTPError) as error:
+        security.safe_download_url("https://www.bilibili.com/video/BV1?secret-canary", tmp_path / "media.bin")
+    assert error.value.status == 403
+    assert "secret-canary" not in str(error.value)
 
 
 def test_hls_materializer_fetches_manifest_segments_and_key_locally(

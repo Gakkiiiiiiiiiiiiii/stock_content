@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 from sqlalchemy import inspect, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -40,7 +41,7 @@ class SqlClaimRepository:
     def save(self, claim: FinancialClaim, *, compatibility_evidence_refs: list[str] | None = None) -> FinancialClaim:
         payload = claim.model_dump(mode="json")
         storage_payload = dict(payload)
-        is_final = claim.claim_schema_version == "claim.final.v1"
+        is_final = claim.claim_schema_version in {"claim.final.v1", "claim.atomic.v1"}
         if is_final:
             # The canonical claim is source-independent.  Keep even a stale
             # caller-supplied evidence list out of its persisted projection;
@@ -81,6 +82,11 @@ class SqlClaimRepository:
                     "claim_schema_version": claim.claim_schema_version,
                     "normalization_version": claim.normalization_version,
                     "source_support_status": claim.source_support_status,
+                    "normalized_statement": claim.normalized_statement,
+                    "grounding_status": claim.grounding_status,
+                    "grounding_reason_codes": list(claim.grounding_reason_codes),
+                    "contradiction_group_id": claim.contradiction_group_id,
+                    "legacy_grounding_incomplete": claim.legacy_grounding_incomplete,
                     "payload": storage_payload,
                 }
                 _insert_ignore(session, FinancialClaimRow, values, [FinancialClaimRow.claim_id])
@@ -143,6 +149,30 @@ class SqlClaimRepository:
                     )
         return claim
 
+    def save_in_session(
+        self,
+        session,
+        claim: FinancialClaim,
+        *,
+        compatibility_evidence_refs: list[str] | None = None,
+    ) -> FinancialClaim:
+        """Persist a claim in a caller-owned transaction.
+
+        Pre-snapshot persistence must share the task fence transaction with
+        artifact and membership writes.  Reuse the canonical save path with a
+        deliberately non-committing session facade rather than opening a
+        repository-local transaction.
+        """
+
+        class _CurrentSessionFactory:
+            def begin(self):
+                return nullcontext(session)
+
+        return SqlClaimRepository(_CurrentSessionFactory()).save(
+            claim,
+            compatibility_evidence_refs=compatibility_evidence_refs,
+        )
+
     def get(self, claim_id: str) -> FinancialClaim | None:
         with self._sessions() as session:
             row = session.get(FinancialClaimRow, claim_id)
@@ -150,8 +180,8 @@ class SqlClaimRepository:
                 return None
             payload = _payload_from_row(session, row)
             is_final = (
-                row.claim_schema_version == "claim.final.v1"
-                or payload.get("claim_schema_version") == "claim.final.v1"
+                row.claim_schema_version in {"claim.final.v1", "claim.atomic.v1"}
+                or payload.get("claim_schema_version") in {"claim.final.v1", "claim.atomic.v1"}
             )
             # Final claims must never hydrate the legacy membership table.
             refs = [] if is_final else _membership_evidence_refs(session, claim_id)
@@ -164,6 +194,38 @@ class SqlClaimRepository:
             if row is None or _row_is_final(row):
                 return []
             return _membership_evidence_refs(session, claim_id)
+
+    def formal_bundle_eligible_claim_ids(self, claim_ids: Iterable[str] | None = None) -> list[str]:
+        """Return only SC-07B-grounded claims with primary occurrence evidence.
+
+        This is deliberately a repository read seam for the future Bundle
+        packet.  Legacy rows stay denied until a separate backfill validates
+        them through SC-07A and writes the grounded fields.
+        """
+        with self._sessions() as session:
+            statement = (
+                select(FinancialClaimRow.claim_id)
+                .join(ClaimOccurrenceRow, ClaimOccurrenceRow.claim_id == FinancialClaimRow.claim_id)
+                .join(
+                    ClaimOccurrenceEvidenceRow,
+                    ClaimOccurrenceEvidenceRow.occurrence_id == ClaimOccurrenceRow.occurrence_id,
+                )
+                .where(
+                    FinancialClaimRow.grounding_status == "GROUNDED",
+                    FinancialClaimRow.legacy_grounding_incomplete.is_(False),
+                    FinancialClaimRow.claim_schema_version == "claim.atomic.v1",
+                    ClaimOccurrenceRow.grounding_status == "GROUNDED",
+                    ClaimOccurrenceRow.legacy_grounding_incomplete.is_(False),
+                    ClaimOccurrenceRow.claim_schema_version == "claim.atomic.v1",
+                    ClaimOccurrenceEvidenceRow.evidence_role == "PRIMARY",
+                )
+                .order_by(FinancialClaimRow.claim_id)
+                .distinct()
+            )
+            requested = tuple(sorted({str(item) for item in (claim_ids or ()) if str(item)}))
+            if requested:
+                statement = statement.where(FinancialClaimRow.claim_id.in_(requested))
+            return list(session.scalars(statement).all())
 
     def verifications(self, claim_id: str) -> list[dict]:
         """Return immutable verification results in deterministic order."""
@@ -261,7 +323,7 @@ class SqlClaimRepository:
                         ClaimEvidenceRow.evidence_id == evidence_id,
                         or_(
                             FinancialClaimRow.claim_schema_version.is_(None),
-                            FinancialClaimRow.claim_schema_version != "claim.final.v1",
+                            FinancialClaimRow.claim_schema_version.not_in(("claim.final.v1", "claim.atomic.v1")),
                         ),
                     )
                     .order_by(ClaimEvidenceRow.claim_id)
@@ -278,7 +340,7 @@ class SqlClaimRepository:
                 continue
             # A row whose schema column is stale but whose payload is final
             # must not leak through the legacy fallback either.
-            if claim.claim_schema_version == "claim.final.v1" and claim_id not in occurrence_ids:
+            if claim.claim_schema_version in {"claim.final.v1", "claim.atomic.v1"} and claim_id not in occurrence_ids:
                 continue
             result.append(claim)
         return result
@@ -403,10 +465,10 @@ def _legacy_evidence_refs(session, claim_id: str) -> list[str]:
 def _row_is_final(row: FinancialClaimRow) -> bool:
     payload = _json_value(row.payload)
     return (
-        row.claim_schema_version == "claim.final.v1"
+        row.claim_schema_version in {"claim.final.v1", "claim.atomic.v1"}
         or (
             isinstance(payload, dict)
-            and payload.get("claim_schema_version") == "claim.final.v1"
+            and payload.get("claim_schema_version") in {"claim.final.v1", "claim.atomic.v1"}
         )
     )
 
@@ -431,8 +493,8 @@ def _payload_from_row(session, row: FinancialClaimRow) -> dict:
     if not isinstance(payload, dict):
         payload = {}
     is_final = (
-        row.claim_schema_version == "claim.final.v1"
-        or payload.get("claim_schema_version") == "claim.final.v1"
+        row.claim_schema_version in {"claim.final.v1", "claim.atomic.v1"}
+        or payload.get("claim_schema_version") in {"claim.final.v1", "claim.atomic.v1"}
     )
     values = {
         "claim_id": row.claim_id,
@@ -457,6 +519,11 @@ def _payload_from_row(session, row: FinancialClaimRow) -> dict:
         "invalidation_text": row.invalidation_text,
         "claim_schema_version": row.claim_schema_version or "claim.v2",
         "normalization_version": row.normalization_version or "normalization.v1",
+        "normalized_statement": row.normalized_statement,
+        "grounding_status": row.grounding_status or "LEGACY_UNGROUNDED",
+        "grounding_reason_codes": list(row.grounding_reason_codes or []),
+        "contradiction_group_id": row.contradiction_group_id,
+        "legacy_grounding_incomplete": row.legacy_grounding_incomplete,
     }
     for key, value in values.items():
         payload.setdefault(key, value)

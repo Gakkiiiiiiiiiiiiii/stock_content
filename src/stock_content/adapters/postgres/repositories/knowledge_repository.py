@@ -166,6 +166,9 @@ class PostgresKnowledgeRepository:
 
     def replace_for_video(self, video_id: str, units: list[KnowledgeUnit]) -> None:
         with self._sessions.begin() as session:
+            self.replace_for_video_in_session(session, video_id, units)
+
+    def replace_for_video_in_session(self, session, video_id: str, units: list[KnowledgeUnit]) -> None:
             existing = {
                 row.knowledge_uid: row
                 for row in session.scalars(select(KnowledgeUnitRow).where(KnowledgeUnitRow.video_id == video_id))

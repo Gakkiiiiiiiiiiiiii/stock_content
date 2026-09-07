@@ -54,6 +54,14 @@ class RuntimeWorkspace:
     work_dir: Path | None = None
     video_path: Path | None = None
     audio_path: Path | None = None
+    # Ephemeral source locators are retained here only between resolve and
+    # download.  Checkpoints/artifacts serialize PipelineState, never this
+    # workspace object.
+    source_materialization: Any = None
+    # Parsed subtitle cues are worker-local values.  They deliberately never
+    # enter PipelineState/checkpoints, whose durable projection has hashes
+    # only.
+    subtitle_tracks: tuple[Any, ...] = ()
     metrics: dict[str, float] = field(default_factory=_default_metrics)
 
 
@@ -63,6 +71,10 @@ class PipelineState:
 
     metadata: dict[str, Any] = field(default_factory=dict)
     segments: list[Any] = field(default_factory=list)
+    transcript_candidates: list[Any] = field(default_factory=list)
+    transcript_quality_report: Any = None
+    validated_atomic_claims: list[Any] = field(default_factory=list)
+    atomic_claim_rejections: list[Any] = field(default_factory=list)
     transcript: str = ""
     frames: list[Any] = field(default_factory=list)
     frame_insights: list[dict[str, Any]] = field(default_factory=list)
@@ -132,6 +144,9 @@ class PipelineContext:
     runtime: RuntimeWorkspace = field(default_factory=RuntimeWorkspace)
     trace: dict[str, str] = field(default_factory=dict)
     current_stage: str = "queued"
+    heartbeat: Callable[[], None] | None = None
+    worker_id: str | None = None
+    fencing_token: int | None = None
 
     def __init__(
         self,
@@ -148,6 +163,9 @@ class PipelineContext:
         runtime: RuntimeWorkspace | None = None,
         trace: dict[str, str] | None = None,
         current_stage: str = "queued",
+        heartbeat: Callable[[], None] | None = None,
+        worker_id: str | None = None,
+        fencing_token: int | None = None,
     ) -> None:
         self.task_id = task_id
         self.source = dict(source_request or source or {})
@@ -168,6 +186,9 @@ class PipelineContext:
         self.runtime = runtime or RuntimeWorkspace()
         self.trace = dict(trace or {})
         self.current_stage = current_stage
+        self.heartbeat = heartbeat
+        self.worker_id = worker_id
+        self.fencing_token = fencing_token
 
     @property
     def source_request(self) -> dict[str, Any]:

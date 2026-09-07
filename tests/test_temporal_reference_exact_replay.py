@@ -1,7 +1,8 @@
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
+from stock_content.adapters.postgres.models import ContentTaskRow
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import SnapshotService
@@ -228,6 +229,15 @@ def _captured_real_context(tmp_path, monkeypatch):
 
 def test_snapshot_recording_rejects_late_reference_before_publishing(tmp_path, monkeypatch):
     application, context, original_execute = _captured_real_context(tmp_path, monkeypatch)
+    # The captured canonical run is terminal. Re-enter this isolated fixture
+    # under a current lease so this test reaches the PIT guard rather than
+    # merely proving that stale workers are fenced out.
+    with application._tasks._sessions.begin() as session:  # noqa: SLF001
+        task = session.get(ContentTaskRow, context.task_id)
+        task.status = "RUNNING"
+        task.lease_owner = context.worker_id
+        task.fencing_token = context.fencing_token
+        task.lease_expires_at = datetime.now(UTC) + timedelta(minutes=1)
     candidate = context.options["snapshot_commit_candidate"]
     late = ClaimTemporalBinding(
         role=TemporalRole.REPORTING_PERIOD,

@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from stock_content.domain.security_redaction import redact_for_serialization
+
 
 @dataclass
 class ContentTask:
@@ -21,10 +23,20 @@ class ContentTask:
     checkpoint: dict[str, Any] = field(default_factory=dict)
     input_hash: str | None = None
     idempotency_key: str | None = None
+    request_hash: str | None = None
+    task_kind: str = "video_pipeline"
+    source_platform: str = "legacy"
+    canonical_source_ref: str | None = None
+    credential_ref_hash: str | None = None
+    locator_secret_hash: str | None = None
+    source_identity_hash: str = "0" * 64
     trace_id: str | None = None
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    fencing_token: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return redact_for_serialization(asdict(self))
 
 
 @dataclass
@@ -57,6 +69,9 @@ class TranscriptSegment:
     confidence: float | None = None
     raw_text: str | None = None
     normalized_text: str | None = None
+    source: str = "ASR"
+    source_artifact_id: str = ""
+    alignment_status: str = "ALIGNED"
     speaker_id: str = "UNKNOWN"
     speaker_confidence: float | None = None
     correction_records: list[dict[str, Any]] = field(default_factory=list)

@@ -5,11 +5,13 @@
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from stock_content.application.pipeline import PipelineContext
+from stock_content.domain.artifacts import canonical_json
 from stock_content.domain.checkpoint import CheckpointRecord, build_checkpoint
 
 
@@ -69,6 +71,8 @@ class StageRunner:
             else set()
         )
         input_artifact_ids = [artifact.artifact_id for artifact in registry.artifacts()]
+        input_hashes = [str(artifact.content_hash) for artifact in registry.artifacts()]
+        checkpoint_identity = _checkpoint_identity(context)
         started_at = datetime.now(UTC)
         try:
             result = self._stage.execute(context)
@@ -91,13 +95,14 @@ class StageRunner:
                     stage=self.name,
                     stage_version=self._stage_version,
                     input_artifact_ids=input_artifact_ids,
+                    input_hashes=input_hashes,
+                    **checkpoint_identity,
                     started_at=started_at,
                     status="FAILED",
                     error=f"{type(exc).__name__}: {exc}",
                 )
             context.checkpoints.append(failed_checkpoint)
-            if self._artifact_repository and hasattr(self._artifact_repository, "put_with_checkpoint"):
-                self._artifact_repository.put_with_checkpoint((), context.task_id, failed_checkpoint)
+            self._persist_checkpoint((), context, failed_checkpoint)
             raise
         if not explicit_result and not outputs:
             # Legacy stage adapter only. Production StageResult must declare
@@ -109,14 +114,27 @@ class StageRunner:
                 stage=self.name,
                 stage_version=self._stage_version,
                 input_artifact_ids=input_artifact_ids,
+                input_hashes=input_hashes,
+                **checkpoint_identity,
                 output_artifacts=outputs,
                 started_at=started_at,
                 status="SUCCEEDED",
             )
         context.checkpoints.append(checkpoint)
-        if self._artifact_repository and hasattr(self._artifact_repository, "put_with_checkpoint"):
-            self._artifact_repository.put_with_checkpoint(outputs, context.task_id, checkpoint)
+        self._persist_checkpoint(outputs, context, checkpoint)
         return context
+
+    def _persist_checkpoint(self, outputs: list[Any] | tuple[Any, ...], context: PipelineContext, checkpoint) -> None:
+        if self._artifact_repository is None:
+            return
+        if context.worker_id and context.fencing_token is not None and hasattr(
+            self._artifact_repository, "put_with_fenced_checkpoint"
+        ):
+            self._artifact_repository.put_with_fenced_checkpoint(
+                outputs, context.task_id, checkpoint, context.worker_id, context.fencing_token
+            )
+        elif hasattr(self._artifact_repository, "put_with_checkpoint"):
+            self._artifact_repository.put_with_checkpoint(outputs, context.task_id, checkpoint)
 
     def _validate_inputs(self, context: PipelineContext) -> None:
         missing = [slot for slot in self.contract.required_inputs if context.artifacts.get(slot) is None]
@@ -181,6 +199,48 @@ def records_from_checkpoint_state(state: dict[str, Any] | list[Any] | None) -> l
         if isinstance(item, dict) and item.get("stage"):
             records.append(CheckpointRecord.from_dict(item))
     return records
+
+
+def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
+    """Extract the safe, deterministic checkpoint manifest from pipeline state."""
+    source = context.artifacts.source
+    public_materialization = {
+        "source_type": str(getattr(source, "source_type", "") or context.source.get("type") or ""),
+        "source_ref": str(getattr(source, "source_ref", "") or context.source.get("ref") or ""),
+        "source_identity_hash": str(getattr(source, "source_identity_hash", "") or ""),
+        "source_version_id": str(getattr(source, "source_version_id", "") or ""),
+    }
+    public_hash = hashlib.sha256(canonical_json(public_materialization).encode("utf-8")).hexdigest()
+    config = dict(context.options.get("pipeline_config") or {})
+    model_identity = {
+        key: str(value)
+        for key, value in {
+            "asr": context.options.get("asr_model") or "faster-whisper",
+            "asr_version": context.options.get("asr_model_version") or "1.0",
+            "segmentation": context.options.get("segmentation_model") or config.get("segmentation_model") or "",
+            "extraction": context.options.get("extraction_model") or config.get("extraction_model") or "",
+        }.items()
+        if value
+    }
+    prompt_identity = {
+        key: str(value)
+        for key, value in {
+            "segmentation": (
+                context.options.get("segmentation_prompt_version") or config.get("segmentation_prompt_version")
+            ),
+            "extraction": (
+                context.options.get("atomic_claim_prompt_version") or config.get("extraction_prompt_version")
+            ),
+        }.items()
+        if value
+    }
+    return {
+        "public_materialization_hash": public_hash,
+        "model_identity": model_identity,
+        "prompt_identity": prompt_identity,
+        "worker_id": context.worker_id,
+        "fencing_token": context.fencing_token,
+    }
 
 
 __all__ = [

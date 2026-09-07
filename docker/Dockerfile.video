@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+# The dedicated video worker owns the executable media dependencies required
+# by its readiness contract; API images intentionally remain lightweight.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir -e ".[postgres,search,media]" \
+    && useradd --create-home --uid 10001 content \
+    && mkdir /work /data \
+    && chown content:content /work /data
+USER content
+CMD ["python", "-m", "stock_content.workers.content_worker"]

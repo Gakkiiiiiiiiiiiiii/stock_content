@@ -13,8 +13,11 @@ class PostgresChapterRepository:
 
     def replace_for_video(self, video_id: str, chapters: list[VideoChapter]) -> None:
         with self._sessions.begin() as session:
-            session.execute(delete(VideoChapterRow).where(VideoChapterRow.video_id == video_id))
-            session.add_all(VideoChapterRow(video_id=video_id, **vars(chapter)) for chapter in chapters)
+            self.replace_for_video_in_session(session, video_id, chapters)
+
+    def replace_for_video_in_session(self, session, video_id: str, chapters: list[VideoChapter]) -> None:
+        session.execute(delete(VideoChapterRow).where(VideoChapterRow.video_id == video_id))
+        session.add_all(VideoChapterRow(video_id=video_id, **vars(chapter)) for chapter in chapters)
 
     def list_for_video(self, video_id: str) -> list[dict]:
         with self._sessions() as session:

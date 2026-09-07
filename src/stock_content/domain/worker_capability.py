@@ -10,6 +10,7 @@ class WorkerProfile(StrEnum):
     CORE = "core"
     MEDIA = "media"
     MULTIMODAL = "multimodal"
+    VIDEO = "video"
 
 
 class TaskKind(StrEnum):
@@ -21,6 +22,7 @@ class TaskKind(StrEnum):
     DIARIZATION = "diarization"
     MULTIMODAL = "multimodal"
     INDEX = "index"
+    VIDEO_PIPELINE = "video_pipeline"
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +47,13 @@ _CAPABILITIES: dict[WorkerProfile, WorkerCapability] = {
         ffmpeg=True,
         torch=True,
         cuda=True,
+    ),
+    # A video pipeline is deliberately a single capability until its stage
+    # artifacts have their own fenced queues.  Do not grant this to CORE.
+    WorkerProfile.VIDEO: WorkerCapability(
+        WorkerProfile.VIDEO,
+        frozenset({TaskKind.VIDEO_PIPELINE}),
+        ffmpeg=True,
     ),
 }
 

@@ -15,6 +15,16 @@ def test_ingest_worker_persists_searchable_knowledge_and_factor_signal(tmp_path)
         {
             "metadata": {"title": "新能源行业分析", "author": "researcher", "duration_seconds": 42},
             "transcript": "宁德时代300750业绩增长，毛利率改善。这是明确利好，但仍需关注价格战风险。",
+            # The declared 42-second media duration requires a transcript
+            # candidate that actually covers the full fixture timeline.
+            "segments": [
+                {
+                    "start_seconds": 0,
+                    "end_seconds": 42,
+                    "text": "宁德时代300750业绩增长，毛利率改善。这是明确利好，但仍需关注价格战风险。",
+                    "confidence": 1.0,
+                }
+            ],
             "as_of": as_of.isoformat(),
             "offline_fixture": True,
         },
@@ -56,7 +66,10 @@ def test_build_application_authoritative_ingest_emits_complete_v5_lineage(tmp_pa
                 "canonical_url": "https://example.test/video/authoritative",
                 "published_at": (as_of.replace(hour=max(0, as_of.hour - 1))).isoformat(),
             },
-            "transcript": "宁德时代300750营收增长，毛利率改善。",
+            # One sentence is one offline-fixture atomic candidate.  Keep
+            # separate metrics in separate transcript units instead of asking
+            # the validator to accept a joined two-metric fact.
+            "transcript": "宁德时代300750营收增长。毛利率改善。",
             "as_of": as_of.isoformat(),
             "offline_fixture": True,
         },
@@ -95,6 +108,14 @@ def test_snapshot_store_healthy_yields_content_snapshot_id(tmp_path):
         {
             "metadata": {"title": "快照正常路径", "author": "tester", "duration_seconds": 10},
             "transcript": "宁德时代300750业绩增长。这是明确利好。",
+            "segments": [
+                {
+                    "start_seconds": 0,
+                    "end_seconds": 10,
+                    "text": "宁德时代300750业绩增长。这是明确利好。",
+                    "confidence": 1.0,
+                }
+            ],
             "offline_fixture": True,
         },
     )
@@ -126,6 +147,14 @@ def test_snapshot_store_failure_never_silently_succeeds(tmp_path, monkeypatch):
         {
             "metadata": {"title": "快照失败路径", "author": "tester", "duration_seconds": 10},
             "transcript": "宁德时代300750业绩增长。这是明确利好。",
+            "segments": [
+                {
+                    "start_seconds": 0,
+                    "end_seconds": 10,
+                    "text": "宁德时代300750业绩增长。这是明确利好。",
+                    "confidence": 1.0,
+                }
+            ],
             "offline_fixture": True,
         },
     )

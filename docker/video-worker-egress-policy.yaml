@@ -1,0 +1,27 @@
+# Deployment input for the egress proxy/CNI owner. Docker Compose does not
+# enforce domain allowlists or host/Kubernetes network isolation by itself.
+version: 1
+workload: stock-content-video-worker
+enforcement: egress-proxy-or-cni-required
+allow_domains:
+  - bilibili.com
+  - '*.bilibili.com'
+  - b23.tv
+  - '*.bilivideo.com'
+  - '*.biliapi.com'
+  - xiaoe-tech.com
+  - '*.xiaoe-tech.com'
+  - content-model.internal.example
+  - storage.internal.example
+deny_destinations:
+  - loopback
+  - private
+  - link-local
+  - cloud-metadata
+  - cluster-control-plane
+  - secret-store
+  - database-except-configured-required-path
+browser_limits:
+  cpu: '2.0'
+  memory: 4096M
+  pids: 128

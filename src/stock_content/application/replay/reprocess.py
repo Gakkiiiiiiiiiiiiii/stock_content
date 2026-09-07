@@ -73,6 +73,22 @@ class ReplayReprocessMixin:
                         # timestamp alter replay identity.
                         options["replay_lifecycle_timestamp"] = "derive_transcript_boundary"
             uri = str(getattr(source, "raw_storage_uri", "") or "")
+            # The source artifact is the sealed capture input for replay.  A
+            # migration may change the pipeline that *consumes* the source,
+            # but it must not recapture source availability, business time, or
+            # the original capture pipeline with the replay worker's clock.
+            # Those values remain meaningful provenance and therefore belong
+            # in the source artifact's deterministic identity.
+            source_metadata = dict(getattr(source, "source_metadata", {}) or {})
+            source_available_at = source_metadata.get("source_available_from")
+            if source_available_at is not None:
+                options["replay_source_available_at"] = source_available_at
+            source_business_as_of = source_metadata.get("business_as_of")
+            if source_business_as_of is not None:
+                options["replay_source_business_as_of"] = source_business_as_of
+            source_pipeline_version = source_metadata.get("pipeline_version")
+            if source_pipeline_version is not None:
+                options["replay_source_pipeline_version"] = source_pipeline_version
             if uri and not uri.startswith("fixture://"):
                 options["replay_raw_storage_uri"] = uri
                 options["replay_expected_raw_hash"] = str(getattr(source, "raw_content_hash", "") or "")
@@ -92,7 +108,7 @@ class ReplayReprocessMixin:
                 }
                 self._tasks.create(ContentTask(task_id=task_id, source_type=snapshot.source_type,
                                                source_ref=snapshot.source_ref, options=persisted_options,
-                                               status="RUNNING", max_retries=1))
+                                               status="RUNNING", max_retries=1, task_kind="replay"))
             context = PipelineContext(task_id=task_id,
                                       source={"type": snapshot.source_type, "ref": snapshot.source_ref},
                                       options=options)
@@ -109,13 +125,15 @@ class ReplayReprocessMixin:
                 payload.update({"error": "REPLAY_NONDETERMINISTIC",
                                 "detail": "reprocessed artifact hashes differ from the source snapshot"})
                 if self._tasks is not None and hasattr(self._tasks, "fail"):
-                    self._tasks.fail(task_id, "replay", "REPLAY_NONDETERMINISTIC: artifact comparison differs")
-            elif self._tasks is not None and hasattr(self._tasks, "succeed"):
-                self._tasks.succeed(task_id, {"content_snapshot_id": candidate_id, "replay": payload})
+                    self._finish_replay_failure(task_id, "REPLAY_NONDETERMINISTIC: artifact comparison differs")
+            elif self._tasks is not None and (
+                hasattr(self._tasks, "succeed_unleased") or hasattr(self._tasks, "succeed")
+            ):
+                self._finish_replay_success(task_id, {"content_snapshot_id": candidate_id, "replay": payload})
             return payload
         except ReplayIntegrityError as replay_error:
             if task_id is not None and self._tasks is not None and hasattr(self._tasks, "fail"):
-                self._tasks.fail(task_id, "replay", "REPLAY_FAILED: integrity/input validation failed")
+                self._finish_replay_failure(task_id, "REPLAY_FAILED: integrity/input validation failed")
             if task_id is not None:
                 # Preserve the durable task handle in the structured API
                 # result so callers can audit the terminal FAILED row.
@@ -127,8 +145,22 @@ class ReplayReprocessMixin:
             if "missing" in message.lower() and "raw" in message.lower():
                 code = "REPLAY_INPUT_UNAVAILABLE"
             if task_id is not None and self._tasks is not None and hasattr(self._tasks, "fail"):
-                self._tasks.fail(task_id, "replay", f"{code}: {message}")
+                self._finish_replay_failure(task_id, f"{code}: {message}")
             raise ReplayIntegrityError(code, message, replay_id=task_id) from exc
+
+    def _finish_replay_success(self, task_id: str, result: dict[str, Any]) -> None:
+        finish = getattr(self._tasks, "succeed_unleased", None)
+        if finish is not None:
+            finish(task_id, result)
+        else:  # Compatibility with narrow in-memory replay fakes.
+            self._tasks.succeed(task_id, result)
+
+    def _finish_replay_failure(self, task_id: str, error: str) -> None:
+        finish = getattr(self._tasks, "fail_unleased", None)
+        if finish is not None:
+            finish(task_id, "replay", error)
+        else:  # Compatibility with narrow in-memory replay fakes.
+            self._tasks.fail(task_id, "replay", error)
 
     def _compare_artifacts(self, old: Any, candidate: Any, registry: ArtifactRegistry) -> dict[str, dict[str, Any]]:
         old_ids = dict(old.artifact_ids or {})

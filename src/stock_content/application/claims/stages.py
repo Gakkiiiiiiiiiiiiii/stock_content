@@ -1,6 +1,7 @@
 """Claim/evidence stage seam for incremental decomposition."""
 from stock_content.application.stages import (
     AtomicClaimExtractionStage,
+    AtomicClaimValidationStage,
     ClaimCanonicalizationStage,
     ClaimOccurrencePersistenceStage,
     ClaimPersistenceStage,
@@ -8,6 +9,9 @@ from stock_content.application.stages import (
 )
 
 __all__ = [
-    "AtomicClaimExtractionStage", "ClaimCanonicalizationStage", "ClaimOccurrencePersistenceStage",
+    "AtomicClaimExtractionStage",
+    "AtomicClaimValidationStage",
+    "ClaimCanonicalizationStage",
+    "ClaimOccurrencePersistenceStage",
     "ClaimPersistenceStage", "EvidenceGroundingStage",
 ]

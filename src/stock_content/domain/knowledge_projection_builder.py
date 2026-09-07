@@ -19,9 +19,12 @@ class KnowledgeProjectionBuilder:
         # occurrence-scoped uid keeps those projections independently
         # addressable while preserving claim_id as the stable semantic key.
         knowledge_uid = occurrence.occurrence_id if occurrence is not None else claim.claim_id
+        grounded = claim.grounding_status == "GROUNDED"
+        if grounded and (occurrence is None or not occurrence.evidence_refs):
+            raise ValueError("grounded claim cannot project knowledge without primary evidence")
         payload = {
             "knowledge_uid": knowledge_uid,
-            "statement": claim.predicate,
+            "statement": claim.normalized_statement or claim.predicate,
             "kind": "CLAIM",
             "knowledge_kind": claim.fact_category,
             "subject": claim.subject_id,
@@ -31,6 +34,14 @@ class KnowledgeProjectionBuilder:
             "support_status": claim.source_support_status,
             "attributes": {
                 "claim_id": claim.claim_id,
+                "normalized_statement": claim.normalized_statement,
+                "condition": claim.condition_text,
+                "invalidation": claim.invalidation_text,
+                "grounding_status": claim.grounding_status,
+                "grounding_reason_codes": list(claim.grounding_reason_codes),
+                "contradiction_group_id": claim.contradiction_group_id,
+                "claim_schema_version": claim.claim_schema_version,
+                "legacy_grounding_incomplete": claim.legacy_grounding_incomplete,
                 "temporal_bindings": [x.model_dump(mode="json") for x in claim.temporal_bindings],
                 "temporal_relations": [x.model_dump(mode="json") for x in claim.temporal_relations],
             },
@@ -47,6 +58,11 @@ class KnowledgeProjectionBuilder:
                     occurrence.times.source_published_at.isoformat()
                     if occurrence.times.source_published_at is not None else None
                 ),
+                "verbatim_quote": occurrence.primary_quote,
+                "primary_quote": occurrence.primary_quote,
+                "evidence_refs": list(occurrence.evidence_refs),
+                "condition_evidence_refs": list(occurrence.condition_evidence_refs),
+                "invalidation_evidence_refs": list(occurrence.invalidation_evidence_refs),
             })
             payload["available_from"] = occurrence.times.available_from
         if verification is not None:

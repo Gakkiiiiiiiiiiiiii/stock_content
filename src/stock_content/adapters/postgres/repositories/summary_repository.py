@@ -12,13 +12,16 @@ class PostgresSummaryRepository:
 
     def upsert(self, summary: VideoSummary) -> None:
         with self._sessions.begin() as session:
-            row = session.get(VideoSummaryRow, summary.video_id)
-            if row is None:
-                session.add(VideoSummaryRow(**vars(summary)))
-            else:
-                row.core_summary = summary.core_summary
-                row.markdown = summary.markdown
-                row.confidence = summary.confidence
+            self.upsert_in_session(session, summary)
+
+    def upsert_in_session(self, session, summary: VideoSummary) -> None:
+        row = session.get(VideoSummaryRow, summary.video_id)
+        if row is None:
+            session.add(VideoSummaryRow(**vars(summary)))
+        else:
+            row.core_summary = summary.core_summary
+            row.markdown = summary.markdown
+            row.confidence = summary.confidence
 
     def get(self, video_id: str) -> dict | None:
         with self._sessions() as session:

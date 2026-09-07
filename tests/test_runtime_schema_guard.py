@@ -63,7 +63,7 @@ def test_multiple_schema_probes_are_read_only_for_prepared_database(tmp_path):
     event.listen(Engine, "before_cursor_execute", record_ddl)
     try:
         with ThreadPoolExecutor(max_workers=4) as executor:
-            list(executor.map(lambda _unused: Database(database_url).verify_schema(), range(8)))
+            list(executor.map(lambda _unused: Database(database_url).verify_schema(), range(20)))
     finally:
         event.remove(Engine, "before_cursor_execute", record_ddl)
 

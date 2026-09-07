@@ -1,25 +1,36 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import Any, Callable
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from stock_content.adapters.postgres.repositories import PostgresTaskRunRepository
 from stock_content.api.admin_tasks import create_admin_tasks_router
+from stock_content.api.application_factory import (
+    ApplicationFactory,
+    CallableApplicationFactory,
+    DefaultApplicationFactory,
+    StaticApplicationFactory,
+)
 from stock_content.api.compatibility_signals import compatibility_response
-from stock_content.api.dependencies import build_application
+from stock_content.api.errors import envelope, install_error_handlers
 from stock_content.api.formal_signal_v2 import FormalSignalQueryRequest, formal_manifest
+from stock_content.api.ingestions import create_ingestions_router
+from stock_content.api.knowledge_bundles import create_knowledge_bundles_router
 from stock_content.api.readiness import create_readiness_router, dependencies_from_application
+from stock_content.api.security import ServiceAuthError, ServiceAuthorizer
 from stock_content.application.service import ContentApplication
 from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.bitemporal_query import PUBLIC_STRICT
 from stock_content.domain.claims import FinancialClaim
 from stock_content.domain.signal_contract_v5_1 import CONTRACT_CHECKSUM, CONTRACT_NAME, validate_signal_v5_1
-from stock_content.domain.source_policy import policy_for_source
 
 SERVICE_NAME = "stock_content"
 SERVICE_VERSION = "1.0.0"
@@ -27,11 +38,15 @@ CONTRACT_VERSIONS = ["content.v1", "content-factor-signal.v3", "content-factor-s
 CONTRACT_VERSIONS.append(CONTRACT_NAME)
 
 
-class IngestRequest(BaseModel):
-    url: str | None = None
-    bv_id: str | None = None
-    m3u8_url: str | None = None
-    options: dict = Field(default_factory=dict)
+def _private_route(method: str, path: str) -> bool:
+    """Private ingestion task data and formal bundles require service identity."""
+    if path.startswith("/v1/content/knowledge-bundles"):
+        return True
+    if path == "/v1/content/ingestions" or path.startswith("/v1/content/ingestions/"):
+        return True
+    if path in {"/api/v1/videos/bilibili/ingest", "/api/v1/videos/xiaoe/ingest"}:
+        return True
+    return path.startswith("/api/v1/tasks/")
 
 
 class KnowledgeSearchRequest(BaseModel):
@@ -83,15 +98,48 @@ class ReplayRequest(BaseModel):
     overrides: dict[str, Any] = Field(default_factory=dict)
 
 
-def _with_idempotency(options: dict, idempotency_key: str | None) -> dict:
-    # §33：Content ingest 支持 Idempotency-Key，避免重试产生重复任务。
-    merged = dict(options or {})
-    if idempotency_key and not merged.get("idempotency_key"):
-        merged["idempotency_key"] = idempotency_key
-    return merged
+def create_app(
+    service: ContentApplication | None = None,
+    *,
+    application_factory: ApplicationFactory | Callable[[], ContentApplication] | None = None,
+    authorizer: ServiceAuthorizer | None = None,
+) -> FastAPI:
+    """Create the HTTP app without composing production dependencies on import.
 
+    ``service`` remains the backwards-compatible explicit-test injection.  A
+    default application is built only in the ASGI lifespan, after the migration
+    job has completed and its schema can be verified read-only.
+    """
+    if service is not None and application_factory is not None:
+        raise ValueError("pass either service or application_factory, not both")
+    prebuilt_application = service
+    if application_factory is None:
+        factory: ApplicationFactory = (
+            StaticApplicationFactory(service) if service is not None else DefaultApplicationFactory()
+        )
+    elif callable(application_factory):
+        factory = CallableApplicationFactory(application_factory)
+    else:
+        factory = application_factory
 
-def create_app(service: ContentApplication | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        application = getattr(app.state, "content_application", None)
+        owns_application = application is None
+        if owns_application:
+            application = factory.create_application()
+            app.state.content_application = application
+            task_sessions = getattr(getattr(application, "_tasks", None), "_sessions", None)
+            task_service = (
+                TaskLeaseService(PostgresTaskRunRepository(task_sessions)) if task_sessions else TaskLeaseService()
+            )
+            app.include_router(create_admin_tasks_router(task_service))
+        try:
+            yield
+        finally:
+            if owns_application:
+                del app.state.content_application
+
     app = FastAPI(
         title="stock_content",
         version="1.0.0",
@@ -104,20 +152,70 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             "degraded search, not a freshness claim. Governed ingestion "
             "records source-policy.v1 and source-governance-evidence.v1."
         ),
+        lifespan=lifespan,
     )
-    application = service or build_application()
-    app.include_router(create_readiness_router(dependencies=lambda: dependencies_from_application(application)))
-    task_sessions = getattr(getattr(application, "_tasks", None), "_sessions", None)
-    task_service = TaskLeaseService(PostgresTaskRunRepository(task_sessions)) if task_sessions else TaskLeaseService()
-    app.include_router(create_admin_tasks_router(task_service))
+    install_error_handlers(app)
+    service_authorizer = authorizer or ServiceAuthorizer.from_environment()
+    if prebuilt_application is not None:
+        # An explicitly supplied test application is already composed by the
+        # caller, so it may serve requests without entering a TestClient
+        # context manager.  Production never takes this path.
+        app.state.content_application = prebuilt_application
+        task_sessions = getattr(getattr(prebuilt_application, "_tasks", None), "_sessions", None)
+        task_service = (
+            TaskLeaseService(PostgresTaskRunRepository(task_sessions)) if task_sessions else TaskLeaseService()
+        )
+        app.include_router(create_admin_tasks_router(task_service))
+
+    def application_for_request() -> ContentApplication:
+        application = getattr(app.state, "content_application", None)
+        if application is None:
+            raise RuntimeError("stock_content application is not initialized; enter the ASGI lifespan first")
+        return application
+
+    app.include_router(
+        create_readiness_router(
+            dependencies=lambda: dependencies_from_application(application_for_request()),
+            operational_context=lambda: (application_for_request(), service_authorizer.configured()),
+        )
+    )
+    app.include_router(create_ingestions_router(application_for_request))
+    app.include_router(create_knowledge_bundles_router(application_for_request))
 
     @app.middleware("http")
     async def trace_headers(request: Request, call_next):
-        # §32：统一 Trace Headers，全链路保持同一 trace_id。
-        trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+        # Trace IDs are client-visible diagnostics, not an unbounded log sink.
+        supplied_trace = request.headers.get("x-trace-id")
+        if supplied_trace and (len(supplied_trace) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", supplied_trace)):
+            trace_id = str(uuid.uuid4())
+            return JSONResponse(envelope("INVALID_TRACE_ID", "x-trace-id is invalid", False, trace_id), 422)
+        trace_id = supplied_trace or str(uuid.uuid4())
         decision_id = request.headers.get("x-decision-id") or None
         request.state.trace_id = trace_id
         request.state.decision_id = decision_id
+        private_route = _private_route(request.method, request.url.path)
+        if private_route and request.method in {"POST", "PUT", "PATCH"}:
+            content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+            if content_type != "application/json":
+                return JSONResponse(
+                    envelope("UNSUPPORTED_MEDIA_TYPE", "application/json content type is required", False, trace_id),
+                    415,
+                )
+        if private_route:
+            try:
+                caller = service_authorizer.authorize(
+                    request.headers.get("authorization"),
+                    request.headers.get("x-caller-service"),
+                    required_caller="stock_agent"
+                    if request.url.path.startswith("/v1/content/knowledge-bundles")
+                    else None,
+                )
+            except ServiceAuthError as exc:
+                headers = {"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else {}
+                return JSONResponse(
+                    envelope(exc.code, exc.message, exc.status_code >= 500, trace_id), exc.status_code, headers
+                )
+            request.state.caller_service = caller
         response: Response = await call_next(request)
         response.headers["x-trace-id"] = trace_id
         if decision_id:
@@ -139,57 +237,16 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             "contract_versions": CONTRACT_VERSIONS,
         }
 
-    @app.post("/api/v1/videos/bilibili/ingest")
-    def ingest_bilibili(
-        request: IngestRequest,
-        http_request: Request,
-        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    ) -> dict:
-        source_ref = request.url or request.bv_id
-        if not source_ref:
-            raise HTTPException(status_code=422, detail="url or bv_id is required")
-        options = _with_idempotency(request.options, idempotency_key)
-        policy = policy_for_source("bilibili")
-        options.setdefault("source_policy_version", policy.policy_version)
-        options.setdefault("retention_class", policy.retention_class)
-        options.setdefault("access_classification", policy.access_classification.value)
-        options["source_artifact_metadata_required"] = True
-        options["enforce_source_policy"] = True
-        options["trace_id"] = http_request.state.trace_id
-        if http_request.state.decision_id:
-            options["decision_id"] = http_request.state.decision_id
-        return application.enqueue("bilibili", source_ref, options)
-
-    @app.post("/api/v1/videos/xiaoe/ingest")
-    def ingest_xiaoe(
-        request: IngestRequest,
-        http_request: Request,
-        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    ) -> dict:
-        if not request.m3u8_url:
-            raise HTTPException(status_code=422, detail="m3u8_url is required")
-        options = _with_idempotency(request.options, idempotency_key)
-        policy = policy_for_source("xiaoe_hls")
-        options.setdefault("source_policy_version", policy.policy_version)
-        options.setdefault("retention_class", policy.retention_class)
-        options.setdefault("access_classification", policy.access_classification.value)
-        options["source_artifact_metadata_required"] = True
-        options["enforce_source_policy"] = True
-        options["trace_id"] = http_request.state.trace_id
-        if http_request.state.decision_id:
-            options["decision_id"] = http_request.state.decision_id
-        return application.enqueue("xiaoe_hls", request.m3u8_url, options)
-
     @app.get("/api/v1/tasks/{task_id}")
     def get_task(task_id: str) -> dict:
-        payload = application.get_task(task_id)
+        payload = application_for_request().get_task(task_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="task not found")
         return payload
 
     @app.get("/api/v1/videos/{video_id}")
     def get_video(video_id: str) -> dict:
-        payload = application.get_video(video_id)
+        payload = application_for_request().get_video(video_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "data": payload}
@@ -197,32 +254,32 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
     @app.get("/api/v1/videos")
     def list_videos(limit: int = 50) -> dict:
         safe_limit = max(1, min(limit, 200))
-        return {"contract_version": "content.v1", "items": application.list_videos(safe_limit)}
+        return {"contract_version": "content.v1", "items": application_for_request().list_videos(safe_limit)}
 
     @app.get("/api/v1/videos/{video_id}/segments")
     def get_video_segments(video_id: str) -> dict:
-        items = application.get_segments(video_id)
+        items = application_for_request().get_segments(video_id)
         if items is None:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "video_id": video_id, "items": items}
 
     @app.get("/api/v1/videos/{video_id}/chapters")
     def get_video_chapters(video_id: str) -> dict:
-        items = application.get_chapters(video_id)
+        items = application_for_request().get_chapters(video_id)
         if items is None:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "video_id": video_id, "items": items}
 
     @app.get("/api/v1/videos/{video_id}/summary")
     def get_video_summary(video_id: str) -> dict:
-        payload = application.get_summary(video_id)
+        payload = application_for_request().get_summary(video_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="summary not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.get("/api/v1/videos/{video_id}/knowledge")
     def list_video_knowledge(video_id: str, limit: int = 100) -> dict:
-        items = application.list_video_knowledge(video_id, max(1, min(limit, 500)))
+        items = application_for_request().list_video_knowledge(video_id, max(1, min(limit, 500)))
         if items is None:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "video_id": video_id, "items": items}
@@ -243,8 +300,10 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         limit: int = 20,
     ) -> dict:
         try:
-            items = application.search_knowledge(
-                query, {}, max(1, min(limit, 100)),
+            items = application_for_request().search_knowledge(
+                query,
+                {},
+                max(1, min(limit, 100)),
                 availability_as_of=availability_as_of,
                 target_start=target_start,
                 target_end=target_end,
@@ -257,19 +316,25 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
-            "contract_version": "content.v1", "items": items,
-            "limit": max(1, min(limit, 100)), "intent": "research",
+            "contract_version": "content.v1",
+            "items": items,
+            "limit": max(1, min(limit, 100)),
+            "intent": "research",
             "filters": {
-                "availability_as_of": availability_as_of, "target_start": target_start,
-                "target_end": target_end, "temporal_role": temporal_role,
-                "semantic_segment_id": semantic_segment_id, "business_as_of": business_as_of,
-                "knowledge_as_of": knowledge_as_of, "pit_mode": pit_mode,
+                "availability_as_of": availability_as_of,
+                "target_start": target_start,
+                "target_end": target_end,
+                "temporal_role": temporal_role,
+                "semantic_segment_id": semantic_segment_id,
+                "business_as_of": business_as_of,
+                "knowledge_as_of": knowledge_as_of,
+                "pit_mode": pit_mode,
             },
         }
 
     @app.get("/api/v1/knowledge/{knowledge_uid}")
     def get_knowledge(knowledge_uid: str) -> dict:
-        payload = application.get_knowledge(knowledge_uid)
+        payload = application_for_request().get_knowledge(knowledge_uid)
         if payload is None:
             raise HTTPException(status_code=404, detail="knowledge unit not found")
         return {"contract_version": "content.v1", "data": payload}
@@ -279,7 +344,8 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         effective_filters = {
             **dict(request.filters or {}),
             **{
-                key: value for key, value in {
+                key: value
+                for key, value in {
                     "availability_as_of": request.availability_as_of,
                     "target_start": request.target_start,
                     "target_end": request.target_end,
@@ -288,11 +354,12 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
                     "business_as_of": request.business_as_of,
                     "knowledge_as_of": request.knowledge_as_of,
                     "pit_mode": request.pit_mode,
-                }.items() if value is not None
+                }.items()
+                if value is not None
             },
         }
         try:
-            items = application.search_knowledge(request.query, effective_filters, request.limit)
+            items = application_for_request().search_knowledge(request.query, effective_filters, request.limit)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
@@ -306,28 +373,28 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
     @app.get("/api/v1/videos/{video_id}/snapshots")
     def list_video_snapshots(video_id: str) -> dict:
         # §4 P0-2：同一 source 的历次处理产物版本列表。
-        items = application.list_snapshots_for_video(video_id)
+        items = application_for_request().list_snapshots_for_video(video_id)
         if items is None:
             raise HTTPException(status_code=404, detail="video not found")
         return {"contract_version": "content.v1", "video_id": video_id, "items": items}
 
     @app.get("/api/v1/content-snapshots/{content_snapshot_id}")
     def get_content_snapshot(content_snapshot_id: str) -> dict:
-        payload = application.get_content_snapshot(content_snapshot_id)
+        payload = application_for_request().get_content_snapshot(content_snapshot_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="content snapshot not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.get("/api/v1/content-snapshots/{content_snapshot_id}/lineage")
     def get_content_snapshot_lineage(content_snapshot_id: str) -> dict:
-        payload = application.get_snapshot_lineage(content_snapshot_id)
+        payload = application_for_request().get_snapshot_lineage(content_snapshot_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="content snapshot not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.post("/api/v1/content-snapshots/{content_snapshot_id}/replay")
     def replay_content_snapshot(content_snapshot_id: str, request: ReplayRequest | None = None) -> dict:
-        result = application.replay_content_snapshot(
+        result = application_for_request().replay_content_snapshot(
             content_snapshot_id,
             mode=request.mode if request else None,
             pipeline_version=request.pipeline_version if request else None,
@@ -349,29 +416,33 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
                 "REPLAY_INPUT_UNAVAILABLE": 424,
                 "REPLAY_UNAVAILABLE": 503,
             }.get(str(error), 500)
-            raise HTTPException(status_code=status, detail=result)
+            # Replay failures have a deliberately bounded, local diagnostic
+            # envelope (replay id and deterministic differences).  Preserve
+            # it under the stable redacted error protocol instead of dropping
+            # it as an arbitrary exception detail.
+            raise HTTPException(status_code=status, detail={"code": str(error), "details": result})
         return {"contract_version": "content.v1", **result}
 
     @app.get("/api/v1/content-snapshots/{content_snapshot_id}/signals")
     def get_snapshot_signals(content_snapshot_id: str, claim_id: str | None = None) -> dict:
-        if application.get_content_snapshot(content_snapshot_id) is None:
+        if application_for_request().get_content_snapshot(content_snapshot_id) is None:
             raise HTTPException(status_code=404, detail="content snapshot not found")
         return {
             "contract_version": "content-factor-signal.v4",
             "content_snapshot_id": content_snapshot_id,
-            "items": application.get_snapshot_signals(content_snapshot_id, claim_id),
+            "items": application_for_request().get_snapshot_signals(content_snapshot_id, claim_id),
         }
 
     @app.get("/api/v1/artifacts/{artifact_id}")
     def get_artifact(artifact_id: str) -> dict:
-        payload = application.get_artifact(artifact_id)
+        payload = application_for_request().get_artifact(artifact_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.get("/api/v1/artifacts/{artifact_id}/lineage")
     def get_artifact_lineage(artifact_id: str) -> dict:
-        payload = application.get_artifact_lineage(artifact_id)
+        payload = application_for_request().get_artifact_lineage(artifact_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         return {"contract_version": "content.v1", "data": payload}
@@ -396,47 +467,47 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {
             "contract_version": "content.v1",
-            **application.register_claim(claim, trace_id=getattr(http_request.state, "trace_id", None)),
+            **application_for_request().register_claim(claim, trace_id=getattr(http_request.state, "trace_id", None)),
         }
 
     @app.get("/api/v1/claims/{claim_id}")
     def get_claim(claim_id: str) -> dict:
-        payload = application.get_claim(claim_id)
+        payload = application_for_request().get_claim(claim_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="claim not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.get("/api/v1/claims/{claim_id}/evidence")
     def get_claim_evidence(claim_id: str) -> dict:
-        payload = application.get_claim_evidence(claim_id)
+        payload = application_for_request().get_claim_evidence(claim_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="claim not found")
         return {"contract_version": "content.v1", "claim_id": claim_id, "items": payload}
 
     @app.get("/api/v1/claims/{claim_id}/verifications")
     def get_claim_verifications(claim_id: str) -> dict:
-        payload = application.get_claim_verifications(claim_id)
+        payload = application_for_request().get_claim_verifications(claim_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="claim not found")
         return {"contract_version": "content.v1", "claim_id": claim_id, "items": payload}
 
     @app.get("/api/v1/claims/{claim_id}/verification")
     def get_claim_verification(claim_id: str) -> dict:
-        payload = application.get_claim_verification(claim_id)
+        payload = application_for_request().get_claim_verification(claim_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="claim verification not found")
         return {"contract_version": "content.v1", "data": payload}
 
     @app.get("/api/v1/signals/{signal_id}/lineage")
     def get_signal_lineage(signal_id: str) -> dict:
-        payload = application.get_signal_lineage(signal_id)
+        payload = application_for_request().get_signal_lineage(signal_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="signal not found")
         return {"contract_version": "content-factor-signal.v4", "data": payload}
 
     @app.post("/api/v1/verification/retry")
     def retry_verification(request: VerificationRetryRequest) -> dict:
-        result = application.retry_verification(request.claim_id)
+        result = application_for_request().retry_verification(request.claim_id)
         if result.get("error") == "CLAIM_NOT_FOUND":
             raise HTTPException(status_code=404, detail="claim not found")
         return {"contract_version": "content.v1", **result}
@@ -444,7 +515,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
     @app.get("/api/v1/conflicts")
     def list_conflicts(status: str | None = None) -> dict:
         try:
-            items = application.list_conflicts(status)
+            items = application_for_request().list_conflicts(status)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return {"contract_version": "content.v1", "items": items}
@@ -463,6 +534,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
     def formal_factor_signals(request: FormalSignalQueryRequest) -> dict:
         try:
             query = request.to_domain()
+            application = application_for_request()
             method = getattr(application, "formal_factor_signals", None)
             candidates = list(method(query) if method is not None else ())
             items = []
@@ -475,11 +547,10 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
                     continue
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        snapshot = getattr(application, "_snapshots", None)
+        snapshot = getattr(application_for_request(), "_snapshots", None)
         snapshot = snapshot.get(query.content_snapshot_id) if snapshot is not None else None
         producer_commit = str(
-            getattr(snapshot, "code_sha", "")
-            or (getattr(snapshot, "producer_manifest", {}) or {}).get("code_sha", "")
+            getattr(snapshot, "code_sha", "") or (getattr(snapshot, "producer_manifest", {}) or {}).get("code_sha", "")
         )
         if not producer_commit:
             raise HTTPException(status_code=422, detail="formal signal requires snapshot producer_commit lineage")
@@ -488,12 +559,20 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
             producer_commit=producer_commit,
             items=items,
         )
-        return {"contract": CONTRACT_NAME, "contract_checksum": CONTRACT_CHECKSUM,
-                "authority": "FORMAL_FACT", "formal_eligible": True,
-                "query_id": query.query_id, "manifest": manifest,
-                "business_as_of": manifest["business_as_of"], "knowledge_as_of": manifest["knowledge_as_of"],
-                "availability_as_of": manifest["availability_as_of"], "content_snapshot_id": query.content_snapshot_id,
-                "pit_mode": PUBLIC_STRICT, "items": items}
+        return {
+            "contract": CONTRACT_NAME,
+            "contract_checksum": CONTRACT_CHECKSUM,
+            "authority": "FORMAL_FACT",
+            "formal_eligible": True,
+            "query_id": query.query_id,
+            "manifest": manifest,
+            "business_as_of": manifest["business_as_of"],
+            "knowledge_as_of": manifest["knowledge_as_of"],
+            "availability_as_of": manifest["availability_as_of"],
+            "content_snapshot_id": query.content_snapshot_id,
+            "pit_mode": PUBLIC_STRICT,
+            "items": items,
+        }
 
     @app.post("/internal/v1/factor-signals", tags=["compatibility"])
     def factor_signals(request: ContentSignalRequest, response: Response) -> dict:
@@ -501,7 +580,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         response.headers["Sunset"] = "Wed, 31 Dec 2026 23:59:59 GMT"
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
-        items = application.factor_signals(request.symbols, start, end, request.minimum_support_status)
+        items = application_for_request().factor_signals(request.symbols, start, end, request.minimum_support_status)
         return compatibility_response("content-factor-signal.v3", items)
 
     @app.post("/internal/v1/factor-signals/v4", tags=["compatibility"])
@@ -512,7 +591,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         return compatibility_response(
             "content-factor-signal.v4",
-            application.factor_signals_v4(request.symbols, start, end),
+            application_for_request().factor_signals_v4(request.symbols, start, end),
         )
 
     @app.post("/internal/v1/factor-signals/v5", tags=["compatibility"])
@@ -522,7 +601,7 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         start = request.start.replace(tzinfo=request.start.tzinfo or UTC)
         end = request.end.replace(tzinfo=request.end.tzinfo or UTC)
         try:
-            items = application.factor_signals_v5(
+            items = application_for_request().factor_signals_v5(
                 request.symbols,
                 start,
                 end,
@@ -535,6 +614,3 @@ def create_app(service: ContentApplication | None = None) -> FastAPI:
         return compatibility_response("content-factor-signal.v5", items)
 
     return app
-
-
-app = create_app()

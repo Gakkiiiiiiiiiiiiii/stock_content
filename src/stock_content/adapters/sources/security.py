@@ -35,6 +35,18 @@ class UnsafeSourceURL(ValueError):
         self.url = url
 
 
+class SourceDownloadHTTPError(RuntimeError):
+    """A redacted HTTP response from the safe byte-download boundary.
+
+    Callers may use ``status`` to make a narrowly scoped retry decision, but
+    the exception deliberately has no URL, response body, or request headers.
+    """
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"SOURCE_DOWNLOAD_HTTP_{status}")
+        self.status = status
+
+
 def _is_allowed_host(host: str, allowed_domains: set[str] | frozenset[str]) -> bool:
     host = host.lower().rstrip(".")
     return any(host == domain or host.endswith("." + domain) for domain in allowed_domains)
@@ -323,6 +335,35 @@ def _open_safe_response(
     raise UnsafeSourceURL("source redirect chain is too long", code="SOURCE_REDIRECT_UNSAFE", url=current)
 
 
+def expand_safe_redirect(
+    url: str,
+    *,
+    allowed_domains: set[str] | frozenset[str] = DEFAULT_ALLOWED_DOMAINS,
+    timeout: float = 10.0,
+    max_redirects: int = 5,
+) -> str:
+    """Expand a public short link through the DNS-pinned redirect boundary.
+
+    This intentionally exposes only the final public URL to the caller; no
+    response body, cookies, authorization headers, or redirect diagnostics are
+    retained.  ``_open_safe_response`` validates every hop and bounds the
+    chain before any subsequent consumer sees the result.
+    """
+    final_url, connection, response = _open_safe_response(
+        url,
+        allowed_domains=allowed_domains,
+        timeout=timeout,
+        max_redirects=max_redirects,
+    )
+    try:
+        if response.status < 200 or response.status >= 400:
+            raise UnsafeSourceURL("source redirect expansion failed", code="SOURCE_REDIRECT_UNSAFE", url=url)
+        return final_url
+    finally:
+        response.close()
+        connection.close()
+
+
 def safe_download_url(
     url: str,
     target: str | os.PathLike[str],
@@ -346,7 +387,7 @@ def safe_download_url(
     )
     try:
         if response.status < 200 or response.status >= 300:
-            raise RuntimeError(f"source download returned HTTP {response.status}")
+            raise SourceDownloadHTTPError(response.status)
         destination = os.fspath(target)
         os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
         written = 0
@@ -375,6 +416,8 @@ def download_hls_playlist(
     *,
     allowed_domains: set[str] | frozenset[str] = DEFAULT_ALLOWED_DOMAINS,
     max_depth: int = 8,
+    headers: dict[str, str] | None = None,
+    manifest_validator: Any | None = None,
 ) -> str:
     """Materialize a safe HLS graph locally and return its local playlist path.
 
@@ -383,6 +426,14 @@ def download_hls_playlist(
     or its bounded manifest equivalent.
     """
     root = os.path.abspath(os.fspath(target_dir))
+    safe_headers: dict[str, str] = {}
+    for name, value in (headers or {}).items():
+        normalized = name.lower()
+        if normalized in {"host", "proxy", "proxy-authorization", "cookie", "authorization"}:
+            raise UnsafeSourceURL("unsafe download header is not allowed", code="SOURCE_HEADER_UNSAFE", url=source_url)
+        if normalized in {"referer", "origin"}:
+            validate_source_url(value, allowed_domains=allowed_domains)
+        safe_headers[name] = value
     os.makedirs(root, exist_ok=True)
     cache = os.path.join(root, ".safe-hls")
     os.makedirs(cache, exist_ok=True)
@@ -399,7 +450,7 @@ def download_hls_playlist(
         if remote_url in playlists:
             return playlists[remote_url]
         final_url, connection, response = _open_safe_response(
-            remote_url, allowed_domains=allowed_domains, timeout=30.0
+            remote_url, allowed_domains=allowed_domains, timeout=30.0, headers=safe_headers
         )
         try:
             if response.status < 200 or response.status >= 300:
@@ -416,6 +467,8 @@ def download_hls_playlist(
             raise RuntimeError("HLS manifest is not UTF-8") from exc
         if not text.lstrip().startswith("#EXTM3U"):
             raise RuntimeError("source is not a supported HLS playlist")
+        if manifest_validator is not None:
+            manifest_validator(text)
         output = local_name(final_url, ".m3u8")
         playlists[remote_url] = output
         lines = text.splitlines()
@@ -470,7 +523,7 @@ def download_hls_playlist(
         if remote_url in assets:
             return assets[remote_url]
         output = local_name(remote_url, ".bin")
-        safe_download_url(remote_url, output, allowed_domains=allowed_domains)
+        safe_download_url(remote_url, output, allowed_domains=allowed_domains, headers=safe_headers)
         assets[remote_url] = output
         return output
 
@@ -479,9 +532,11 @@ def download_hls_playlist(
 
 __all__ = [
     "DEFAULT_ALLOWED_DOMAINS",
+    "SourceDownloadHTTPError",
     "UnsafeSourceURL",
     "preflight_source_url",
     "download_hls_playlist",
+    "expand_safe_redirect",
     "safe_download_url",
     "validate_redirect",
     "validate_source_url",

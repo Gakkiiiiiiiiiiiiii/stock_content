@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from .claim_draft import ClaimOccurrenceDraft
+from .claim_draft import ClaimOccurrenceDraft, TemporalExpressionDraft
 from .semantic_context_builder import SemanticContext
 
 
@@ -86,17 +86,55 @@ class AtomicClaimExtractor:
                 )
                 bullish = any(x in statement for x in ("增长", "利好", "改善"))
                 bearish = any(x in statement for x in ("风险", "利空", "下滑"))
+                # The offline adapter supplies a deterministic *candidate*
+                # shape which is still validated against the authoritative
+                # transcript below.  Its subject/predicate must be textual
+                # values from the selected sentence; synthetic "fixture"
+                # identities would correctly fail the atomic validator.
+                predicate = next(
+                    (
+                        marker
+                        for marker in (
+                            "营收增长", "收入增长", "利润增长", "毛利率", "营收", "收入", "利润",
+                            "业绩", "基本面", "估值", "订单", "增长", "放缓", "下滑", "风险", "利好", "利空",
+                        )
+                        if marker in statement
+                    ),
+                    statement.strip("。！？!?；; "),
+                )
+                subject_name = None
+                if not ticker:
+                    chinese_run = re.search(r"[\u4e00-\u9fff]{2,}", statement)
+                    subject_name = chinese_run.group(0) if chinese_run else None
+                temporal_match = re.search(
+                    r"(?:19|20)\d{2}\s*(?:年\s*(?:第?[一二三四1234]季度|Q[1-4])|Q[1-4])",
+                    statement,
+                    re.IGNORECASE,
+                )
                 drafts.append(ClaimOccurrenceDraft(
                 semantic_segment_id=semantic_segment_id,
                 knowledge_kind="EARNINGS" if earnings else "CLAIM",
                 claim_type="FINANCIAL_METRIC" if earnings else "INDUSTRY_RELATION",
                 subject_type="EQUITY" if ticker else "CONTENT",
-                subject_key=ticker.group(1) if ticker else "fixture",
-                predicate_key="statement",
+                subject_key=ticker.group(1) if ticker else "",
+                subject_name=subject_name,
+                predicate_key=predicate,
                 conclusion=statement,
-                value=statement,
+                value=None,
                 sentiment="BULLISH" if bullish else "BEARISH" if bearish else "NEUTRAL",
                 evidence_segment_indices=[idx],
+                temporal_expressions=(
+                    [
+                        TemporalExpressionDraft(
+                            role="REPORTING_PERIOD",
+                            raw_expression=temporal_match.group(0),
+                            evidence_segment_indices=[idx],
+                            confidence=1.0,
+                        )
+                    ]
+                    if temporal_match
+                    else []
+                ),
                 extraction_model_id="offline-fixture",
                 extraction_prompt_version="offline-fixture.v1",
                 extraction_confidence=1.0,
@@ -104,13 +142,50 @@ class AtomicClaimExtractor:
         return drafts
 
     def _validate(self, value: ClaimOccurrenceDraft | dict[str, Any], semantic_segment_id: str) -> ClaimOccurrenceDraft:
-        draft = value if isinstance(value, ClaimOccurrenceDraft) else ClaimOccurrenceDraft.model_validate(value)
+        if isinstance(value, ClaimOccurrenceDraft):
+            draft = value
+        else:
+            # The model is allowed to return the public ``claim.atomic.v1``
+            # shape, but extraction still exposes the legacy occurrence DTO
+            # to the next pipeline stage.  Retain only candidate facts here;
+            # acceptance markers below are deliberately overwritten until the
+            # transcript-local atomic validator accepts them.
+            candidate = dict(value)
+            subject = candidate.pop("subject", None)
+            if isinstance(subject, dict):
+                candidate.setdefault("subject_type", subject.get("subject_type"))
+                candidate.setdefault("subject_key", subject.get("subject_key"))
+                candidate.setdefault("subject_name", subject.get("subject_name"))
+            if "predicate" in candidate:
+                candidate.setdefault("predicate_key", candidate.pop("predicate"))
+            object_value = candidate.pop("object", None)
+            if isinstance(object_value, dict):
+                candidate.setdefault("value", object_value.get("value", object_value.get("text")))
+                candidate.setdefault("unit", object_value.get("unit"))
+                candidate.setdefault("currency", object_value.get("currency"))
+            candidate.setdefault("conclusion", candidate.get("normalized_statement", ""))
+            # These keys are extractor/model metadata, not acceptance facts.
+            # A model must never make its own output formally grounded.
+            for key in (
+                "polarity", "assertion_tense", "visual_anchors", "claim_schema_version",
+                "grounding_status", "grounding_reason_codes", "contradiction_group_id",
+                "legacy_grounding_incomplete",
+            ):
+                candidate.pop(key, None)
+            draft = ClaimOccurrenceDraft.model_validate(candidate)
         if draft.semantic_segment_id and draft.semantic_segment_id != semantic_segment_id:
             raise ValueError("claim draft belongs to another semantic segment")
         return draft.model_copy(update={
             "semantic_segment_id": semantic_segment_id,
             "extraction_model_id": draft.extraction_model_id or self.model_id,
             "extraction_prompt_version": draft.extraction_prompt_version or self.prompt_version,
+            # This extractor is an untrusted boundary.  Only
+            # AtomicClaimValidationStage may replace these fail-closed values.
+            "grounding_status": "LEGACY_UNGROUNDED",
+            "grounding_reason_codes": [],
+            "contradiction_group_id": None,
+            "claim_schema_version": "claim.final.v1",
+            "legacy_grounding_incomplete": True,
         })
 
     def _complete(self, prompt: str) -> Any:

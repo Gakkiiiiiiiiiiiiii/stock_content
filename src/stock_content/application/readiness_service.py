@@ -27,6 +27,8 @@ class ReadinessDependencies:
     # it means the service cannot make a freshness claim for Qdrant.
     index_lag_events: int | None = None
     index_state: str = "UNKNOWN"
+    projection_pending_count: int = 0
+    projection_dead_letter_count: int = 0
     latest_snapshot: SnapshotReadiness = field(default_factory=lambda: SnapshotReadiness(None))
     contract_inventory: tuple[str, ...] = ()
     required_contracts: tuple[str, ...] = ()
@@ -45,10 +47,13 @@ class ReadinessReport:
     fact: ComponentReadiness
     signal: ComponentReadiness
     search: ComponentReadiness
+    projection: ComponentReadiness
     latest_ready_snapshot: SnapshotReadiness
     outbox_lag_seconds: float
     index_lag_events: int | None
     index_state: str
+    projection_pending_count: int
+    projection_dead_letter_count: int
     max_index_lag_events: int
     contract_inventory: tuple[str, ...]
 
@@ -64,6 +69,7 @@ class ReadinessReport:
             "fact": component(self.fact),
             "signal": component(self.signal),
             "search": component(self.search),
+            "projection": component(self.projection),
             "latest_ready_snapshot": {
                 "snapshot_id": self.latest_ready_snapshot.snapshot_id,
                 "state": self.latest_ready_snapshot.state,
@@ -73,6 +79,8 @@ class ReadinessReport:
             "outbox_lag_seconds": self.outbox_lag_seconds,
             "index_lag_events": self.index_lag_events,
             "index_state": self.index_state,
+            "projection_pending_count": self.projection_pending_count,
+            "projection_dead_letter_count": self.projection_dead_letter_count,
             "index_backlog_slo_events": self.max_index_lag_events,
             "contract_inventory": list(self.contract_inventory),
             # These names make the operational permission distinction explicit
@@ -83,6 +91,7 @@ class ReadinessReport:
                 "read_only_facts": component(self.fact),
                 "formal_publish": component(self.signal),
                 "derived_search": component(self.search),
+                "derived_projection": component(self.projection),
             },
         }
 
@@ -136,14 +145,25 @@ class ReadinessService:
         elif dep.index_lag_events > self.max_index_lag_events:
             search_reasons.append("index_backlog_exceeded")
         search = ComponentReadiness("search", not search_reasons, bool(search_reasons), tuple(search_reasons))
+        projection_reasons = []
+        if not dep.qdrant_ok:
+            projection_reasons.append("qdrant_unavailable")
+        if dep.projection_dead_letter_count:
+            projection_reasons.append("projection_dead_letter")
+        projection = ComponentReadiness(
+            "projection", not projection_reasons, bool(projection_reasons), tuple(projection_reasons)
+        )
         return ReadinessReport(
             fact=fact,
             signal=signal,
             search=search,
+            projection=projection,
             latest_ready_snapshot=snapshot,
             outbox_lag_seconds=dep.outbox_lag_seconds,
             index_lag_events=dep.index_lag_events,
             index_state=index_state,
+            projection_pending_count=dep.projection_pending_count,
+            projection_dead_letter_count=dep.projection_dead_letter_count,
             max_index_lag_events=self.max_index_lag_events,
             contract_inventory=tuple(dep.contract_inventory),
         )

@@ -101,6 +101,11 @@ class FinancialClaim(BaseModel):
     condition_text: str | None = None
     invalidation_text: str | None = None
     condition_key: str | None = None
+    normalized_statement: str | None = None
+    grounding_status: str = "LEGACY_UNGROUNDED"
+    grounding_reason_codes: list[str] = Field(default_factory=list)
+    contradiction_group_id: str | None = None
+    legacy_grounding_incomplete: bool = True
     temporal_bindings: list[ClaimTemporalBinding] = Field(default_factory=list)
     temporal_relations: list[ClaimTemporalRelation] = Field(default_factory=list)
     claim_schema_version: str = "claim.v2"
@@ -121,10 +126,15 @@ class FinancialClaim(BaseModel):
     @model_validator(mode="after")
     def _invariants(self) -> "FinancialClaim":
         # 所有 claim 必须有 evidence（最终验收标准）。
-        if not self.evidence_refs and self.claim_schema_version != "claim.final.v1":
+        if not self.evidence_refs and self.claim_schema_version not in {"claim.final.v1", "claim.atomic.v1"}:
             raise ValueError("claim requires at least one evidence_ref")
         if not self.fact_category:
             self.fact_category = CLAIM_CATEGORY[self.claim_type]
+        if self.grounding_status == "GROUNDED":
+            if not self.normalized_statement:
+                raise ValueError("grounded claim requires normalized_statement")
+            if self.legacy_grounding_incomplete:
+                raise ValueError("grounded claim cannot be marked legacy incomplete")
         if not self.claim_id:
             self.claim_id = claim_id_of(self)
         return self
@@ -143,6 +153,9 @@ class FinancialClaim(BaseModel):
             "period_end": str(self.period_end) if self.period_end else None,
             "claim_schema_version": self.claim_schema_version,
             "normalization_version": self.normalization_version,
+            "normalized_statement": self.normalized_statement,
+            "grounding_status": self.grounding_status,
+            "contradiction_group_id": self.contradiction_group_id,
         }
         if self.condition_key or self.temporal_bindings or self.temporal_relations:
             # Legacy fact_time/period fields are compatibility projections and

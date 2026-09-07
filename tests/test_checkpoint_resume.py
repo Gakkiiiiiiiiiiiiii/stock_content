@@ -136,6 +136,12 @@ def test_production_pipeline_stages_are_stage_runners(tmp_path):
     # 稳定常量：两次构建版本一致。
     second = build_application(f"sqlite:///{tmp_path / 'content2.db'}", enable_qdrant=False)
     assert [s.stage_version for s in second._pipeline._stages] == [s.stage_version for s in stages]  # noqa: SLF001
+    # Queued production effects must use one durable fence dependency rather
+    # than each stage silently choosing an unfenced fallback.
+    wired = {runner.name: runner._stage for runner in stages}  # noqa: SLF001
+    assert wired["content_snapshot"]._fenced_effects is not None  # noqa: SLF001
+    assert wired["persist"]._fenced_effects is wired["content_snapshot"]._fenced_effects  # noqa: SLF001
+    assert wired["index"]._fenced_effects is wired["persist"]._fenced_effects  # noqa: SLF001
 
 
 def test_production_run_writes_checkpoint_v2_payload(tmp_path):
@@ -144,18 +150,28 @@ def test_production_run_writes_checkpoint_v2_payload(tmp_path):
 
     from stock_content.api.dependencies import build_application
     from stock_content.api.main import create_app
+    from stock_content.api.security import ServiceAuthorizer
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    token_file = tmp_path / "content-api.token"
+    token_file.write_text("checkpoint-test-token\n", encoding="utf-8")
+    client = TestClient(
+        create_app(application, authorizer=ServiceAuthorizer((token_file,), ("stock_agent",)))
+    )
+    headers = {
+        "Authorization": "Bearer checkpoint-test-token",
+        "x-caller-service": "stock_agent",
+    }
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest",
         json={
             "bv_id": "BV1ckpt",
             "options": {"metadata": {"title": "ckpt"}, "transcript": "股票600000基本面良好。", "offline_fixture": True},
         },
+        headers=headers,
     )
     application.process_next("ckpt-test")
-    task = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()
+    task = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}", headers=headers).json()
     assert task["status"] == "SUCCEEDED"
     checkpoint = task["checkpoint"]
     from stock_content.api.dependencies import STAGE_VERSIONS

@@ -66,6 +66,27 @@ def test_final_temporal_scopes_and_financial_horizons_are_deterministic():
     assert normalizer.normalize("NTM", anchor=anchored).metric_temporal_nature is MetricTemporalNature.FORWARD
 
 
+def test_explicit_chinese_gregorian_day_and_quarter_normalize_without_inference():
+    normalizer = TemporalNormalizer()
+    chinese_day = normalizer.normalize("2026年9月1日")
+    iso_day = normalizer.normalize("2026-09-01")
+    assert chinese_day.start_date == chinese_day.end_date == date(2026, 9, 1)
+    assert chinese_day.value_type is TemporalValueType.DATE
+    assert chinese_day.temporal_binding_id == iso_day.temporal_binding_id
+
+    chinese_quarter = normalizer.normalize("2025年第三季度")
+    canonical_quarter = normalizer.normalize("2025Q3")
+    assert (chinese_quarter.start_date, chinese_quarter.end_date) == (date(2025, 7, 1), date(2025, 9, 30))
+    assert chinese_quarter.temporal_binding_id == canonical_quarter.temporal_binding_id
+
+
+@pytest.mark.parametrize("expression", ["2026年2月29日", "2025年13月1日", "2025年第三季", "下个季度"])
+def test_malformed_or_ambiguous_chinese_time_is_not_inferred(expression):
+    result = TemporalNormalizer().normalize(expression)
+    assert result.normalization_status == "UNRESOLVED"
+    assert result.start_date is None and result.end_date is None
+
+
 def test_fiscal_and_market_reference_provenance_is_retained():
     normalizer = TemporalNormalizer(reference_provider=ReferenceData())
     fiscal = normalizer.normalize("FY2027Q2", anchor=datetime(2026, 8, 1, tzinfo=timezone.utc), subject_key="issuer")

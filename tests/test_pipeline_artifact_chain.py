@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select
@@ -19,11 +21,13 @@ from stock_content.adapters.postgres.repositories.artifact_repository import Sql
 from stock_content.api.dependencies import STAGE_VERSIONS, build_application
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.snapshot_service import SnapshotService
+from stock_content.application.source_resolution_service import command_with_legacy_policy, normalize_command
 from stock_content.application.stage_runner import StageResult, StageRunner
 from stock_content.application.stages import FrameExtractionStage
 from stock_content.domain.artifacts import SourceArtifact
 from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.checkpoint import CheckpointValidationError
+from stock_content.domain.knowledge_bundle import KnowledgeBundleRequest
 from stock_content.domain.models import KnowledgeUnit
 from stock_content.domain.semantic_context_builder import SemanticContext
 
@@ -98,6 +102,53 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
     assert active["verification"].artifact_id in active["lifecycle"].parent_artifact_ids
     assert active["lifecycle"].artifact_id in active["knowledge"].parent_artifact_ids
     assert active["knowledge"].artifact_id in active["summary"].parent_artifact_ids
+
+
+def test_canonical_command_worker_projects_validated_atomic_claim_to_strict_sql_bundle(tmp_path, monkeypatch):
+    """No SQL claim/occurrence/evidence authority is seeded by this probe."""
+    monkeypatch.setenv("CONTENT_SERVICE_VERSION", "test-service")
+    monkeypatch.setenv("CONTENT_GIT_COMMIT", "test-content-sha")
+    monkeypatch.setenv("CONTENT_PIPELINE_VERSION", "test-pipeline")
+    application = build_application(f"sqlite:///{tmp_path / 'atomic-bundle.db'}", enable_qdrant=False)
+    canonical = command_with_legacy_policy(
+        normalize_command(source_type="bilibili", source_ref="BV1atomic", part=2, options={"language": "en"})
+    )
+    # The test-only media/model fixture is injected below the canonical
+    # command boundary.  It is not a caller-supplied atomic payload and all
+    # resulting claims still pass the production validator.
+    command = replace(
+        canonical,
+        options={
+            **canonical.options,
+            "metadata": {"title": "fixture", "platform_id": "BV1atomic", "part_id": "2"},
+            "transcript": "600000 revenue grows 10% in 2025Q3.",
+            "offline_fixture": True,
+        },
+    )
+    task = application.enqueue_ingestion(command)
+    result = application.process_next("atomic-bundle-worker")
+    assert result["status"] == "SUCCEEDED"
+    now = datetime.now(UTC)
+    bundle = application.create_knowledge_bundle(
+        KnowledgeBundleRequest(
+            content_snapshot_id=result["content_snapshot_id"],
+            query="revenue",
+            symbol="600000",
+            business_as_of=now,
+            knowledge_as_of=now,
+            availability_as_of=now,
+            minimum_support_status="SOURCE_SUPPORTED",
+            max_items=10,
+        )
+    )
+    assert task["task_id"] == result["task_id"]
+    assert len(bundle["items"]) == 1
+    item = bundle["items"][0]
+    assert item["statement"] == "600000 revenue grows 10% in 2025Q3."
+    assert item["support_status"] == "SOURCE_SUPPORTED"
+    assert item["evidence"][0]["ownership"] == "PRIMARY"
+    assert item["evidence"][0]["quote_hash"].startswith("sha256:")
+    assert item["temporal"]["target_start"] == "2025-07-01T00:00:00Z"
 
 
 def test_non_quant_claim_persists_not_verifiable_result_without_job(tmp_path):

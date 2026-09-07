@@ -17,6 +17,9 @@ class PostgresFinancialEntityRepository:
 
     def replace(self, video_id: str, units: list[KnowledgeUnit]) -> None:
         with self._sessions.begin() as session:
+            self.replace_in_session(session, video_id, units)
+
+    def replace_in_session(self, session, video_id: str, units: list[KnowledgeUnit]) -> None:
             session.execute(delete(FinancialEntityRow).where(FinancialEntityRow.video_id == video_id))
             seen: set[str] = set()
             for unit in units:

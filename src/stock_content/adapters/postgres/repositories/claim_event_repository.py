@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from stock_content.adapters.postgres.models import ClaimStateEventRow, FinancialClaimRow
-from stock_content.domain.claim_state_event import ClaimStateEvent, validate_event_chain
+from stock_content.domain.claim_state_event import ClaimStateEvent, event_logical_identity, validate_event_chain
 
 
 class ClaimStateEventRepository:
@@ -15,8 +15,7 @@ class ClaimStateEventRepository:
 
     def append(self, event: ClaimStateEvent) -> ClaimStateEvent:
         with self._sessions.begin() as session:
-            self.append_in_session(session, event)
-        return event
+            return self.append_in_session(session, event)
 
     def append_in_session(self, session, event: ClaimStateEvent) -> ClaimStateEvent:
         # Validate the content-addressed identity at the persistence boundary
@@ -55,7 +54,25 @@ class ClaimStateEventRepository:
             if stored != candidate:
                 raise ValueError(f"claim state event {event.event_id} already stores different payload")
             return event
-        tail = self._tail_in_session(session, event.claim_id)
+        rows = session.scalars(
+            select(ClaimStateEventRow)
+            .where(ClaimStateEventRow.claim_id == event.claim_id)
+            # Lock every row: chain placement and the logical projection key
+            # must be checked in the same transaction.
+            .with_for_update()
+        ).all()
+        existing_events = validate_event_chain(self._events_from_rows(rows))
+        logical_matches = [
+            stored for stored in existing_events
+            if event_logical_identity(stored) == event_logical_identity(event)
+        ]
+        if len(logical_matches) > 1:
+            raise ValueError("claim state event logical identity is ambiguous")
+        if logical_matches:
+            # A retry sees the original chained event and must retain its
+            # predecessor/hash rather than append it to the newer tail.
+            return logical_matches[0]
+        tail = existing_events[-1] if existing_events else None
         if tail is not None and event.previous_event_hash != tail.event_hash:
             raise ValueError("claim state event previous_event_hash does not match chain tail")
         session.add(ClaimStateEventRow(

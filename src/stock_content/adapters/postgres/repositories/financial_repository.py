@@ -15,6 +15,9 @@ class PostgresFinancialRepository:
 
     def replace(self, video_id: str, numeric_facts: list[dict], events: list[dict]) -> None:
         with self._sessions.begin() as session:
+            self.replace_in_session(session, video_id, numeric_facts, events)
+
+    def replace_in_session(self, session, video_id: str, numeric_facts: list[dict], events: list[dict]) -> None:
             session.execute(delete(FinancialNumericFactRow).where(FinancialNumericFactRow.video_id == video_id))
             session.execute(delete(FinancialEventRow).where(FinancialEventRow.video_id == video_id))
             for index, item in enumerate(numeric_facts):

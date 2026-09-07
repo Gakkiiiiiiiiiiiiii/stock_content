@@ -233,6 +233,25 @@ class TemporalNormalizer:
         m = re.fullmatch(r"(\d{4})[年\-/]?\s*(?:Q|第)?([1-4])(?:季度)?", text, re.I)
         if m:
             return self._period(text, int(m.group(1)), int(m.group(2)), role, evidence_refs)
+        # These are explicit Gregorian periods, not a locale-dependent date
+        # parser.  Keep support deliberately narrow: a malformed calendar day
+        # remains unresolved rather than being corrected or inferred.
+        m = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+        if m:
+            try:
+                return self._date(
+                    text,
+                    date(int(m.group(1)), int(m.group(2)), int(m.group(3))),
+                    role,
+                    TemporalPrecision.DAY,
+                    evidence_refs,
+                )
+            except ValueError:
+                return self._unresolved(text, role, scope_hint or TemporalScope.UNKNOWN, evidence_refs)
+        m = re.fullmatch(r"(\d{4})年\s*第?([一二三四])季度", text)
+        if m:
+            chinese_quarter = {"一": 1, "二": 2, "三": 3, "四": 4}
+            return self._period(text, int(m.group(1)), chinese_quarter[m.group(2)], role, evidence_refs)
         m = re.fullmatch(r"(\d{4})\s*[H半]([12])", text, re.I)
         if m:
             y, half = int(m.group(1)), int(m.group(2))

@@ -5,9 +5,44 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from stock_content.adapters.postgres.models import ClaimStateEventRow
 from stock_content.api.dependencies import build_application
 from stock_content.api.main import create_app
+from stock_content.api.security import ServiceAuthorizer
+
+
+class _AuthenticatedClient:
+    """Exercise private routes with the same service authentication as production."""
+
+    def __init__(self, client: TestClient) -> None:
+        self._client = client
+
+    @staticmethod
+    def _headers(headers: dict | None = None) -> dict:
+        return {
+            "Authorization": "Bearer replay-fixture-token",
+            "X-Caller-Service": "stock_agent",
+            "X-Trace-Id": "replay-fixture",
+            **(headers or {}),
+        }
+
+    def get(self, url: str, **kwargs):
+        kwargs["headers"] = self._headers(kwargs.get("headers"))
+        return self._client.get(url, **kwargs)
+
+    def post(self, url: str, **kwargs):
+        kwargs["headers"] = self._headers(kwargs.get("headers"))
+        return self._client.post(url, **kwargs)
+
+
+def _client(application, tmp_path) -> _AuthenticatedClient:
+    token = tmp_path / "content-service-token"
+    token.write_text("replay-fixture-token\n", encoding="utf-8")
+    return _AuthenticatedClient(
+        TestClient(create_app(application, authorizer=ServiceAuthorizer((token,), ("stock_agent",))))
+    )
 
 
 def _ingest_options() -> dict:
@@ -23,7 +58,7 @@ def _ingest_options() -> dict:
 
 def test_ingest_produces_content_snapshot_and_replay(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
 
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1replay", "options": _ingest_options()}
@@ -61,7 +96,7 @@ def test_ingest_produces_content_snapshot_and_replay(tmp_path):
 
 def test_ingest_persist_events_drive_formal_v51_query(tmp_path, monkeypatch):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest",
         json={
@@ -107,7 +142,7 @@ def test_ingest_persist_events_drive_formal_v51_query(tmp_path, monkeypatch):
 
 def test_same_content_different_model_yields_new_snapshot(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
 
     # 同一 source 使用不同 ASR 模型重复处理：源内容相同，快照身份必须不同。
     ids = []
@@ -132,9 +167,38 @@ def test_same_content_different_model_yields_new_snapshot(tmp_path):
 
 def test_snapshot_not_found_returns_404(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     assert client.get("/api/v1/content-snapshots/cs-missing").status_code == 404
     assert client.post("/api/v1/content-snapshots/cs-missing/replay").status_code == 404
+
+
+def test_snapshot_reentry_keeps_one_initial_claim_event(tmp_path, monkeypatch):
+    """Crash/reentry cannot append the same initial event at a new tail."""
+    from stock_content.application.stages import SnapshotRecordingStage
+
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    original = SnapshotRecordingStage.execute
+
+    def reenter_once(self, context):
+        original(self, context)
+        # This is the production seam after publication but before the stage
+        # checkpoint is acknowledged. The same lease remains current.
+        return original(self, context)
+
+    monkeypatch.setattr(SnapshotRecordingStage, "execute", reenter_once)
+    application.enqueue(
+        "bilibili", "BV-snapshot-reentry", _ingest_options()
+    )
+    result = application.process_next("snapshot-reentry-worker")
+    assert result["status"] == "SUCCEEDED", result
+    with application._claim_event_repository._sessions() as session:  # noqa: SLF001
+        rows = session.scalars(
+            select(ClaimStateEventRow).where(ClaimStateEventRow.event_type == "VERIFICATION_INITIAL")
+        ).all()
+    assert len(rows) == 1
+    # Repository read reconstructs and validates the hash chain.
+    events = application._claim_event_repository.list_for_claim(rows[0].claim_id)  # noqa: SLF001
+    assert [event.event_type for event in events].count("VERIFICATION_INITIAL") == 1
 
 
 # ---- P0 C-02：核心 pipeline 必须在对应 Stage 完成时立即登记 typed Artifact ----
@@ -144,7 +208,7 @@ def _run_and_capture_registry(tmp_path, monkeypatch) -> tuple[dict, "TestClient"
     from stock_content.application.stages import SnapshotRecordingStage
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     captured: dict = {}
     original = SnapshotRecordingStage.execute
 
@@ -224,7 +288,7 @@ def test_replay_uses_artifact_lineage(tmp_path, monkeypatch):
 
 def test_reprocess_fixture_is_exact_and_closes_task(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     options = {
         **_ingest_options(),
         "available_from": "2025-01-02T03:04:05+00:00",
@@ -249,7 +313,7 @@ def test_reprocess_fixture_is_exact_and_closes_task(tmp_path):
 
 def test_migration_replay_creates_child_snapshot(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1migration", "options": _ingest_options()}
     )
@@ -267,9 +331,40 @@ def test_migration_replay_creates_child_snapshot(tmp_path):
     assert candidate["pipeline_version"] == "pipeline.v4"
 
 
+def test_migration_replay_reuses_sealed_source_clock_and_artifact_hashes(tmp_path):
+    """A migration changes snapshot lineage, never sealed source inputs."""
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = _client(application, tmp_path)
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest",
+        json={
+            "bv_id": "BV1migrationoffset",
+            "options": {
+                **_ingest_options(),
+            },
+        },
+    )
+    assert enqueue.status_code == 200, enqueue.json()
+    application.process_next("replay-migration-offset")
+    task = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()
+    assert task["status"] == "SUCCEEDED", task
+    source_id = task["result"]["content_snapshot_id"]
+    replay = client.post(
+        f"/api/v1/content-snapshots/{source_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4"},
+    )
+    assert replay.status_code == 200
+    candidate_id = replay.json()["candidate_snapshot_id"]
+    source = application._snapshots.get(source_id)  # noqa: SLF001
+    candidate = application._snapshots.get(candidate_id)  # noqa: SLF001
+    assert candidate.content_snapshot_id != source.content_snapshot_id
+    assert candidate.pipeline_version == "pipeline.v4"
+    assert candidate.artifact_ids == source.artifact_ids
+
+
 def test_task_specific_options_do_not_change_snapshot_identity(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     ids = []
     for key, trace in (("request-a", "trace-a"), ("request-b", "trace-b")):
         options = {
@@ -290,7 +385,7 @@ def test_task_specific_options_do_not_change_snapshot_identity(tmp_path):
 
 def test_reprocess_difference_is_structured_and_task_fails(tmp_path):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1different", "options": _ingest_options()}
     )
@@ -301,7 +396,7 @@ def test_reprocess_difference_is_structured_and_task_fails(tmp_path):
         json={"mode": "REPROCESS", "overrides": {"transcript": "different fixture"}},
     )
     assert replay.status_code == 409
-    body = replay.json()["detail"]
+    body = replay.json()["error"]["details"]
     assert body["error"] == "REPLAY_NONDETERMINISTIC"
     assert body["differences"]
     assert client.get(f"/api/v1/tasks/{body['replay_id']}").json()["status"] == "FAILED"
@@ -309,7 +404,7 @@ def test_reprocess_difference_is_structured_and_task_fails(tmp_path):
 
 def test_reprocess_pipeline_failure_closes_created_task(tmp_path, monkeypatch):
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1failure", "options": _ingest_options()}
     )
@@ -324,7 +419,7 @@ def test_reprocess_pipeline_failure_closes_created_task(tmp_path, monkeypatch):
         f"/api/v1/content-snapshots/{snapshot_id}/replay", json={"mode": "REPROCESS"}
     )
     assert replay.status_code == 500
-    detail = replay.json()["detail"]
+    detail = replay.json()["error"]["details"]
     assert detail["error"] == "REPLAY_FAILED"
     assert client.get(f"/api/v1/tasks/{detail['replay_id']}").json()["status"] == "FAILED"
 
@@ -340,7 +435,7 @@ def test_verify_lineage_rejects_missing_snapshot_closure_rows(tmp_path, missing_
     )
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
         "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1closure", "options": _ingest_options()}
     )
@@ -380,9 +475,9 @@ def test_verify_lineage_rejects_occurrence_row_outside_snapshot(tmp_path, field,
     from stock_content.adapters.postgres.models import ClaimOccurrenceRow
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
-        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1closure-tamper", "options": _ingest_options()}
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1closuretamper", "options": _ingest_options()}
     )
     application.process_next("closure-tamper")
     snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
@@ -409,9 +504,9 @@ def test_verify_lineage_rejects_occurrence_evidence_outside_snapshot(tmp_path):
     from stock_content.adapters.postgres.models import ClaimOccurrenceEvidenceRow
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
-        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1evidence-tamper", "options": _ingest_options()}
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1evidencetamper", "options": _ingest_options()}
     )
     application.process_next("evidence-tamper")
     snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
@@ -441,9 +536,9 @@ def test_verify_lineage_rejects_lifecycle_target_type_tampering(tmp_path):
     from stock_content.adapters.postgres.models import LifecycleEventLedgerRow
 
     application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
-    client = TestClient(create_app(application))
+    client = _client(application, tmp_path)
     enqueue = client.post(
-        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1lifecycle-tamper", "options": _ingest_options()}
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1lifecycletamper", "options": _ingest_options()}
     )
     application.process_next("lifecycle-tamper")
     snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]

@@ -20,6 +20,14 @@ services:
       CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
       CONTENT_QDRANT_URL: http://qdrant:6333
       CONTENT_QDRANT_COLLECTION: knowledge_v3
+      CONTENT_SERVICE_API_KEY_FILE: /run/secrets/content-service-api-key
+      CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
+      CONTENT_XIAOE_HLS_CREDENTIAL_REF: ${CONTENT_XIAOE_HLS_CREDENTIAL_REF:-xiaoe-hls-locator}
+      CONTENT_INGESTION_CREDENTIAL_REFS: ${CONTENT_INGESTION_CREDENTIAL_REFS:-bilibili-cookiefile,xiaoe-hls-locator,xiaoe-storage-state}
+    secrets:
+      - content-service-api-key
+    volumes:
+      - content-worker-state:/var/run/stock-content:ro
     ports:
       - "8100:8100"
     depends_on:
@@ -27,8 +35,6 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
 
   stock-content-core-worker:
     build:
@@ -53,8 +59,50 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
+
+  stock-content-video-worker:
+    profiles: [video]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.video
+    env_file:
+      - path: .env
+        required: false
+    command: ["stock-content-worker"]
+    environment:
+      CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+      CONTENT_QDRANT_URL: http://qdrant:6333
+      CONTENT_QDRANT_COLLECTION: knowledge_v3
+      CONTENT_WORKER_PROFILE: video
+      CONTENT_WORKER_QUEUE: video_pipeline
+      CONTENT_VIDEO_WORKER_HEARTBEAT_FILE: /var/run/stock-content/video-worker-heartbeat.json
+      CONTENT_XIAOE_STORAGE_STATE_FILE: /run/secrets/xiaoe-storage-state
+      CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
+      CONTENT_BILIBILI_COOKIEFILE: /run/secrets/bilibili-cookiefile
+      CONTENT_XIAOE_HLS_CREDENTIAL_REF: ${CONTENT_XIAOE_HLS_CREDENTIAL_REF:-xiaoe-hls-locator}
+      CONTENT_XIAOE_HLS_LOCATOR_FILE: /run/secrets/xiaoe-hls-locator
+    volumes:
+      - content-worker-state:/var/run/stock-content
+    secrets:
+      - xiaoe-storage-state
+      - bilibili-cookiefile
+      - xiaoe-hls-locator
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /work:uid=10001,gid=10001,mode=700
+      - /data:uid=10001,gid=10001,mode=700
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4096M
+          pids: 128
+    depends_on:
+      content-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   verification-worker:
     profiles: [verification]
@@ -151,6 +199,7 @@ services:
       retries: 10
 
   qdrant:
+    profiles: [search]
     image: qdrant/qdrant:v1.12.6
     volumes:
       - content-qdrant:/qdrant/storage
@@ -158,3 +207,14 @@ services:
 volumes:
   content-postgres:
   content-qdrant:
+  content-worker-state:
+
+secrets:
+  content-service-api-key:
+    file: ${CONTENT_SERVICE_API_KEY_HOST_FILE:?set CONTENT_SERVICE_API_KEY_HOST_FILE to a read-only secret file}
+  xiaoe-storage-state:
+    file: ${CONTENT_XIAOE_STORAGE_STATE_HOST_FILE:?set CONTENT_XIAOE_STORAGE_STATE_HOST_FILE to a read-only secret file}
+  bilibili-cookiefile:
+    file: ${CONTENT_BILIBILI_COOKIEFILE_HOST_FILE:?set CONTENT_BILIBILI_COOKIEFILE_HOST_FILE to a read-only Netscape cookie file}
+  xiaoe-hls-locator:
+    file: ${CONTENT_XIAOE_HLS_LOCATOR_HOST_FILE:?set CONTENT_XIAOE_HLS_LOCATOR_HOST_FILE to a read-only authorized HLS locator file}
