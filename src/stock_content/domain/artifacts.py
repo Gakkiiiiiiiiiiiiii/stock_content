@@ -276,6 +276,11 @@ class FrameArtifact(ArtifactBase):
     image_hash: str = ""
     storage_ref: str = ""
     extraction_reason: str = ""
+    # Targeted visual evidence must retain its transcript-derived provenance
+    # through checkpoints/replay without embedding transcript text or URLs.
+    semantic_segment_ids: tuple[str, ...] = ()
+    evidence_window_ids: tuple[str, ...] = ()
+    planner_version: str = ""
 
 
 @dataclass(frozen=True)

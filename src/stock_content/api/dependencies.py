@@ -69,6 +69,7 @@ from stock_content.application.stages import (
     FinancialEnrichmentStage,
     FrameExtractionStage,
     IndexStage,
+    KnowledgeDirectedFrameExtractionStage,
     KnowledgeExtractionStage,
     LifecycleProjectionStage,
     MultimodalContextStage,
@@ -121,6 +122,7 @@ STAGE_VERSIONS: dict[str, str] = {
     "multimodal_context": "1.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
+    "knowledge_frame": "1.0.0",
     "semantic_context": "1.0.0",
     "atomic_claim_extraction": "1.0.0",
     "atomic_claim_validation": "1.0.0",
@@ -422,6 +424,7 @@ def build_application(
             ChapterStage(ChapterSegmenter()),
             TemporalWindowStage(TemporalWindowBuilder()),
             SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
+            KnowledgeDirectedFrameExtractionStage(FfmpegFrameExtractor()),
             SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
             AtomicClaimExtractionStage(extractor=atomic_extractor),
             AtomicClaimValidationStage(),

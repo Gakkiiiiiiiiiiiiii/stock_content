@@ -77,6 +77,7 @@ class PipelineState:
     atomic_claim_rejections: list[Any] = field(default_factory=list)
     transcript: str = ""
     frames: list[Any] = field(default_factory=list)
+    knowledge_evidence_windows: list[Any] = field(default_factory=list)
     frame_insights: list[dict[str, Any]] = field(default_factory=list)
     ocr_evidence: list[dict[str, Any]] = field(default_factory=list)
     multimodal_context: dict[str, Any] = field(default_factory=dict)

@@ -571,6 +571,10 @@ class ContentApplication:
                 "image_hash": item.image_hash,
                 "storage_ref": item.storage_ref,
                 "image_path": item.storage_ref,
+                "extraction_reason": item.extraction_reason,
+                "semantic_segment_ids": list(item.semantic_segment_ids),
+                "evidence_window_ids": list(item.evidence_window_ids),
+                "planner_version": item.planner_version,
             }
             for item in context.artifacts.frames
         ]

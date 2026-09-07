@@ -55,6 +55,8 @@ from stock_content.domain.governance_evidence import governance_evidence_for, re
 from stock_content.domain.initial_verification import build_initial_verification_plan
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
+from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindowPlanner
+from stock_content.domain.knowledge_frame_plan import KnowledgeFramePlanner, frame_id_for
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
@@ -533,6 +535,9 @@ class FrameExtractionStage:
                     image_hash=self._image_hash(item),
                     storage_ref=str(durable_image or item.get("image_path") or item.get("storage_ref") or ""),
                     extraction_reason=str(item.get("extraction_reason") or "fixture"),
+                    semantic_segment_ids=tuple(str(value) for value in item.get("semantic_segment_ids") or ()),
+                    evidence_window_ids=tuple(str(value) for value in item.get("evidence_window_ids") or ()),
+                    planner_version=str(item.get("planner_version") or ""),
                     parent_artifact_ids=(media.artifact_id,),
                 )
                 frame_artifacts.append(
@@ -1153,6 +1158,101 @@ class SemanticSegmentationStage:
                 )
             self._repository.save(result.artifact, video_id=video_id)
         return _stage_result(context, "semantic_segments")
+
+
+class KnowledgeDirectedFrameExtractionStage:
+    """Materialize transcript-planned frames after semantic segmentation.
+
+    OCR and vision deliberately remain untouched in this packet: they execute
+    earlier in the existing graph.  A following packet can move or rerun those
+    consumers after this stage without changing this stage's deterministic
+    request/identity boundary.
+    """
+
+    name = "knowledge_frame"
+    required_inputs = ("media", "transcript", "semantic_segments")
+    output_types = ("frame",)
+    optional_output_types = ("frame",)
+
+    def __init__(
+        self,
+        extractor,
+        window_planner: KnowledgeEvidenceWindowPlanner | None = None,
+        frame_planner: KnowledgeFramePlanner | None = None,
+    ) -> None:
+        self._extractor = extractor
+        self._window_planner = window_planner or KnowledgeEvidenceWindowPlanner()
+        self._frame_planner = frame_planner or KnowledgeFramePlanner()
+
+    def execute(self, context: PipelineContext) -> StageResult:
+        transcript = context.artifacts.transcript
+        media = context.artifacts.media
+        if transcript is None or media is None:
+            raise ValueError("knowledge-directed frame extraction requires media and transcript artifacts")
+        windows = self._window_planner.plan(
+            transcript,
+            context.state.semantic_segments,
+            media_duration_ms=_duration_ms(context),
+        )
+        context.state.knowledge_evidence_windows = list(windows)
+        requests = self._frame_planner.plan(windows, media_duration_ms=_duration_ms(context))
+        if context.runtime.video_path is None:
+            return StageResult(context=context)
+        existing_hashes = {
+            str(item.get("image_hash") or "")
+            for item in context.state.frames
+            if isinstance(item, dict) and item.get("image_hash")
+        }
+        extracted = self._extractor.extract_targeted(
+            context.runtime.video_path,
+            context.runtime.work_dir,
+            requests,
+            existing_image_hashes=existing_hashes,
+        )
+        request_by_timestamp = {item.timestamp_ms: item for item in requests}
+        artifacts: list[FrameArtifact] = []
+        for item in extracted:
+            timestamp_ms = int(item["timestamp_ms"])
+            request = request_by_timestamp.get(timestamp_ms)
+            if request is None:
+                raise RuntimeError("knowledge frame extractor returned an unplanned timestamp")
+            image_path = Path(str(item["image_path"]))
+            digest = self._image_hash(item)
+            durable_image = _persist_durable_file(context, image_path, digest, "frames")
+            frame_id = frame_id_for(media_artifact_id=media.artifact_id, request=request)
+            planned = {
+                **item,
+                "frame_id": frame_id,
+                "image_path": str(durable_image),
+                "storage_ref": str(durable_image),
+            }
+            frame = FrameArtifact(
+                artifact_id="frame-pending",
+                artifact_type="frame",
+                producer_stage=self.name,
+                media_artifact_id=media.artifact_id,
+                frame_id=frame_id,
+                timestamp_ms=timestamp_ms,
+                image_hash=digest,
+                storage_ref=str(durable_image),
+                extraction_reason=request.extraction_reason,
+                semantic_segment_ids=request.semantic_segment_ids,
+                evidence_window_ids=request.evidence_window_ids,
+                planner_version=request.planner_version,
+                parent_artifact_ids=(media.artifact_id,),
+            )
+            artifact = FrameArtifact(**{**frame.__dict__, "artifact_id": artifact_id_of(frame)})
+            context.artifacts.add("frames", artifact)
+            artifacts.append(artifact)
+            context.state.frames.append(planned)
+        context.state.frames.sort(
+            key=lambda item: (int(item.get("timestamp_ms") or 0), str(item.get("frame_id") or ""))
+        )
+        return StageResult(context=context, produced_artifacts=tuple(artifacts))
+
+    @staticmethod
+    def _image_hash(item: dict[str, Any]) -> str:
+        return FrameExtractionStage._image_hash(item)
 
 
 class SemanticContextStage:
