@@ -77,9 +77,15 @@ class PostgresKnowledgeBundleRepository:
         dialect = session.bind.dialect.name
         if dialect == "postgresql":
             result = session.execute(
-                postgresql_insert(ContentKnowledgeBundleRow).values(**values).on_conflict_do_nothing()
+                postgresql_insert(ContentKnowledgeBundleRow)
+                .values(**values)
+                .on_conflict_do_nothing()
+                # psycopg may expose an indeterminate rowcount for conflict
+                # ignoring inserts.  The immutable bundle id is returned
+                # only when this transaction won the first write.
+                .returning(ContentKnowledgeBundleRow.bundle_id)
             )
-            return bool(result.rowcount)
+            return result.scalar_one_or_none() is not None
         if dialect == "sqlite":
             result = session.execute(sqlite_insert(ContentKnowledgeBundleRow).values(**values).on_conflict_do_nothing())
             return bool(result.rowcount)

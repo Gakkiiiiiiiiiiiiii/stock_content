@@ -8,9 +8,19 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from stock_content.adapters.postgres.repositories.artifact_repository import SqlArtifactRepository
+from stock_content.adapters.postgres.repositories.artifact_repository import (
+    ArtifactIntegrityError,
+    SqlArtifactRepository,
+)
 from stock_content.adapters.postgres.repositories.claim_occurrence_repository import ClaimOccurrenceRepository
 from stock_content.adapters.postgres.repositories.claim_repository import SqlClaimRepository
+from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
+    PostgresKnowledgeBundleRepository,
+)
+from stock_content.adapters.postgres.repositories.signal_outbox_repository import (
+    SignalOutboxIntegrityError,
+    SignalOutboxRepository,
+)
 from stock_content.adapters.postgres.repositories.snapshot_repository import (
     SnapshotIntegrityError,
     SqlSnapshotStore,
@@ -43,7 +53,10 @@ def test_psycopg_first_write_uses_returning_without_early_integrity_checks(postg
         source_ref="psycopg",
         source_content_hash="source-hash",
     )
-    artifacts.put(source)
+    assert artifacts.put(source).artifact_id == source.artifact_id
+    assert artifacts.put(source).artifact_id == source.artifact_id
+    with pytest.raises(ArtifactIntegrityError, match="different payload"):
+        artifacts.put(replace(source, source_content_hash="different-source-hash", content_hash=""))
     snapshots = SqlSnapshotStore(postgres_database.session_factory)
     snapshot = build_content_snapshot(
         source_type="fixture",
@@ -103,7 +116,38 @@ def test_psycopg_first_write_uses_returning_without_early_integrity_checks(postg
         source_confidence=0.9,
         extractor_confidence=0.9,
     )
-    SqlClaimRepository(postgres_database.session_factory).save(claim)
+    claims = SqlClaimRepository(postgres_database.session_factory)
+    assert claims.save(claim) == claim
+    assert claims.save(claim) == claim
+    with pytest.raises(ValueError, match="different payload"):
+        claims.save(claim.model_copy(update={"value": 11}))
+
+    outbox = SignalOutboxRepository(postgres_database.session_factory)
+    signal = {
+        "signal_id": "psycopg-signal",
+        "signal_schema_version": "content-factor-signal.v4",
+        "content_snapshot_id": snapshot.content_snapshot_id,
+        "claim_id": claim.claim_id,
+    }
+    assert outbox.enqueue(signal).signal_id == signal["signal_id"]
+    assert outbox.enqueue(dict(signal)).signal_id == signal["signal_id"]
+    with pytest.raises(SignalOutboxIntegrityError, match="different payload"):
+        outbox.enqueue({**signal, "claim_id": "different-claim"})
+
+    bundle = {
+        "bundle_id": "ckb_" + "a" * 64,
+        "bundle_hash": "sha256:" + "a" * 64,
+        "content_snapshot_id": snapshot.content_snapshot_id,
+        "request_hash": "sha256:" + "b" * 64,
+        "contract": "content-knowledge-bundle.v1",
+        "producer": {"git_commit": "psycopg-test", "pipeline_version": "test-pipeline"},
+    }
+    bundles = PostgresKnowledgeBundleRepository(postgres_database.session_factory)
+    assert bundles.insert(bundle) == bundle
+    assert bundles.insert(dict(bundle)) == bundle
+    with pytest.raises(ValueError, match="immutable bundle id collision"):
+        bundles.insert({**bundle, "bundle_hash": "sha256:" + "c" * 64})
+
     result = VerificationResult(
         claim_id=claim.claim_id,
         status="VERIFIED",

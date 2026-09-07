@@ -183,6 +183,13 @@ def _insert_ignore(session, model, values: dict, conflict_columns: list) -> bool
     dialect = session.get_bind().dialect.name
     if dialect == "postgresql":
         statement = postgres_insert(model).values(**values)
+        # psycopg does not guarantee a useful rowcount for ``DO NOTHING``.
+        # A returned primary key is present only for the first writer.
+        primary_key = next(iter(model.__table__.primary_key.columns))
+        result = session.execute(
+            statement.on_conflict_do_nothing(index_elements=conflict_columns).returning(primary_key)
+        )
+        return result.scalar_one_or_none() is not None
     elif dialect == "sqlite":
         statement = sqlite_insert(model).values(**values)
     else:
