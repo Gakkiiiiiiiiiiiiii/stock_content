@@ -275,8 +275,12 @@ def _existing_payload(session, row: ClaimOccurrenceRow) -> dict:
 def _insert_ignore(session, model, values: dict) -> bool:
     dialect = session.get_bind().dialect.name
     if dialect == "postgresql":
-        result = session.execute(postgres_insert(model).values(**values).on_conflict_do_nothing())
-        return result.rowcount == 1
+        statement = postgres_insert(model).values(**values)
+        # ``rowcount`` is not reliable with psycopg for DO NOTHING.  The
+        # primary key appears only when this transaction inserted the row.
+        primary_key = next(iter(model.__table__.primary_key.columns))
+        result = session.execute(statement.on_conflict_do_nothing().returning(primary_key))
+        return result.scalar_one_or_none() is not None
     elif dialect == "sqlite":
         result = session.execute(sqlite_insert(model).values(**values).on_conflict_do_nothing())
         return result.rowcount == 1
