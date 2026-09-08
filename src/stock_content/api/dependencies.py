@@ -67,7 +67,7 @@ from stock_content.application.stages import (
     DownloadStage,
     EvidenceGroundingStage,
     FinancialEnrichmentStage,
-    FrameExtractionStage,
+    FixtureFrameRegistrationStage,
     IndexStage,
     KnowledgeDirectedFrameExtractionStage,
     KnowledgeExtractionStage,
@@ -90,6 +90,7 @@ from stock_content.application.stages import (
     TranscriptVisualCrosscheckStage,
     VerificationStage,
     VisionStage,
+    VisualEvidencePolicyStage,
 )
 from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
@@ -116,7 +117,11 @@ LOGGER = logging.getLogger(__name__)
 STAGE_VERSIONS: dict[str, str] = {
     "resolve": "1.0.0",
     "download": "1.0.0",
-    "frame": "1.0.0",
+    # ``frame`` is no longer part of the production graph.  Bump the legacy
+    # identity so a checkpoint containing interval/boundary frames cannot be
+    # restored into the targeted-only visual chain.
+    "frame": "2.0.0",
+    "frame_fixture": "2.0.0",
     "audio": "1.0.0",
     "asr": "1.0.0",
     # Coverage policy changed from 95% with a max-gap gate to 90% without
@@ -130,14 +135,17 @@ STAGE_VERSIONS: dict[str, str] = {
     # C3 moves visual consumers after transcript-planned knowledge frames.
     # Bumping their checkpoint identities prevents resume from accepting
     # pre-targeted OCR/vision context as if it covered the complete frame set.
-    "ocr": "3.0.0",
-    "vision": "3.0.0",
-    "transcript_visual_crosscheck": "2.0.0",
-    "multimodal_context": "4.0.0",
+    # GPU runtime/device identity is now a checkpoint input. Pre-isolation
+    # (including CPU) OCR results cannot resume into a required-GPU task.
+    "ocr": "5.0.0",
+    "vision": "4.0.0",
+    "transcript_visual_crosscheck": "3.0.0",
+    "multimodal_context": "5.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
-    "knowledge_frame": "2.0.0",
-    "semantic_context": "3.0.0",
+    "knowledge_frame": "3.0.0",
+    "visual_evidence_policy": "1.0.0",
+    "semantic_context": "4.0.0",
     "atomic_claim_extraction": "1.0.0",
     "atomic_claim_validation": "1.0.0",
     "evidence_grounding": "1.0.0",
@@ -203,6 +211,8 @@ def pipeline_config_from_env() -> dict[str, object]:
         ),
         "ocr_engine": os.getenv("CONTENT_OCR_ENGINE", "paddleocr"),
         "ocr_engine_version": os.getenv("CONTENT_OCR_ENGINE_VERSION", "3"),
+        "ocr_device": os.getenv("CONTENT_OCR_DEVICE", "gpu:0"),
+        "ocr_require_gpu": _env_bool("CONTENT_OCR_REQUIRE_GPU", True),
         "vision_model": os.getenv("CONTENT_VISION_MODEL", ""),
         "vision_model_version": os.getenv("CONTENT_VISION_MODEL_VERSION", ""),
         "vision_prompt_version": os.getenv("CONTENT_VISION_PROMPT_VERSION", "vision-context.prompt.v1"),
@@ -466,13 +476,10 @@ def build_application(
         if semantic_enabled
         else []
     )
-    compatibility_stages = (
-        []
-        if semantic_enabled
-        else [
-            ChapterStage(ChapterSegmenter()),
-        ]
+    visual_planning_stages = (
+        semantic_stages if semantic_enabled else [VisualEvidencePolicyStage(semantic_segmentation_enabled=False)]
     )
+    compatibility_stages = [] if semantic_enabled else [ChapterStage(ChapterSegmenter())]
     semantic_claim_stages = (
         [
             SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
@@ -492,7 +499,6 @@ def build_application(
     stages = [
         ResolveSourceStage(sources),
         DownloadStage(sources),
-        FrameExtractionStage(FfmpegFrameExtractor()),
         TranscriptCandidateStage(),
         AudioStage(FfmpegAudioExtractor()),
         ASRStage(FasterWhisperRecognizer()),
@@ -501,11 +507,13 @@ def build_application(
         SpeakerDiarizationStage(PyannoteDiarizer()),
         TranscriptPostprocessStage(TranscriptPostprocessor()),
         # Video identity is required by semantic segment persistence; visual
-        # analysis follows semantic planning so it sees coarse and targeted
-        # frames in one immutable set.
+        # analysis follows semantic planning and receives targeted frames only.
         BuildVideoStage(),
-        *semantic_stages,
-        OCRStage(PaddleOcrEngine()),
+        *visual_planning_stages,
+        # Test fixtures remain an explicit adapter only.  It never invokes
+        # ffmpeg and may not register caller-supplied frames for live media.
+        FixtureFrameRegistrationStage(),
+        OCRStage(PaddleOcrEngine(device=str(config["ocr_device"]), require_gpu=bool(config["ocr_require_gpu"]))),
         VisionStage(HttpVisionAnalyzer()),
         TranscriptVisualCrosscheckStage(
             TranscriptVisualCrossChecker(version=str(config["transcript_visual_crosscheck_version"]))

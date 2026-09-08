@@ -7,6 +7,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from stock_content.adapters.media.ocr import PaddleOcrEngine
 from stock_content.api.dependencies import build_application
 from stock_content.domain.worker_capability import TaskKind, WorkerProfile, require_capability
 
@@ -42,9 +43,27 @@ def _write_video_heartbeat() -> None:
         LOGGER.warning("video worker heartbeat could not be written")
 
 
+def _probe_video_ocr_runtime() -> None:
+    """Prove the isolated OCR runtime, then release the startup probe.
+
+    Pipeline stages create their own long-lived OCR adapter when work arrives;
+    retaining this preliminary process would otherwise leak an idle GPU child.
+    """
+
+    engine = PaddleOcrEngine()
+    try:
+        engine.start_and_probe()
+    finally:
+        engine.close()
+
+
 def run_forever() -> None:
     require_capability(WORKER_PROFILE, QUEUE)
     logging.basicConfig(level=os.getenv("CONTENT_LOG_LEVEL", "INFO"))
+    # The video queue owns visual stages. It must not claim work until the
+    # separate Paddle process has completed initialization and a real probe.
+    if WORKER_PROFILE is WorkerProfile.VIDEO:
+        _probe_video_ocr_runtime()
     application = build_application()
     worker_id = os.getenv("CONTENT_WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")
     poll_seconds = float(os.getenv("CONTENT_WORKER_POLL_SECONDS", "2"))

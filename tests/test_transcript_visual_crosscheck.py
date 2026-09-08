@@ -339,6 +339,19 @@ def test_visual_checkpoint_identity_rejects_changed_model_or_planner_version():
         "vision_prompt_version": "vision.v1",
         "vision_adapter_version": "adapter.v1",
     }
+    # This is a post-OCR checkpoint fixture.  It must carry the same observed
+    # runtime identity that a successful GPU OCR stage seals, while this test
+    # continues to exercise the independent visual-model mismatch boundary.
+    context.options["ocr_runtime_identity"] = {
+        "requested_device": "gpu:0",
+        "actual_device": "gpu:0",
+        "paddle_version": "3.3.0",
+        "paddleocr_version": "3.7.0",
+        "compiled_cuda": "true",
+        "cuda_version": "12.9",
+        "cudnn_version": "9.9",
+        "device_count": "1",
+    }
     identity = _checkpoint_identity(context)
     record = build_checkpoint(
         stage="transcript_visual_crosscheck",

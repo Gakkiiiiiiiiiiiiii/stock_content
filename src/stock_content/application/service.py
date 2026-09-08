@@ -67,11 +67,36 @@ _VISUAL_MODEL_IDENTITY_KEYS = frozenset(
         "transcript_visual_crosscheck",
         "ocr_engine",
         "ocr_engine_version",
+        "ocr_requested_device",
         "vision",
         "vision_version",
     }
 )
 _VISUAL_PROMPT_IDENTITY_KEYS = frozenset({"vision", "vision_adapter"})
+_OCR_RUNTIME_IDENTITY_KEYS = frozenset({"ocr_actual_device", "ocr_runtime_identity"})
+_OCR_RUNTIME_BOUND_STAGES = frozenset(
+    {
+        "ocr",
+        "vision",
+        "transcript_visual_crosscheck",
+        "multimodal_context",
+        "temporal_window",
+        "semantic_context",
+    }
+)
+
+
+def _is_offline_fixture_options(options: dict[str, Any]) -> bool:
+    """Recognize the narrowly defined legacy media-fixture inputs.
+
+    Historical callers supplied a transcript or segments directly, before the
+    explicit ``offline_fixture`` flag existed.  Those inputs deliberately
+    bypass media execution and therefore have no observed OCR runtime to
+    validate during replay.  Key presence (rather than truthiness) preserves
+    the established empty-segments fixture contract without treating arbitrary
+    option values as a production bypass.
+    """
+    return bool(options.get("offline_fixture") or "transcript" in options or "segments" in options)
 
 
 def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineContext) -> None:
@@ -80,7 +105,11 @@ def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineCo
     expected_models = dict(expected.get("model_identity") or {})
     expected_prompts = dict(expected.get("prompt_identity") or {})
     for record in records:
-        if str(getattr(record, "stage", "")) not in _VISUAL_CHECKPOINT_STAGES:
+        # FAILED records are a restart boundary, never reusable provenance.
+        # Do not make their necessarily pre-execution identity block a retry.
+        if getattr(record, "status", "SUCCEEDED") != "SUCCEEDED" or str(
+            getattr(record, "stage", "")
+        ) not in _VISUAL_CHECKPOINT_STAGES:
             continue
         actual_models = dict(getattr(record, "model_identity", None) or {})
         actual_prompts = dict(getattr(record, "prompt_identity", None) or {})
@@ -89,6 +118,19 @@ def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineCo
                 raise CheckpointValidationError(
                     f"CHECKPOINT_ERROR: visual model identity incompatible for {record.stage}: {key}"
                 )
+        # OCR is the boundary at which a concrete Paddle/CUDA runtime is
+        # observed.  Checkpoints at and after that boundary may not be reused
+        # under a different (or absent) observed runtime.  Earlier planning
+        # stages intentionally have no OCR runtime yet.
+        if (
+            str(getattr(record, "stage", "")) in _OCR_RUNTIME_BOUND_STAGES
+            and not _is_offline_fixture_options(context.options)
+        ):
+            for key in _OCR_RUNTIME_IDENTITY_KEYS:
+                if not actual_models.get(key) or actual_models.get(key) != expected_models.get(key):
+                    raise CheckpointValidationError(
+                        f"CHECKPOINT_ERROR: OCR runtime identity incompatible for {record.stage}: {key}"
+                    )
         for key in _VISUAL_PROMPT_IDENTITY_KEYS:
             if actual_prompts.get(key) != expected_prompts.get(key):
                 raise CheckpointValidationError(
@@ -506,6 +548,7 @@ class ContentApplication:
         records, persisted = repository.load_checkpoints(task.task_id, stage_versions)
         if not records:
             return False
+        self._observe_ocr_runtime_for_resume(records, context)
         _validate_visual_checkpoint_identity(records, context)
         context.restored_artifacts = dict(persisted)
         restorable = {
@@ -617,9 +660,43 @@ class ContentApplication:
                     context.runtime.audio_path = extractor.extract(context.runtime.video_path, context.runtime.work_dir)
         return bool(records)
 
+    def _observe_ocr_runtime_for_resume(self, records: list[Any], context: PipelineContext) -> None:
+        """Probe the isolated worker before an OCR checkpoint can be reused.
+
+        Paddle/CUDA identity is observed at prediction time, not encoded in
+        service configuration.  A successful OCR checkpoint consequently
+        needs a fresh probe before its runtime provenance can be trusted on a
+        resumed task.  No probe is performed for non-OCR replay.
+        """
+        if _is_offline_fixture_options(context.options):
+            return
+        if not any(record.status == "SUCCEEDED" and record.stage == "ocr" for record in records):
+            return
+        runner = next((stage for stage in getattr(self._pipeline, "_stages", []) if stage.name == "ocr"), None)
+        stage = getattr(runner, "_stage", runner)
+        probe = getattr(getattr(stage, "_engine", None), "start_and_probe", None)
+        if not callable(probe):
+            raise CheckpointValidationError("CHECKPOINT_ERROR: OCR runtime probe unavailable for resume")
+        try:
+            observed = probe()
+        except Exception as exc:  # noqa: BLE001 - stable checkpoint boundary
+            raise CheckpointValidationError("CHECKPOINT_ERROR: OCR runtime probe failed for resume") from exc
+        if not isinstance(observed, dict) or not observed:
+            raise CheckpointValidationError("CHECKPOINT_ERROR: OCR runtime identity unavailable for resume")
+        frozen_identity = {str(key): str(value) for key, value in observed.items()}
+        requested = str(frozen_identity.get("requested_device") or "")
+        actual = str(frozen_identity.get("actual_device") or "")
+        if bool((context.options.get("pipeline_config") or {}).get("ocr_require_gpu", True)) and (
+            requested != "gpu:0" or not actual.lower().startswith("gpu:0")
+        ):
+            raise CheckpointValidationError("CHECKPOINT_ERROR: OCR GPU runtime unavailable for resume")
+        # The live child-process observation is the only valid resume input;
+        # never trust a caller/task supplied runtime value.
+        context.options["ocr_runtime_identity"] = frozen_identity
+
     @staticmethod
     def _fixture_options(options: dict[str, Any]) -> bool:
-        return bool(options.get("offline_fixture") or "transcript" in options or "segments" in options)
+        return _is_offline_fixture_options(options)
 
     def _restore_typed_prefix(self, context: PipelineContext, persisted: dict[str, Any]) -> None:
         source = context.artifacts.source
@@ -662,6 +739,7 @@ class ContentApplication:
                 "semantic_segment_ids": list(item.semantic_segment_ids),
                 "evidence_window_ids": list(item.evidence_window_ids),
                 "planner_version": item.planner_version,
+                "planner_request_id": item.planner_request_id,
             }
             for item in context.artifacts.frames
         ]

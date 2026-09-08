@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -430,7 +431,78 @@ def test_hls_materializer_fetches_manifest_segments_and_key_locally(
     assert "key.bin" not in text
     assert "segment.ts" not in text
     assert "#EXTM3U" in text
-    assert list((tmp_path / ".safe-hls").glob("*.bin"))
+    assets = list((tmp_path / ".safe-hls").iterdir())
+    assert any(item.suffix == ".key" for item in assets)
+    assert any(item.suffix == ".ts" for item in assets)
+    assert all("key.bin" not in item.name and "segment.ts" not in item.name for item in assets)
+
+
+def test_hls_extensionless_segments_use_m4s_with_map_and_ts_without_map() -> None:
+    assert security._hls_local_asset_suffix("https://media.example/segment", asset_kind="media", has_map=False) == ".ts"
+    assert security._hls_local_asset_suffix("https://media.example/segment", asset_kind="media", has_map=True) == ".m4s"
+    assert security._hls_local_asset_suffix("https://media.example/init", asset_kind="map", has_map=True) == ".mp4"
+    assert security._hls_local_asset_suffix("https://media.example/key", asset_kind="key", has_map=False) == ".key"
+
+
+def test_local_hls_ts_fixture_is_accepted_by_installed_ffmpeg(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg is not installed")
+    segment = tmp_path / "hashed-segment.ts"
+    generated_playlist = tmp_path / "generated.m3u8"
+    generated = subprocess.run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=32x32:rate=1",
+            "-t",
+            "1",
+            "-c:v",
+            "libx264",
+            "-f",
+            "hls",
+            "-hls_time",
+            "1",
+            "-hls_list_size",
+            "0",
+            str(generated_playlist),
+        ],
+        capture_output=True,
+    )
+    if generated.returncode != 0:
+        pytest.skip("installed ffmpeg cannot generate HLS fixture")
+    generated_segment = tmp_path / "generated0.ts"
+    if not generated_segment.is_file():
+        pytest.skip("installed ffmpeg did not create an HLS segment")
+    generated_segment.replace(segment)
+    playlist = tmp_path / "local.m3u8"
+    playlist.write_text(
+        generated_playlist.read_text(encoding="utf-8").replace("generated0.ts", "hashed-segment.ts"), encoding="utf-8"
+    )
+    output = tmp_path / "source.mp4"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-nostdin",
+            "-y",
+            "-protocol_whitelist",
+            "file,crypto,data",
+            "-allowed_extensions",
+            "ALL",
+            "-i",
+            str(playlist),
+            "-c",
+            "copy",
+            str(output),
+        ],
+        capture_output=True,
+    )
+    assert completed.returncode == 0
+    assert output.is_file() and output.stat().st_size > 0
 
 
 def test_hls_segment_private_redirect_fails_closed_before_bytes(
@@ -461,3 +533,93 @@ def test_hls_segment_private_redirect_fails_closed_before_bytes(
     with pytest.raises(UnsafeSourceURL) as error:
         security.download_hls_playlist("https://m.xiaoe-tech.com/live.m3u8", tmp_path)
     assert error.value.code == "SOURCE_REDIRECT_UNSAFE"
+
+
+def test_hls_master_downloads_only_one_video_variant_and_its_default_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bodies = {
+        "/master.m3u8": b"\n".join(
+            [
+                b"#EXTM3U",
+                b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="other",URI="/audio-other.m3u8"',
+                b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",DEFAULT=YES,URI="/audio-default.m3u8"',
+                b'#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="aud"',
+                b"/video-one.m3u8",
+                b"#EXT-X-STREAM-INF:BANDWIDTH=2,AUDIO=\"aud\"",
+                b"/video-two.m3u8",
+            ]
+        ),
+        "/video-one.m3u8": b"#EXTM3U\n#EXTINF:1,\n/video-one.ts\n",
+        "/audio-default.m3u8": b"#EXTM3U\n#EXTINF:1,\n/audio-default.ts\n",
+        "/video-one.ts": b"video",
+        "/audio-default.ts": b"audio",
+    }
+    requested: list[str] = []
+
+    class FakeConnection:
+        def __init__(self, _host: str, _port: int, **_: object) -> None:
+            self.path = ""
+
+        def request(self, _method: str, path: str, *, headers: dict[str, str]) -> None:
+            self.path = path
+            requested.append(path)
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(200, body=bodies[self.path])
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(security, "_PinnedHTTPSConnection", FakeConnection)
+    monkeypatch.setattr(security.socket, "getaddrinfo", _dns({"m.xiaoe-tech.com": "93.184.216.34"}))
+
+    playlist = Path(security.download_hls_playlist("https://m.xiaoe-tech.com/master.m3u8", tmp_path))
+
+    assert "/video-one.m3u8" in requested
+    assert "/audio-default.m3u8" in requested
+    assert "/video-two.m3u8" not in requested
+    assert "/audio-other.m3u8" not in requested
+    assert "https:" not in playlist.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_code"),
+    [
+        ({"max_playlists": 1}, "HLS_PLAYLIST_LIMIT_EXCEEDED"),
+        ({"max_assets": 1}, "HLS_ASSET_LIMIT_EXCEEDED"),
+        ({"max_total_bytes": 40}, "HLS_TOTAL_BYTES_LIMIT_EXCEEDED"),
+        ({"max_planned_duration_seconds": 1.5}, "HLS_DURATION_LIMIT_EXCEEDED"),
+    ],
+)
+def test_hls_aggregate_limits_fail_closed_and_remove_partial_graph(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kwargs: dict[str, int | float], expected_code: str
+) -> None:
+    bodies = {
+        "/master.m3u8": b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n/video.m3u8\n",
+        "/video.m3u8": b"#EXTM3U\n#EXTINF:1,\n/one.ts\n#EXTINF:1,\n/two.ts\n",
+        "/one.ts": b"a" * 32,
+        "/two.ts": b"b" * 32,
+    }
+
+    class FakeConnection:
+        def __init__(self, _host: str, _port: int, **_: object) -> None:
+            self.path = ""
+
+        def request(self, _method: str, path: str, *, headers: dict[str, str]) -> None:
+            self.path = path
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(200, body=bodies[self.path])
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(security, "_PinnedHTTPSConnection", FakeConnection)
+    monkeypatch.setattr(security.socket, "getaddrinfo", _dns({"m.xiaoe-tech.com": "93.184.216.34"}))
+
+    with pytest.raises(security.HlsResourceLimitError) as error:
+        security.download_hls_playlist("https://m.xiaoe-tech.com/master.m3u8", tmp_path, **kwargs)
+
+    assert error.value.code == expected_code
+    assert not (tmp_path / ".safe-hls").exists()

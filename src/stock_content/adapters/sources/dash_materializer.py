@@ -153,7 +153,13 @@ class DashLocalizer:
             return
 
     def materialize(
-        self, source_url: str, target_dir: Path, *, allowed_domains: frozenset[str], headers: dict[str, str]
+        self,
+        source_url: str,
+        target_dir: Path,
+        *,
+        allowed_domains: frozenset[str],
+        headers: dict[str, str],
+        cookie_jar: object | None = None,
     ) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
         cache = target_dir / ".safe-dash"
@@ -161,7 +167,12 @@ class DashLocalizer:
         raw_mpd = cache / "manifest.xml"
         try:
             final_mpd = self._downloader(
-                source_url, raw_mpd, allowed_domains=allowed_domains, headers=headers, max_bytes=_MAX_MPD_BYTES
+                source_url,
+                raw_mpd,
+                allowed_domains=allowed_domains,
+                headers=headers,
+                max_bytes=_MAX_MPD_BYTES,
+                cookie_jar=cookie_jar,
             )
             body = raw_mpd.read_bytes()
         except DashMaterializationError:
@@ -209,7 +220,12 @@ class DashLocalizer:
             if not output.exists():
                 try:
                     final_asset = self._downloader(
-                        locator, output, allowed_domains=allowed_domains, headers=headers, max_bytes=_MAX_ASSET_BYTES
+                        locator,
+                        output,
+                        allowed_domains=allowed_domains,
+                        headers=headers,
+                        max_bytes=_MAX_ASSET_BYTES,
+                        cookie_jar=cookie_jar,
                     )
                     if not _same_media_host(final_mpd, final_asset):
                         raise DashMaterializationError("SOURCE_REDIRECT_UNSAFE")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import SecretStr
@@ -19,6 +20,7 @@ from stock_content.domain.source_materialization import (
 )
 
 _XIAOE_BASE_DOMAINS = frozenset({"xiaoe-tech.com", "m.xiaoe-tech.com"})
+_IDENTITY = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
 
 
 class XiaoeResolutionError(RuntimeError):
@@ -80,6 +82,13 @@ class XiaoePageResolver:
         except DrmPolicyError as exc:
             raise XiaoeResolutionError(exc.code) from exc
 
+    def storage_state_for(self, credential_ref_hash: str | None):
+        """Return the configured private state at the immediate worker boundary."""
+        try:
+            return self._credential_provider.resolve_hash(credential_ref_hash)
+        except SecretUnavailable as exc:
+            raise XiaoeResolutionError(exc.code) from exc
+
     def _materialization(
         self, source_identity: str, capture: PageCapture, credential_ref_hash: str | None
     ) -> SourceMaterialization:
@@ -113,7 +122,7 @@ class XiaoePageResolver:
             source_type="xiaoe", canonical_source_ref=source_identity,
             source_identity_hash=hashlib.sha256(f"xiaoe:{source_identity}".encode()).hexdigest(),
             platform_id=capture.course_id, part_id=capture.lesson_id, title=capture.title,
-            author=capture.author, published_at=capture.published_at,
+            author=capture.author, published_at=capture.published_at, duration_seconds=capture.duration_seconds,
         )
         return SourceMaterialization(
             public=public, streams=streams, subtitles=subtitles, credential_ref_hash=credential_ref_hash,
@@ -146,6 +155,19 @@ class XiaoeHlsResolver:
         )
 
 
+def _page_url_from_template(template: str, source_identity: str) -> str:
+    values = source_identity.split("/", 1)
+    if len(values) != 2 or not all(_IDENTITY.fullmatch(value) for value in values):
+        raise XiaoeResolutionError("SOURCE_MEDIA_NOT_FOUND")
+    course_id, lesson_id = values
+    if not any(marker in template for marker in ("{source_ref}", "{course_id}", "{lesson_id}")):
+        raise XiaoeResolutionError("SOURCE_MEDIA_NOT_FOUND")
+    try:
+        return template.format(source_ref=source_identity, course_id=course_id, lesson_id=lesson_id)
+    except (KeyError, ValueError) as exc:
+        raise XiaoeResolutionError("SOURCE_MEDIA_NOT_FOUND") from exc
+
+
 def page_resolver_from_environment() -> XiaoePageResolver | None:
     """Build only when the operator has configured an explicit, legal session."""
     if os.getenv("CONTENT_XIAOE_PAGE_RESOLVER_ENABLED", "").lower() != "true":
@@ -153,14 +175,16 @@ def page_resolver_from_environment() -> XiaoePageResolver | None:
     state_file = os.getenv("CONTENT_XIAOE_STORAGE_STATE_FILE")
     template = os.getenv("CONTENT_XIAOE_PAGE_URL_TEMPLATE")
     credential_ref = os.getenv("CONTENT_XIAOE_CREDENTIAL_REF", "xiaoe-storage-state")
-    if not state_file or not template or "{source_ref}" not in template:
+    if not state_file or not template or not any(
+        marker in template for marker in ("{source_ref}", "{course_id}", "{lesson_id}")
+    ):
         return None
     domains = xiaoe_allowed_domains()
     timeout = float(os.getenv("CONTENT_XIAOE_PAGE_TIMEOUT_SECONDS", "60"))
     return XiaoePageResolver(
         credential_provider=FileSecretProvider({credential_ref: state_file}),
         browser=PlaywrightSession(
-            allowed_domains=domains, page_url_for=lambda source_ref: template.format(source_ref=source_ref),
+            allowed_domains=domains, page_url_for=lambda source_ref: _page_url_from_template(template, source_ref),
             timeout_seconds=timeout,
         ),
         allowed_domains=domains,
@@ -169,5 +193,5 @@ def page_resolver_from_environment() -> XiaoePageResolver | None:
 
 __all__ = [
     "XiaoeHlsResolver", "XiaoePageResolver", "XiaoeResolutionError", "page_resolver_from_environment",
-    "xiaoe_allowed_domains",
+    "xiaoe_allowed_domains", "_page_url_from_template",
 ]

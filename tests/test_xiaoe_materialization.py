@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
+import stock_content.adapters.sources.xiaoe_materializer as materializer_module
 from stock_content.adapters.browser.playwright_session import CapturedResponse, PageCapture
 from stock_content.adapters.credentials.file_secret_provider import FileSecretProvider
+from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer
 from stock_content.adapters.sources.dash_materializer import DashLocalizer, DashMaterializationError
-from stock_content.adapters.sources.security import SourceDownloadHTTPError, UnsafeSourceURL
+from stock_content.adapters.sources.security import HlsResourceLimitError, SourceDownloadHTTPError, UnsafeSourceURL
 from stock_content.adapters.sources.xiaoe import XiaoeHlsSourceAdapter
 from stock_content.adapters.sources.xiaoe_materializer import XiaoeMaterializationError, XiaoeMaterializer
 from stock_content.adapters.sources.xiaoe_page import XiaoeHlsResolver, XiaoePageResolver, XiaoeResolutionError
@@ -21,6 +23,19 @@ from stock_content.domain.source_materialization import MediaStream, ResolvedSou
 @pytest.fixture(autouse=True)
 def _allow_test_cdn(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CONTENT_XIAOE_ALLOWED_DOMAINS", "example.test")
+    monkeypatch.setattr(
+        BilibiliMaterializer,
+        "_ffprobe",
+        staticmethod(
+            lambda _path: {
+                "format": {"duration": "1.0", "bit_rate": "1000"},
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264"},
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ],
+            }
+        ),
+    )
 
 
 class _Browser:
@@ -154,6 +169,10 @@ def test_direct_hls_uses_same_secret_materialization_boundary(monkeypatch: pytes
 
     def ffmpeg(arguments: list[str]) -> None:
         assert not any("signature=canary" in value for value in arguments)
+        assert arguments[arguments.index("-allowed_extensions") + 1] == "ALL"
+        assert arguments[arguments.index("-protocol_whitelist") + 1] == "file,crypto,data"
+        assert "-safe" not in arguments
+        assert all(not value.startswith(("http:", "https:")) for value in arguments)
         Path(arguments[-1]).write_bytes(b"media")
 
     materializer = XiaoeMaterializer(playlist_downloader=_playlist_downloader, ffmpeg=ffmpeg)
@@ -161,6 +180,59 @@ def test_direct_hls_uses_same_secret_materialization_boundary(monkeypatch: pytes
     assert result.path.read_bytes() == b"media"
     assert "signature=canary" not in repr(result)
     assert "signature=canary" not in materialization.model_dump_json()
+
+
+def test_materialization_revalidates_storage_state_immediately_before_cookie_jar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage_state = tmp_path / "operator-state.json"
+    storage_state.write_text("replaced-after-resolution", encoding="utf-8")
+    calls: list[str] = []
+    expected_cookie_jar = object()
+
+    def validate(path: Path) -> None:
+        assert path == storage_state
+        calls.append("validate")
+
+    def make_jar(path: Path) -> object:
+        assert path == storage_state
+        calls.append("cookie-jar")
+        return expected_cookie_jar
+
+    def playlist(_url: str, target: Path, *, cookie_jar: object | None, **_kwargs: object) -> str:
+        assert cookie_jar is expected_cookie_jar
+        calls.append("download")
+        path = target / "local.m3u8"
+        path.write_text("#EXTM3U\n", encoding="utf-8")
+        return str(path)
+
+    def ffmpeg(arguments: list[str]) -> None:
+        Path(arguments[-1]).write_bytes(b"media")
+
+    monkeypatch.setattr(materializer_module, "validate_storage_state", validate)
+    monkeypatch.setattr(materializer_module, "StorageStateCookieJar", make_jar)
+    XiaoeMaterializer(playlist_downloader=playlist, ffmpeg=ffmpeg).materialize(
+        _hls_materialization(), tmp_path, storage_state=storage_state
+    )
+    assert calls == ["validate", "cookie-jar", "download"]
+
+
+def test_media_probe_rejects_single_track_and_never_publishes(tmp_path: Path) -> None:
+    def ffmpeg(arguments: list[str]) -> None:
+        Path(arguments[-1]).write_bytes(b"not-a-real-video")
+
+    def probe(_path: Path) -> dict:
+        return {
+            "format": {"duration": "10", "bit_rate": "1000"},
+            "streams": [{"codec_type": "video", "codec_name": "h264"}],
+        }
+
+    with pytest.raises(XiaoeMaterializationError) as error:
+        XiaoeMaterializer(playlist_downloader=_playlist_downloader, ffmpeg=ffmpeg, probe=probe).materialize(
+            _hls_materialization(), tmp_path
+        )
+    assert error.value.code == "MEDIA_PROBE_INVALID"
+    assert not (tmp_path / "source.mp4").exists()
 
 
 @pytest.mark.parametrize("method", ["SAMPLE-AES", "SAMPLE-AES-CTR", "UNKNOWN"])
@@ -179,6 +251,22 @@ def test_drm_policy_rejects_before_ffmpeg(method: str, tmp_path: Path) -> None:
         XiaoeMaterializer(playlist_downloader=playlist, ffmpeg=ffmpeg).materialize(_hls_materialization(), tmp_path)
     assert error.value.code == "SOURCE_DRM_UNSUPPORTED"
     assert not called
+
+
+def test_hls_resource_limit_code_is_preserved_at_materialization_boundary(tmp_path: Path) -> None:
+    def playlist(_url: str, target: Path, **_kwargs: object) -> str:
+        cache = target / ".safe-hls"
+        cache.mkdir()
+        (cache / "partial.ts").write_bytes(b"partial")
+        (target / "source.part.mp4").write_bytes(b"partial")
+        raise HlsResourceLimitError("HLS_TOTAL_BYTES_LIMIT_EXCEEDED")
+
+    with pytest.raises(XiaoeMaterializationError) as error:
+        XiaoeMaterializer(playlist_downloader=playlist).materialize(_hls_materialization(), tmp_path)
+
+    assert error.value.code == "HLS_TOTAL_BYTES_LIMIT_EXCEEDED"
+    assert not (tmp_path / ".safe-hls").exists()
+    assert not (tmp_path / "source.part.mp4").exists()
 
 
 def test_expired_signed_url_reresolves_once_and_missing_media_fails_closed(tmp_path: Path) -> None:

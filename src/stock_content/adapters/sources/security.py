@@ -4,14 +4,18 @@ from __future__ import annotations
 import hashlib
 import http.client
 import ipaddress
+import math
 import os
 import re
+import shutil
 import socket
 import ssl
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from stock_content.domain.drm_policy import require_supported_hls
 
 DEFAULT_ALLOWED_DOMAINS = frozenset(
     {
@@ -45,6 +49,14 @@ class SourceDownloadHTTPError(RuntimeError):
     def __init__(self, status: int) -> None:
         super().__init__(f"SOURCE_DOWNLOAD_HTTP_{status}")
         self.status = status
+
+
+class HlsResourceLimitError(RuntimeError):
+    """Redacted, deterministic HLS graph resource-limit failure."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 def _is_allowed_host(host: str, allowed_domains: set[str] | frozenset[str]) -> bool:
@@ -296,6 +308,7 @@ def _open_safe_response(
     allowed_domains: set[str] | frozenset[str],
     timeout: float,
     headers: dict[str, str] | None = None,
+    cookie_jar: Any | None = None,
     max_redirects: int = 5,
 ) -> tuple[str, http.client.HTTPConnection, http.client.HTTPResponse]:
     """Open one safe response, manually traversing and validating redirects."""
@@ -311,6 +324,10 @@ def _open_safe_response(
             request_headers = {"Host": parsed.netloc, "User-Agent": "stock-content-safe-fetch/1"}
             if headers:
                 request_headers.update(headers)
+            if cookie_jar is not None:
+                cookie = cookie_jar.header_for(current)
+                if cookie:
+                    request_headers["Cookie"] = cookie
             connection.request(
                 "GET",
                 path,
@@ -372,6 +389,7 @@ def safe_download_url(
     timeout: float = 30.0,
     max_bytes: int = 512 * 1024 * 1024,
     headers: dict[str, str] | None = None,
+    cookie_jar: Any | None = None,
 ) -> str:
     """Download bytes with per-request DNS pinning and manual safe redirects."""
     safe_headers: dict[str, str] = {}
@@ -383,7 +401,7 @@ def safe_download_url(
             validate_source_url(value, allowed_domains=allowed_domains)
         safe_headers[name] = value
     final_url, connection, response = _open_safe_response(
-        url, allowed_domains=allowed_domains, timeout=timeout, headers=safe_headers
+        url, allowed_domains=allowed_domains, timeout=timeout, headers=safe_headers, cookie_jar=cookie_jar
     )
     try:
         if response.status < 200 or response.status >= 300:
@@ -408,6 +426,63 @@ def safe_download_url(
 
 _HLS_URI = re.compile(r'URI=(?:"([^"]+)"|([^,\s]+))')
 _HLS_PLAYLIST_TAGS = {"#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF", "#EXT-X-MEDIA"}
+_HLS_MEDIA_SUFFIXES = frozenset({".aac", ".ac3", ".ec3", ".m4a", ".m4s", ".mp3", ".mp4", ".ts", ".webm"})
+_HLS_ATTRIBUTE = re.compile(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))')
+_HLS_MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
+
+def _hls_attributes(line: str) -> dict[str, str]:
+    return {
+        match.group(1): match.group(2) if match.group(2) is not None else match.group(3)
+        for match in _HLS_ATTRIBUTE.finditer(line)
+    }
+
+
+def _hls_selected_master_lines(lines: list[str]) -> set[int] | None:
+    """Return master-line indexes retained for one video plus required audio.
+
+    Master playlists are an alternative graph, not a request to download every
+    rendition.  Retain the first declared full video variant (publisher order
+    is deterministic) and its DEFAULT audio rendition when one is referenced.
+    """
+    variants: list[tuple[int, int, dict[str, str]]] = []
+    audio: list[tuple[int, dict[str, str]]] = []
+    for index, line in enumerate(lines):
+        tag = line.strip().split(":", 1)[0]
+        if (
+            tag == "#EXT-X-STREAM-INF"
+            and index + 1 < len(lines)
+            and lines[index + 1].strip()
+            and not lines[index + 1].lstrip().startswith("#")
+        ):
+            variants.append((index, index + 1, _hls_attributes(line)))
+        elif tag == "#EXT-X-MEDIA":
+            attributes = _hls_attributes(line)
+            if attributes.get("TYPE", "").upper() == "AUDIO" and "URI" in attributes:
+                audio.append((index, attributes))
+    if not variants:
+        return None
+    stream_index, uri_index, stream_attributes = variants[0]
+    retained = {stream_index, uri_index}
+    audio_group = stream_attributes.get("AUDIO")
+    if audio_group:
+        candidates = [(index, attributes) for index, attributes in audio if attributes.get("GROUP-ID") == audio_group]
+        if candidates:
+            selected = next((item for item in candidates if item[1].get("DEFAULT", "").upper() == "YES"), candidates[0])
+            retained.add(selected[0])
+    return retained
+
+
+def _hls_local_asset_suffix(remote_url: str, *, asset_kind: str, has_map: bool) -> str:
+    """Keep only a format-relevant, allowlisted suffix on opaque local names."""
+    if asset_kind == "key":
+        return ".key"
+    suffix = os.path.splitext(urlparse(remote_url).path)[1].lower()
+    if suffix in _HLS_MEDIA_SUFFIXES:
+        return suffix
+    if asset_kind == "map":
+        return ".m4s" if suffix == ".m4s" else ".mp4"
+    return ".m4s" if has_map else ".ts"
 
 
 def download_hls_playlist(
@@ -416,7 +491,12 @@ def download_hls_playlist(
     *,
     allowed_domains: set[str] | frozenset[str] = DEFAULT_ALLOWED_DOMAINS,
     max_depth: int = 8,
+    max_playlists: int = 32,
+    max_assets: int = 5_000,
+    max_total_bytes: int = 2 * 1024 * 1024 * 1024,
+    max_planned_duration_seconds: float = 6 * 60 * 60,
     headers: dict[str, str] | None = None,
+    cookie_jar: Any | None = None,
     manifest_validator: Any | None = None,
 ) -> str:
     """Materialize a safe HLS graph locally and return its local playlist path.
@@ -425,6 +505,8 @@ def download_hls_playlist(
     encryption key, map, and redirect is fetched through ``safe_download_url``
     or its bounded manifest equivalent.
     """
+    if max_depth < 0 or max_playlists < 1 or max_assets < 1 or max_total_bytes < 1 or max_planned_duration_seconds <= 0:
+        raise ValueError("HLS resource limits must be positive")
     root = os.path.abspath(os.fspath(target_dir))
     safe_headers: dict[str, str] = {}
     for name, value in (headers or {}).items():
@@ -438,26 +520,38 @@ def download_hls_playlist(
     cache = os.path.join(root, ".safe-hls")
     os.makedirs(cache, exist_ok=True)
     playlists: dict[str, str] = {}
-    assets: dict[str, str] = {}
+    assets: dict[tuple[str, str, bool], str] = {}
+    downloaded_bytes = 0
+    planned_duration_by_playlist: dict[str, float] = {}
+    validator = manifest_validator or require_supported_hls
 
     def local_name(remote: str, suffix: str) -> str:
         digest = hashlib.sha256(remote.encode("utf-8")).hexdigest()[:24]
         return os.path.join(cache, digest + suffix)
 
     def fetch_manifest(remote_url: str, *, depth: int) -> str:
+        nonlocal downloaded_bytes
         if depth > max_depth:
-            raise RuntimeError("HLS playlist nesting exceeds configured limit")
+            raise HlsResourceLimitError("HLS_NESTING_LIMIT_EXCEEDED")
         if remote_url in playlists:
             return playlists[remote_url]
+        if len(set(playlists.values())) >= max_playlists:
+            raise HlsResourceLimitError("HLS_PLAYLIST_LIMIT_EXCEEDED")
         final_url, connection, response = _open_safe_response(
-            remote_url, allowed_domains=allowed_domains, timeout=30.0, headers=safe_headers
+            remote_url, allowed_domains=allowed_domains, timeout=30.0, headers=safe_headers, cookie_jar=cookie_jar
         )
         try:
             if response.status < 200 or response.status >= 300:
                 raise RuntimeError(f"HLS manifest returned HTTP {response.status}")
-            body = response.read(8 * 1024 * 1024 + 1)
-            if len(body) > 8 * 1024 * 1024:
-                raise RuntimeError("HLS manifest exceeds configured size limit")
+            remaining_bytes = max_total_bytes - downloaded_bytes
+            if remaining_bytes <= 0:
+                raise HlsResourceLimitError("HLS_TOTAL_BYTES_LIMIT_EXCEEDED")
+            body = response.read(min(_HLS_MAX_MANIFEST_BYTES, remaining_bytes) + 1)
+            if len(body) > _HLS_MAX_MANIFEST_BYTES:
+                raise HlsResourceLimitError("HLS_MANIFEST_BYTES_LIMIT_EXCEEDED")
+            if len(body) > remaining_bytes:
+                raise HlsResourceLimitError("HLS_TOTAL_BYTES_LIMIT_EXCEEDED")
+            downloaded_bytes += len(body)
         finally:
             response.close()
             connection.close()
@@ -467,17 +561,42 @@ def download_hls_playlist(
             raise RuntimeError("HLS manifest is not UTF-8") from exc
         if not text.lstrip().startswith("#EXTM3U"):
             raise RuntimeError("source is not a supported HLS playlist")
-        if manifest_validator is not None:
-            manifest_validator(text)
+        validator(text)
         output = local_name(final_url, ".m3u8")
         playlists[remote_url] = output
+        playlists[final_url] = output
+        planned_duration_by_playlist[output] = 0.0
         lines = text.splitlines()
+        retained_master_lines = _hls_selected_master_lines(lines)
         rewritten: list[str] = []
         pending_variant = False
-        for line in lines:
+        has_map = any(item.strip().startswith("#EXT-X-MAP") for item in lines)
+        for index, line in enumerate(lines):
             stripped = line.strip()
             tag_name = stripped.split(":", 1)[0] if stripped.startswith("#") else ""
+            if retained_master_lines is not None and (tag_name in _HLS_PLAYLIST_TAGS or pending_variant):
+                if index not in retained_master_lines:
+                    pending_variant = False
+                    continue
+            if (
+                retained_master_lines is not None
+                and not stripped.startswith("#")
+                and index > 0
+                and lines[index - 1].strip().startswith("#EXT-X-STREAM-INF")
+                and index not in retained_master_lines
+            ):
+                continue
             if stripped.startswith("#"):
+                if tag_name == "#EXTINF":
+                    try:
+                        duration = float(stripped.split(":", 1)[1].split(",", 1)[0])
+                    except (IndexError, ValueError) as exc:
+                        raise HlsResourceLimitError("HLS_DURATION_INVALID") from exc
+                    if not math.isfinite(duration) or duration < 0:
+                        raise HlsResourceLimitError("HLS_DURATION_INVALID")
+                    planned_duration_by_playlist[output] += duration
+                    if planned_duration_by_playlist[output] > max_planned_duration_seconds:
+                        raise HlsResourceLimitError("HLS_DURATION_LIMIT_EXCEEDED")
                 if "URI=" in line:
                     is_playlist_tag = tag_name in _HLS_PLAYLIST_TAGS
 
@@ -486,7 +605,10 @@ def download_hls_playlist(
                         if is_playlist_tag:
                             local = fetch_manifest(remote, depth=depth + 1)
                         else:
-                            local = fetch_asset(remote)
+                            asset_kind = (
+                                "key" if tag_name == "#EXT-X-KEY" else "map" if tag_name == "#EXT-X-MAP" else "media"
+                            )
+                            local = fetch_asset(remote, asset_kind=asset_kind, has_map=has_map)
                         relative = os.path.relpath(local, os.path.dirname(output)).replace(os.sep, "/")
                         quote = '"' if match.group(1) is not None else ""
                         return "URI=" + quote + relative + quote
@@ -503,7 +625,7 @@ def download_hls_playlist(
                 local = fetch_manifest(remote, depth=depth + 1)
                 pending_variant = False
             else:
-                local = fetch_asset(remote)
+                local = fetch_asset(remote, asset_kind="media", has_map=has_map)
             rewritten.append(os.path.relpath(local, os.path.dirname(output)).replace(os.sep, "/"))
         def has_remote_uri(line: str) -> bool:
             lowered = line.lower()
@@ -519,19 +641,46 @@ def download_hls_playlist(
             stream.write("\n".join(rewritten) + "\n")
         return output
 
-    def fetch_asset(remote_url: str) -> str:
-        if remote_url in assets:
-            return assets[remote_url]
-        output = local_name(remote_url, ".bin")
-        safe_download_url(remote_url, output, allowed_domains=allowed_domains, headers=safe_headers)
-        assets[remote_url] = output
+    def fetch_asset(remote_url: str, *, asset_kind: str, has_map: bool) -> str:
+        nonlocal downloaded_bytes
+        key = (remote_url, asset_kind, has_map)
+        if key in assets:
+            return assets[key]
+        if len(assets) >= max_assets:
+            raise HlsResourceLimitError("HLS_ASSET_LIMIT_EXCEEDED")
+        remaining_bytes = max_total_bytes - downloaded_bytes
+        if remaining_bytes <= 0:
+            raise HlsResourceLimitError("HLS_TOTAL_BYTES_LIMIT_EXCEEDED")
+        output = local_name(remote_url, _hls_local_asset_suffix(remote_url, asset_kind=asset_kind, has_map=has_map))
+        try:
+            safe_download_url(
+                remote_url,
+                output,
+                allowed_domains=allowed_domains,
+                headers=safe_headers,
+                cookie_jar=cookie_jar,
+                max_bytes=remaining_bytes,
+            )
+        except RuntimeError as exc:
+            if str(exc) == "source download exceeds configured size limit":
+                raise HlsResourceLimitError("HLS_TOTAL_BYTES_LIMIT_EXCEEDED") from exc
+            raise
+        downloaded_bytes += os.path.getsize(output)
+        assets[key] = output
         return output
 
-    return fetch_manifest(source_url, depth=0)
+    try:
+        return fetch_manifest(source_url, depth=0)
+    except Exception:
+        # This directory contains only opaque local HLS files made for the
+        # current attempt.  Never leave a partial graph to be consumed later.
+        shutil.rmtree(cache, ignore_errors=True)
+        raise
 
 
 __all__ = [
     "DEFAULT_ALLOWED_DOMAINS",
+    "HlsResourceLimitError",
     "SourceDownloadHTTPError",
     "UnsafeSourceURL",
     "preflight_source_url",

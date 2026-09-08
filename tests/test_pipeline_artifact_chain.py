@@ -473,10 +473,10 @@ def test_cross_application_resume_does_not_rerun_expensive_prefix(tmp_path):
     assert restored_context.artifacts.transcript.artifact_id == latest_transcript_id
     assert latest_transcript_id in restored_context.restored_artifacts
 
-    # C3 deliberately invalidates old OCR/Vision checkpoints: those results
-    # predate transcript-planned target frames and cannot be reused. Media and
-    # ASR remain the immutable expensive prefix eligible for replay reuse.
-    for stage_name in ("download", "frame", "asr"):
+    # Targeted-only visual evidence deliberately invalidates old OCR/Vision
+    # checkpoints.  Media and ASR remain the immutable expensive prefix
+    # eligible for replay reuse; interval ``frame`` is no longer a graph stage.
+    for stage_name in ("download", "asr"):
         runner = next(runner for runner in second._pipeline._stages if runner.name == stage_name)  # noqa: SLF001
 
         def must_not_run(_context, *, _stage_name=stage_name):

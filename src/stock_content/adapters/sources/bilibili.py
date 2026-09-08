@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from stock_content.adapters.browser.playwright_session import BrowserSessionError, temporary_netscape_cookiefile
 from stock_content.adapters.credentials.file_secret_provider import FileSecretProvider, SecretUnavailable
 from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer, MaterializedMedia
 from stock_content.adapters.sources.bilibili_resolver import BilibiliResolver, canonical_bilibili_url
@@ -21,15 +22,28 @@ BILIBILI_ALLOWED_DOMAINS = frozenset(
 class BilibiliSourceAdapter:
     """Bilibili adapter backed by yt-dlp, loaded only in the media worker."""
 
-    def __init__(self, *, credential_provider: FileSecretProvider | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        credential_provider: FileSecretProvider | None = None,
+        storage_state_provider: FileSecretProvider | None = None,
+    ) -> None:
+        # ``credential_provider`` is the legacy Netscape-cookie provider.  It
+        # remains a compatible constructor argument for existing wiring.
         self._credential_provider = credential_provider
+        self._storage_state_provider = storage_state_provider
 
     @classmethod
     def from_environment(cls) -> "BilibiliSourceAdapter":
         reference = os.getenv("CONTENT_BILIBILI_CREDENTIAL_REF", "").strip()
         cookiefile = os.getenv("CONTENT_BILIBILI_COOKIEFILE", "").strip()
+        storage_reference = os.getenv("CONTENT_BILIBILI_STORAGE_STATE_REF", "").strip()
+        storage_state = os.getenv("CONTENT_BILIBILI_STORAGE_STATE_FILE", "").strip()
         provider = FileSecretProvider({reference: cookiefile}) if reference and cookiefile else None
-        return cls(credential_provider=provider)
+        state_provider = (
+            FileSecretProvider({storage_reference: storage_state}) if storage_reference and storage_state else None
+        )
+        return cls(credential_provider=provider, storage_state_provider=state_provider)
 
     @staticmethod
     def _url(source_ref: str) -> str:
@@ -72,14 +86,30 @@ class BilibiliSourceAdapter:
             return json.loads(self._run(arguments).stdout)
 
         cookiefile = None
+        storage_state = None
         if credential_ref_hash:
-            if self._credential_provider is None:
-                raise RuntimeError("SOURCE_SESSION_EXPIRED")
-            try:
-                cookiefile = self._credential_provider.resolve_hash(credential_ref_hash)
-            except SecretUnavailable as exc:
-                raise RuntimeError(exc.code) from exc
-        return BilibiliResolver(extractor=extract, cookiefile=cookiefile).resolve(source_ref, part=part)
+            # State references win over the old cookiefile reference.  This
+            # selection is worker-local; the submitted name cannot be
+            # recovered from the queued one-way hash.
+            if self._storage_state_provider is not None:
+                try:
+                    storage_state = self._storage_state_provider.resolve_hash(credential_ref_hash)
+                except SecretUnavailable:
+                    pass
+            if storage_state is None:
+                if self._credential_provider is None:
+                    raise RuntimeError("SOURCE_SESSION_EXPIRED")
+                try:
+                    cookiefile = self._credential_provider.resolve_hash(credential_ref_hash)
+                except SecretUnavailable as exc:
+                    raise RuntimeError(exc.code) from exc
+        if storage_state is None:
+            return BilibiliResolver(extractor=extract, cookiefile=cookiefile).resolve(source_ref, part=part)
+        try:
+            with temporary_netscape_cookiefile(storage_state, allowed_domains=BILIBILI_ALLOWED_DOMAINS) as temporary:
+                return BilibiliResolver(extractor=extract, cookiefile=temporary).resolve(source_ref, part=part)
+        except BrowserSessionError as exc:
+            raise RuntimeError(exc.code) from exc
 
     def materialize(
         self,

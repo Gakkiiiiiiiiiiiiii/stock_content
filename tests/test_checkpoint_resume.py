@@ -120,6 +120,16 @@ def test_resume_rejects_pre_90_percent_transcript_policy_checkpoints():
             validate_resume([legacy], {}, stage_versions=STAGE_VERSIONS)
 
 
+def test_resume_rejects_interval_or_pre_targeted_visual_checkpoints():
+    """A mixed interval/targeted visual prefix can never become targeted-only evidence."""
+    from stock_content.api.dependencies import STAGE_VERSIONS
+
+    for stage, legacy_version in (("frame", "1.0.0"), ("knowledge_frame", "2.0.0"), ("ocr", "3.0.0")):
+        legacy = build_checkpoint(stage=stage, stage_version=legacy_version)
+        with pytest.raises(CheckpointValidationError, match=f"stage version incompatible for {stage}"):
+            validate_resume([legacy], {}, stage_versions=STAGE_VERSIONS)
+
+
 def test_validate_resume_stops_at_failed_checkpoint():
     artifact = SourceArtifact(artifact_id="source-1", artifact_type="source", source_content_hash="h")
     ok = build_checkpoint(stage="source", output_artifacts=[artifact])

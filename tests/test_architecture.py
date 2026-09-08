@@ -13,9 +13,7 @@ def _application_imports(path: Path) -> set[str]:
         if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("stock_content.application"):
             imports.add(node.module)
         elif isinstance(node, ast.Import):
-            imports.update(
-                alias.name for alias in node.names if alias.name.startswith("stock_content.application")
-            )
+            imports.update(alias.name for alias in node.names if alias.name.startswith("stock_content.application"))
     return imports
 
 
@@ -64,9 +62,7 @@ def test_application_pipeline_boundaries_do_not_reverse_dependencies():
     stage_implementations = _application_imports(application / "stages.py")
     replay_facade = _application_imports(application / "replay_service.py")
     replay_implementation = {
-        imported
-        for source in (application / "replay").rglob("*.py")
-        for imported in _application_imports(source)
+        imported for source in (application / "replay").rglob("*.py") for imported in _application_imports(source)
     }
     verification_facade = _application_imports(application / "verification_refresh.py")
     verification_implementation = {
@@ -87,7 +83,8 @@ def test_application_pipeline_boundaries_do_not_reverse_dependencies():
     assert not {
         imported
         for imported in stage_implementations
-        if imported in {
+        if imported
+        in {
             "stock_content.application.service",
             "stock_content.application.replay_service",
             "stock_content.application.verification_refresh",
@@ -98,7 +95,8 @@ def test_application_pipeline_boundaries_do_not_reverse_dependencies():
     assert not {
         imported
         for imported in replay_facade | replay_implementation
-        if imported in {
+        if imported
+        in {
             "stock_content.application.service",
             "stock_content.application.stages",
             "stock_content.application.verification_refresh",
@@ -108,7 +106,8 @@ def test_application_pipeline_boundaries_do_not_reverse_dependencies():
     assert not {
         imported
         for imported in verification_facade | verification_implementation
-        if imported in {
+        if imported
+        in {
             "stock_content.application.service",
             "stock_content.application.stages",
             "stock_content.application.replay_service",
@@ -136,12 +135,8 @@ def test_application_entrypoints_depend_on_public_pipeline_facades_only():
     # and worker entrypoints must not bypass those boundaries.
     assert "stock_content.application.replay_service" in service_imports
     assert "stock_content.application.verification_service" in service_imports
-    assert not {
-        imported for imported in service_imports if imported.startswith(internal_modules)
-    }
-    assert not {
-        imported for imported in entrypoint_imports if imported.startswith(internal_modules)
-    }
+    assert not {imported for imported in service_imports if imported.startswith(internal_modules)}
+    assert not {imported for imported in entrypoint_imports if imported.startswith(internal_modules)}
 
 
 def _installed_extras(path: Path) -> set[str]:
@@ -170,7 +165,7 @@ def test_core_images_and_runtime_exclude_heavy_media_dependencies():
     ):
         tree = ast.parse(source.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            names = ([node.module] if isinstance(node, ast.ImportFrom) and node.module else [])
+            names = [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
             if isinstance(node, ast.Import):
                 names.extend(alias.name for alias in node.names)
             violations.extend(f"{source.name}: {name}" for name in names if name.split(".")[0] in heavy_modules)
@@ -180,17 +175,22 @@ def test_core_images_and_runtime_exclude_heavy_media_dependencies():
 def test_specialized_worker_profiles_match_their_auditable_dependency_sets():
     project = tomllib.loads((ROOT.parent / "pyproject.toml").read_text(encoding="utf-8"))
     extras = project["project"]["optional-dependencies"]
-    assert {"faster-whisper", "yt-dlp", "opencc-python-reimplemented", "paddleocr"} <= {
+    assert {"faster-whisper", "yt-dlp", "opencc-python-reimplemented"} <= {
         requirement.split(">=", 1)[0] for requirement in extras["media"]
     }
-    assert {"faster-whisper", "yt-dlp", "opencc-python-reimplemented", "paddleocr", "pyannote.audio"} <= {
+    assert {"faster-whisper", "yt-dlp", "opencc-python-reimplemented", "pyannote.audio"} <= {
         requirement.split(">=", 1)[0] for requirement in extras["multimodal"]
     }
+    assert "paddleocr==3.7.0" in extras["ocr"]
+    assert not any("paddle" in requirement.lower() for requirement in extras["media"] + extras["multimodal"])
 
     for profile in ("media", "multimodal"):
         expected = f"-e .[core,postgres,search,{profile}]"
         assert expected in (ROOT.parent / "requirements" / f"{profile}.in").read_text(encoding="utf-8")
         assert expected in (ROOT.parent / "locks" / f"{profile}.lock").read_text(encoding="utf-8")
         assert _installed_extras(ROOT.parent / "docker" / f"Dockerfile.{profile}") == {
-            "core", "postgres", "search", profile
+            "core",
+            "postgres",
+            "search",
+            profile,
         }

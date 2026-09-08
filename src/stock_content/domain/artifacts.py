@@ -15,6 +15,21 @@ from typing import Any
 
 ARTIFACT_SCHEMA_VERSION = "artifact.v1"
 
+# ``artifact.v1`` was already persisted before the targeted-frame and GPU OCR
+# provenance fields were introduced.  The schema label therefore cannot tell
+# us which canonical identity rule created a row.  Keep this compatibility
+# marker internal to the Python object/serializer: it is inferred only from a
+# historical payload which lacks the additive field(s), and is deliberately
+# not itself persisted.
+_IDENTITY_PROFILE_CURRENT = "current"
+_IDENTITY_PROFILE_LEGACY_FRAME = "legacy-frame.v1"
+_IDENTITY_PROFILE_LEGACY_OCR = "legacy-ocr.v1"
+_IDENTITY_PROFILES = {
+    _IDENTITY_PROFILE_CURRENT,
+    _IDENTITY_PROFILE_LEGACY_FRAME,
+    _IDENTITY_PROFILE_LEGACY_OCR,
+}
+
 
 def canonical_json(payload: Any) -> str:
     """canonical JSON：key 排序、紧凑分隔符、统一序列化。"""
@@ -83,7 +98,13 @@ def artifact_identity_payload(artifact: "ArtifactBase") -> dict[str, Any]:
     row, so the rule is shared by all persistence implementations.
     """
     payload = artifact.to_dict()
-    return {key: value for key, value in payload.items() if key not in {"artifact_id", "created_at", "content_hash"}}
+    excluded = {"artifact_id", "created_at", "content_hash"}
+    if artifact.artifact_type == "frame" and artifact._identity_profile != _IDENTITY_PROFILE_LEGACY_FRAME:
+        # Durable object roots vary by worker and replay environment.  Frame
+        # identity is the immutable media/plan/timestamp/image tuple, never a
+        # local object-store locator.
+        excluded.add("storage_ref")
+    return {key: value for key, value in payload.items() if key not in excluded}
 
 
 def _utcnow() -> datetime:
@@ -104,8 +125,18 @@ class ArtifactBase:
     # deserialization supplies the stored value explicitly so tampering is
     # visible to repository integrity checks.
     content_hash: str = ""
+    # Internal deserialization marker.  It remains an init field so existing
+    # reconstruction idioms using ``artifact.__dict__`` keep working, but is
+    # removed by ``to_dict`` and cannot become part of a persisted payload.
+    _identity_profile: str = field(
+        default=_IDENTITY_PROFILE_CURRENT,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
+        if self._identity_profile not in _IDENTITY_PROFILES:
+            raise ValueError("unknown artifact identity profile")
         if not self.content_hash:
             object.__setattr__(
                 self,
@@ -114,7 +145,18 @@ class ArtifactBase:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        profile = payload.pop("_identity_profile", _IDENTITY_PROFILE_CURRENT)
+        # Re-serialize a historic row in the exact field shape that was
+        # hashed when it was first persisted.  New artifacts always retain
+        # the additive identity fields, including their explicit empty values.
+        if profile == _IDENTITY_PROFILE_LEGACY_FRAME:
+            payload.pop("planner_request_id", None)
+        elif profile == _IDENTITY_PROFILE_LEGACY_OCR:
+            payload.pop("requested_device", None)
+            payload.pop("actual_device", None)
+            payload.pop("runtime_identity", None)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -280,6 +322,14 @@ class FrameArtifact(ArtifactBase):
     semantic_segment_ids: tuple[str, ...] = ()
     evidence_window_ids: tuple[str, ...] = ()
     planner_version: str = ""
+    # Hash of the complete, non-secret planner request.  It joins a materialised
+    # frame to its semantic/evidence window even when timestamps collide.
+    planner_request_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self._identity_profile == _IDENTITY_PROFILE_LEGACY_FRAME and self.planner_request_id:
+            raise ValueError("legacy frame identity cannot carry planner_request_id")
+        super().__post_init__()
 
 
 @dataclass(frozen=True)
@@ -296,6 +346,18 @@ class OCRArtifact(ArtifactBase):
     blocks: list[dict[str, Any]] = field(default_factory=list)
     engine: str = ""
     engine_version: str = ""
+    # Non-secret, content-addressed GPU provenance. Defaults preserve legacy
+    # CPU artifact deserialization; the bumped OCR checkpoint rejects resume.
+    requested_device: str = ""
+    actual_device: str = ""
+    runtime_identity: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self._identity_profile == _IDENTITY_PROFILE_LEGACY_OCR and (
+            self.requested_device or self.actual_device or self.runtime_identity
+        ):
+            raise ValueError("legacy OCR identity cannot carry GPU runtime provenance")
+        super().__post_init__()
 
 
 @dataclass(frozen=True)
@@ -717,7 +779,35 @@ def deserialize_artifact(payload: dict[str, Any]) -> ArtifactBase:
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if key in cls.__dataclass_fields__:  # type: ignore[attr-defined]
             kwargs[key] = value
-    return cls(**kwargs)
+    stored_content_hash = bool(kwargs.get("content_hash"))
+    artifact = cls(**kwargs)
+    identity_profile = _identity_profile_from_serialized_payload(payload, artifact_type)
+    if identity_profile != _IDENTITY_PROFILE_CURRENT:
+        object.__setattr__(artifact, "_identity_profile", identity_profile)
+        # Serialized production artifacts always carry ``content_hash``.  Be
+        # defensive for callers hydrating an old in-memory fixture without it:
+        # once the historical profile is known, compute the correct identity.
+        if not stored_content_hash:
+            object.__setattr__(artifact, "content_hash", content_hash_of(artifact_identity_payload(artifact)))
+    return artifact
+
+
+def _identity_profile_from_serialized_payload(payload: dict[str, Any], artifact_type: Any) -> str:
+    """Infer the only compatible historical identity form from field presence.
+
+    ``artifact.v1`` cannot be bumped retroactively.  Field *presence* is the
+    stable discriminator: a new serializer writes all additive fields, even
+    if their values are empty, whereas old rows do not contain them at all.
+    """
+    if artifact_type == "frame" and "planner_request_id" not in payload:
+        return _IDENTITY_PROFILE_LEGACY_FRAME
+    if artifact_type == "ocr" and not {
+        "requested_device",
+        "actual_device",
+        "runtime_identity",
+    }.intersection(payload):
+        return _IDENTITY_PROFILE_LEGACY_OCR
+    return _IDENTITY_PROFILE_CURRENT
 
 
 _TYPE_REGISTRY: dict[str, type[ArtifactBase]] = {

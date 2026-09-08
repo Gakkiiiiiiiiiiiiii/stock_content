@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import SecretStr
 
+from stock_content.adapters.browser.playwright_session import write_private_file
 from stock_content.adapters.credentials.file_secret_provider import FileSecretProvider, SecretUnavailable
 from stock_content.adapters.sources.bilibili import BilibiliSourceAdapter
 from stock_content.adapters.sources.bilibili_materializer import (
@@ -214,6 +215,77 @@ def test_authorized_cookiefile_is_resolved_in_worker_only_and_never_projected(
     assert seen[seen.index("--cookies") + 1] == str(cookiefile.resolve())
     assert "cookie-canary" not in repr(materialization)
     assert "cookie-canary" not in materialization.model_dump_json()
+
+
+def test_storage_state_is_converted_only_for_one_resolution_and_wins_over_legacy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import stock_content.adapters.sources.bilibili_resolver as resolver_module
+
+    monkeypatch.setattr(resolver_module, "validate_source_url", lambda value, **_: value)
+    state = tmp_path / "state.json"
+    write_private_file(
+        state,
+        json.dumps({"cookies": [
+            {"name": "SESSDATA", "value": "state-canary", "domain": ".bilibili.com", "path": "/", "secure": True,
+             "httpOnly": True, "expires": 4102444800},
+            {"name": "other", "value": "not-exported", "domain": "example.test", "path": "/", "secure": True,
+             "expires": 4102444800},
+        ]}).encode("utf-8"),
+    )
+    legacy = tmp_path / "legacy.txt"
+    legacy.write_text("legacy-canary", encoding="utf-8")
+    if os.name != "nt":
+        state.chmod(0o400)
+        legacy.chmod(0o400)
+    # Deliberately use the same allowlisted name to prove storage state has
+    # priority even during an operator's legacy-config migration.
+    state_reference = legacy_reference = "bili-state"
+    adapter = BilibiliSourceAdapter(
+        credential_provider=FileSecretProvider({legacy_reference: legacy}),
+        storage_state_provider=FileSecretProvider({state_reference: state}),
+    )
+    seen: list[str] = []
+
+    def run(arguments: list[str]):
+        seen.extend(arguments)
+        cookiefile = Path(arguments[arguments.index("--cookies") + 1])
+        contents = cookiefile.read_text(encoding="utf-8")
+        assert "state-canary" in contents and "not-exported" not in contents and "legacy-canary" not in contents
+        if os.name != "nt":
+            assert (cookiefile.stat().st_mode & 0o777) == 0o400
+        return SimpleNamespace(stdout=json.dumps({"id": "BV1fixture", "title": "fixture", "url": "https://cdn.bilivideo.com/media"}))
+
+    monkeypatch.setattr(adapter, "_run", run)
+    materialization = adapter.resolve_materialization(
+        "BV1fixture", credential_ref_hash=hashlib.sha256(state_reference.encode()).hexdigest()
+    )
+    converted = Path(seen[seen.index("--cookies") + 1])
+    assert not converted.exists()
+    assert "state-canary" not in repr(materialization)
+    assert "state-canary" not in materialization.model_dump_json()
+    public = BilibiliResolver(
+        extractor=lambda _: {"id": "BV1fixture", "title": "fixture", "url": "https://cdn.bilivideo.com/media"}
+    ).resolve("BV1fixture")
+    assert materialization.public.canonical_source_ref == public.public.canonical_source_ref
+    assert materialization.public.source_identity_hash == public.public.source_identity_hash
+
+
+def test_storage_state_fails_closed_when_bilibili_cookies_are_expired(tmp_path: Path) -> None:
+    state = tmp_path / "expired.json"
+    state.write_text(
+        json.dumps({"cookies": [{"name": "SESSDATA", "value": "expired", "domain": ".bilibili.com", "path": "/",
+                                  "secure": True, "expires": 1}]}),
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        state.chmod(0o400)
+    reference = "bili-state"
+    adapter = BilibiliSourceAdapter(storage_state_provider=FileSecretProvider({reference: state}))
+    with pytest.raises(RuntimeError, match="SOURCE_SESSION_EXPIRED"):
+        adapter.resolve_materialization(
+            "BV1fixture", credential_ref_hash=hashlib.sha256(reference.encode()).hexdigest()
+        )
 
 
 def test_legacy_adapter_registers_the_new_ephemeral_seam() -> None:

@@ -1,41 +1,30 @@
-# Keep the interpreter on Python 3.11 even though the CUDA runtime base is an
-# Ubuntu image. Paddle's cu129 release is a cp311 wheel; Ubuntu's default
-# interpreter must never be used to create /opt/ocr.
+# Standalone OCR diagnostic image. The video worker builds the same isolated
+# cp311 /opt/ocr environment, while this image remains useful for GPU runtime
+# smoke tests without ASR/Torch dependencies.
 FROM python:3.11-slim AS python311
 
 FROM nvidia/cuda:12.9.1-cudnn-runtime-ubuntu24.04
 WORKDIR /app
 COPY --from=python311 /usr/local /usr/local
 COPY . .
-
-# The video/ASR environment and Paddle are intentionally separate venvs. Do
-# not install Paddle or Torch into the other environment: the parent process
-# starts the OCR worker with a scrubbed environment and /opt/ocr Python.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg libbz2-1.0 libffi8 libgdbm6 libgomp1 liblzma5 libncursesw6 \
+        libbz2-1.0 libffi8 libgdbm6 libgomp1 liblzma5 libncursesw6 \
         libreadline8 libsqlite3-0 libssl3 libzstd1 \
     && rm -rf /var/lib/apt/lists/* \
-    && /usr/local/bin/python -m venv /opt/video \
-    && /opt/video/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/video/bin/pip install --no-cache-dir -e ".[postgres,search,media,media-browser]" \
-    && PLAYWRIGHT_BROWSERS_PATH=/ms-playwright /opt/video/bin/python -m playwright install --with-deps chromium \
     && /usr/local/bin/python -m venv /opt/ocr \
     && /opt/ocr/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/ocr/bin/pip install --no-deps https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/paddlepaddle_gpu-3.3.0-cp311-cp311-manylinux2014_x86_64.whl \
     && /opt/ocr/bin/pip install --no-cache-dir -r requirements/ocr-gpu-cu129.lock \
     && /opt/ocr/bin/pip install --no-deps . \
     && useradd --create-home --uid 10001 content \
-    && mkdir /work /data \
     && mkdir -p /var/cache/stock-content/ocr \
-    && chown -R content:content /work /data /var/cache/stock-content
-
-ENV PATH=/opt/video/bin:/usr/local/bin:${PATH} \
+    && chown -R content:content /var/cache/stock-content
+ENV PATH=/opt/ocr/bin:/usr/local/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    CONTENT_OCR_PYTHON=/opt/ocr/bin/python \
     CONTENT_OCR_DEVICE=gpu:0 \
     CONTENT_OCR_REQUIRE_GPU=true \
+    CONTENT_OCR_PYTHON=/opt/ocr/bin/python \
     CONTENT_OCR_CACHE_HOME=/var/cache/stock-content/ocr \
     CONTENT_OCR_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/ocr/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/ocr/lib/python3.11/site-packages/nvidia/cudnn/lib
 USER content
-CMD ["python", "-m", "stock_content.workers.content_worker"]
+CMD ["/opt/ocr/bin/python", "-m", "stock_content.adapters.media.ocr_worker"]

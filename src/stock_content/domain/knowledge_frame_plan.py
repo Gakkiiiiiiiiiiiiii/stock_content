@@ -147,6 +147,18 @@ def frame_id_for(
     return "frame_" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:58]
 
 
+def request_id_for(request: KnowledgeFrameRequest) -> str:
+    """Stable, non-secret identity for a complete targeted-frame request."""
+    payload = {
+        "timestamp_ms": request.timestamp_ms,
+        "extraction_reason": request.extraction_reason,
+        "semantic_segment_ids": request.semantic_segment_ids,
+        "evidence_window_ids": request.evidence_window_ids,
+        "planner_version": request.planner_version,
+    }
+    return "kfr_" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:58]
+
+
 __all__ = [
     "HIGH_SIGNAL",
     "KNOWLEDGE_CENTER",
@@ -156,4 +168,5 @@ __all__ = [
     "KnowledgeFrameRequest",
     "evidence_window_id",
     "frame_id_for",
+    "request_id_for",
 ]

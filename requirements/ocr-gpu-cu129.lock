@@ -1,0 +1,5 @@
+# This file is deliberately separate from PyPI extras. Paddle's CUDA wheel is
+# selected by platform, not by a misleading environment marker.
+paddleocr==3.7.0
+nvidia-cuda-runtime-cu12==12.9.37
+nvidia-cudnn-cu12==9.9.0.52

@@ -21,9 +21,14 @@ services:
       CONTENT_QDRANT_URL: http://qdrant:6333
       CONTENT_QDRANT_COLLECTION: knowledge_v3
       CONTENT_SERVICE_API_KEY_FILE: /run/secrets/content-service-api-key
+      # This is read-only in the API container and written only by the video
+      # worker after a real GPU OCR probe.
+      CONTENT_OCR_HEARTBEAT_FILE: /var/run/stock-content/ocr-heartbeat.json
+      CONTENT_OCR_HEARTBEAT_MAX_AGE_SECONDS: "120"
       CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
+      CONTENT_BILIBILI_STORAGE_STATE_REF: ${CONTENT_BILIBILI_STORAGE_STATE_REF:-bilibili-storage-state}
       CONTENT_XIAOE_HLS_CREDENTIAL_REF: ${CONTENT_XIAOE_HLS_CREDENTIAL_REF:-xiaoe-hls-locator}
-      CONTENT_INGESTION_CREDENTIAL_REFS: ${CONTENT_INGESTION_CREDENTIAL_REFS:-bilibili-cookiefile,xiaoe-hls-locator,xiaoe-storage-state}
+      CONTENT_INGESTION_CREDENTIAL_REFS: ${CONTENT_INGESTION_CREDENTIAL_REFS:-bilibili-storage-state,bilibili-cookiefile,xiaoe-hls-locator,xiaoe-storage-state}
     secrets:
       - content-service-api-key
     volumes:
@@ -76,16 +81,29 @@ services:
       CONTENT_WORKER_PROFILE: video
       CONTENT_WORKER_QUEUE: video_pipeline
       CONTENT_VIDEO_WORKER_HEARTBEAT_FILE: /var/run/stock-content/video-worker-heartbeat.json
+      # OCR is a local subprocess in the video worker, but executes only
+      # /opt/ocr Python. It must fail closed if the NVIDIA device is absent.
+      CONTENT_OCR_PYTHON: /opt/ocr/bin/python
+      CONTENT_OCR_DEVICE: gpu:0
+      CONTENT_OCR_REQUIRE_GPU: "true"
+      CONTENT_OCR_HEARTBEAT_FILE: /var/run/stock-content/ocr-heartbeat.json
+      CONTENT_OCR_HEARTBEAT_MAX_AGE_SECONDS: "120"
+      CONTENT_OCR_CACHE_HOME: /var/cache/stock-content/ocr
+      CONTENT_OCR_LIBRARY_PATH: /usr/local/cuda/lib64:/opt/ocr/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/ocr/lib/python3.11/site-packages/nvidia/cudnn/lib
       CONTENT_XIAOE_STORAGE_STATE_FILE: /run/secrets/xiaoe-storage-state
       CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
       CONTENT_BILIBILI_COOKIEFILE: /run/secrets/bilibili-cookiefile
+      CONTENT_BILIBILI_STORAGE_STATE_REF: ${CONTENT_BILIBILI_STORAGE_STATE_REF:-bilibili-storage-state}
+      CONTENT_BILIBILI_STORAGE_STATE_FILE: /run/secrets/bilibili-storage-state
       CONTENT_XIAOE_HLS_CREDENTIAL_REF: ${CONTENT_XIAOE_HLS_CREDENTIAL_REF:-xiaoe-hls-locator}
       CONTENT_XIAOE_HLS_LOCATOR_FILE: /run/secrets/xiaoe-hls-locator
     volumes:
       - content-worker-state:/var/run/stock-content
+      - content-ocr-cache:/var/cache/stock-content/ocr
     secrets:
       - xiaoe-storage-state
       - bilibili-cookiefile
+      - bilibili-storage-state
       - xiaoe-hls-locator
     user: "10001:10001"
     read_only: true
@@ -98,6 +116,11 @@ services:
           cpus: "2.0"
           memory: 4096M
           pids: 128
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       content-migrate:
         condition: service_completed_successfully
@@ -208,6 +231,7 @@ volumes:
   content-postgres:
   content-qdrant:
   content-worker-state:
+  content-ocr-cache:
 
 secrets:
   content-service-api-key:
@@ -216,5 +240,7 @@ secrets:
     file: ${CONTENT_XIAOE_STORAGE_STATE_HOST_FILE:?set CONTENT_XIAOE_STORAGE_STATE_HOST_FILE to a read-only secret file}
   bilibili-cookiefile:
     file: ${CONTENT_BILIBILI_COOKIEFILE_HOST_FILE:?set CONTENT_BILIBILI_COOKIEFILE_HOST_FILE to a read-only Netscape cookie file}
+  bilibili-storage-state:
+    file: ${CONTENT_BILIBILI_STORAGE_STATE_HOST_FILE:?set CONTENT_BILIBILI_STORAGE_STATE_HOST_FILE to a read-only Playwright storage state file}
   xiaoe-hls-locator:
     file: ${CONTENT_XIAOE_HLS_LOCATOR_HOST_FILE:?set CONTENT_XIAOE_HLS_LOCATOR_HOST_FILE to a read-only authorized HLS locator file}

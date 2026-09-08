@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from stock_content.adapters.sources.bilibili_materializer import MaterializedMedia
+from stock_content.adapters.browser.playwright_session import StorageStateCookieJar, validate_storage_state
+from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer, MaterializedMedia
 from stock_content.adapters.sources.dash_materializer import DashLocalizer, DashMaterializationError
-from stock_content.adapters.sources.security import UnsafeSourceURL, download_hls_playlist, validate_source_url
+from stock_content.adapters.sources.security import (
+    HlsResourceLimitError,
+    UnsafeSourceURL,
+    download_hls_playlist,
+    validate_source_url,
+)
 from stock_content.adapters.sources.xiaoe_page import xiaoe_allowed_domains
 from stock_content.domain.drm_policy import DrmPolicyError, require_supported_hls
 from stock_content.domain.source_materialization import SourceMaterialization
@@ -41,11 +48,13 @@ class XiaoeMaterializer:
         playlist_downloader: Callable[..., str] = download_hls_playlist,
         dash_localizer: DashLocalizer | None = None,
         ffmpeg: Callable[[list[str]], None] | None = None,
+        probe: Callable[[Path], dict] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._playlist_downloader = playlist_downloader
         self._dash_localizer = dash_localizer or DashLocalizer()
         self._ffmpeg = ffmpeg or self._run_ffmpeg
+        self._probe = probe or BilibiliMaterializer._ffprobe
         self._now = now
         self._allowed_domains = xiaoe_allowed_domains()
 
@@ -79,6 +88,8 @@ class XiaoeMaterializer:
     def _failure_code(exc: Exception, materialization: SourceMaterialization) -> str:
         if isinstance(exc, XiaoeMaterializationError):
             return exc.code
+        if isinstance(exc, HlsResourceLimitError):
+            return exc.code
         text = str(exc).upper()
         if "404" in text or "NOT_FOUND" in text or "MEDIA_EMPTY" in text:
             return "SOURCE_MEDIA_NOT_FOUND"
@@ -86,7 +97,9 @@ class XiaoeMaterializer:
             return "SOURCE_SESSION_EXPIRED" if materialization.credential_ref_hash else "SOURCE_SIGNED_URL_EXPIRED"
         return "MEDIA_MATERIALIZATION_FAILED"
 
-    def _download(self, materialization: SourceMaterialization, target_dir: Path) -> Path:
+    def _download(
+        self, materialization: SourceMaterialization, target_dir: Path, *, cookie_jar: StorageStateCookieJar | None
+    ) -> Path:
         if len(materialization.streams) != 1:
             raise XiaoeMaterializationError("SOURCE_MEDIA_NOT_FOUND")
         stream = materialization.streams[0]
@@ -97,8 +110,9 @@ class XiaoeMaterializer:
                     target_dir,
                     allowed_domains=self._allowed_domains,
                     headers=self._safe_headers(stream.headers),
+                    cookie_jar=cookie_jar,
                 )
-                output = target_dir / "source.mp4"
+                output = target_dir / "source.part.mp4"
                 self._ffmpeg(
                     [
                         "ffmpeg",
@@ -127,11 +141,12 @@ class XiaoeMaterializer:
             target_dir,
             allowed_domains=self._allowed_domains,
             headers=self._safe_headers(stream.headers),
+            cookie_jar=cookie_jar,
             manifest_validator=require_supported_hls,
         )
         if not Path(playlist).is_file():
             raise XiaoeMaterializationError("SOURCE_MEDIA_NOT_FOUND")
-        output = target_dir / "source.mp4"
+        output = target_dir / "source.part.mp4"
         self._ffmpeg(
             [
                 "ffmpeg",
@@ -139,8 +154,11 @@ class XiaoeMaterializer:
                 "-y",
                 "-protocol_whitelist",
                 "file,crypto,data",
-                "-safe",
-                "0",
+                # The safe downloader has already rewritten every HLS URI to
+                # local content-addressed media/key files.  This is an input-only
+                # extension exception; ffmpeg still has no network protocol.
+                "-allowed_extensions",
+                "ALL",
                 "-i",
                 str(playlist),
                 "-c",
@@ -151,6 +169,32 @@ class XiaoeMaterializer:
         if not output.is_file() or output.stat().st_size == 0:
             raise XiaoeMaterializationError("SOURCE_MEDIA_NOT_FOUND")
         return output
+
+    def _publish(self, partial: Path, target_dir: Path, *, expected_duration: float | None) -> MaterializedMedia:
+        """Reject previews/truncated or single-track output before atomic publication."""
+        try:
+            duration = BilibiliMaterializer._validate_probe(
+                self._probe(partial), request_video=True, expected_duration=expected_duration
+            )
+        except Exception as exc:
+            raise XiaoeMaterializationError("MEDIA_PROBE_INVALID") from exc
+        output = target_dir / "source.mp4"
+        try:
+            partial.replace(output)
+        except OSError as exc:
+            raise XiaoeMaterializationError("MEDIA_MATERIALIZATION_FAILED") from exc
+        return MaterializedMedia(
+            output,
+            _sha256(output),
+            duration,
+            {
+                "language": None,
+                "type": "asr",
+                "selection_reason": "asr_required",
+                "raw_sha256": None,
+                "normalized_sha256": None,
+            },
+        )
 
     def _validate_refresh(
         self, previous: SourceMaterialization, refreshed: SourceMaterialization
@@ -178,14 +222,17 @@ class XiaoeMaterializer:
             raise XiaoeMaterializationError(exc.code) from exc
         return refreshed
 
-    def _cleanup_refresh_artifacts(self, target_dir: Path) -> None:
-        """Discard only our prior local DASH graph and partial output."""
+    def _cleanup_local_artifacts(self, target_dir: Path) -> None:
+        """Discard only local graphs and partial output made for this attempt."""
         self._dash_localizer.cleanup(target_dir)
-        output = target_dir / "source.mp4"
+        output = target_dir / "source.part.mp4"
+        cache = target_dir / ".safe-hls"
         try:
             root = target_dir.resolve()
             if output.is_file() and not output.is_symlink() and output.resolve().is_relative_to(root):
                 output.unlink()
+            if cache.is_dir() and not cache.is_symlink() and cache.resolve().is_relative_to(root):
+                shutil.rmtree(cache)
         except OSError:
             return
 
@@ -195,10 +242,19 @@ class XiaoeMaterializer:
         target_dir: Path,
         *,
         reresolve: Callable[[], SourceMaterialization] | None = None,
+        storage_state: Path | None = None,
         **_: object,
     ) -> MaterializedMedia:
         """Retry exactly once after an expired signed locator/session response."""
         target_dir.mkdir(parents=True, exist_ok=True)
+        # Resolution can have happened long before a worker starts its local
+        # download.  Re-check the secret file at this materialization boundary
+        # so a replaced, symlinked, or permission-relaxed state is never read
+        # into a cookie jar.
+        cookie_jar = None
+        if storage_state is not None:
+            validate_storage_state(storage_state)
+            cookie_jar = StorageStateCookieJar(storage_state)
         active = materialization
         for attempt in range(2):
             try:
@@ -206,39 +262,33 @@ class XiaoeMaterializer:
                     raise XiaoeMaterializationError(
                         "SOURCE_SESSION_EXPIRED" if active.credential_ref_hash else "SOURCE_SIGNED_URL_EXPIRED"
                     )
-                path = self._download(active, target_dir)
-                return MaterializedMedia(
-                    path,
-                    _sha256(path),
-                    0.0,
-                    {
-                        "language": None,
-                        "type": "asr",
-                        "selection_reason": "asr_required",
-                        "raw_sha256": None,
-                        "normalized_sha256": None,
-                    },
-                )
+                path = self._download(active, target_dir, cookie_jar=cookie_jar)
+                result = self._publish(path, target_dir, expected_duration=active.public.duration_seconds)
+                self._cleanup_local_artifacts(target_dir)
+                return result
             except DrmPolicyError as exc:
+                self._cleanup_local_artifacts(target_dir)
                 raise XiaoeMaterializationError(exc.code) from exc
             except DashMaterializationError as exc:
                 if attempt == 0 and exc.retryable_locator_expiry and reresolve:
-                    self._cleanup_refresh_artifacts(target_dir)
+                    self._cleanup_local_artifacts(target_dir)
                     try:
                         active = self._validate_refresh(active, reresolve())
                     except Exception as refresh_error:
                         raise XiaoeMaterializationError(self._failure_code(refresh_error, active)) from refresh_error
                     continue
+                self._cleanup_local_artifacts(target_dir)
                 raise XiaoeMaterializationError(exc.code) from exc
             except Exception as exc:
                 code = self._failure_code(exc, active)
                 if attempt == 0 and code in {"SOURCE_SESSION_EXPIRED", "SOURCE_SIGNED_URL_EXPIRED"} and reresolve:
-                    self._cleanup_refresh_artifacts(target_dir)
+                    self._cleanup_local_artifacts(target_dir)
                     try:
                         active = self._validate_refresh(active, reresolve())
                     except Exception as refresh_error:
                         raise XiaoeMaterializationError(self._failure_code(refresh_error, active)) from refresh_error
                     continue
+                self._cleanup_local_artifacts(target_dir)
                 raise XiaoeMaterializationError(code) from exc
         raise XiaoeMaterializationError("SOURCE_MEDIA_NOT_FOUND")
 

@@ -116,4 +116,14 @@ class XiaoePageSourceAdapter:
         return self._resolver.resolve(source_ref, credential_ref_hash=credential_ref_hash)
 
     def materialize(self, materialization: SourceMaterialization, target_dir: Path, **kwargs: object):
-        return self._materializer.materialize(materialization, target_dir, **kwargs)
+        if self._resolver is None:
+            raise XiaoeResolutionError("SOURCE_PAGE_RESOLVER_DISABLED")
+        # The state file remains in this adapter and is used only by the
+        # immediate materialization call; it is not attached to durable task
+        # data, artifacts, checkpoints, or materialization metadata.
+        return self._materializer.materialize(
+            materialization,
+            target_dir,
+            storage_state=self._resolver.storage_state_for(materialization.credential_ref_hash),
+            **kwargs,
+        )

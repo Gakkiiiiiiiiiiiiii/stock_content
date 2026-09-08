@@ -103,6 +103,13 @@ class StageRunner:
             # Legacy stage adapter only. Production StageResult must declare
             # produced_artifacts explicitly.
             outputs = [artifact for artifact in context.artifacts.artifacts() if artifact.artifact_id not in before]
+        # Some stages discover their immutable execution identity while doing
+        # the work (the isolated OCR worker is the important example).  A
+        # successful checkpoint must seal that observed identity, rather than
+        # the pre-execution view used for a FAILED attempt.  This leaves
+        # ordinary stages unchanged while making a completed OCR result
+        # inseparable from the runtime that produced it.
+        checkpoint_identity = _checkpoint_identity(context)
         checkpoint = build_checkpoint(
             stage=self.name,
             stage_version=self._stage_version,
@@ -219,11 +226,18 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "transcript_visual_crosscheck": config.get("transcript_visual_crosscheck_version") or "",
             "ocr_engine": config.get("ocr_engine") or context.options.get("ocr_model") or "",
             "ocr_engine_version": config.get("ocr_engine_version") or context.options.get("ocr_model_version") or "",
+            "ocr_requested_device": config.get("ocr_device") or "",
             "vision": config.get("vision_model") or context.options.get("vision_model") or "",
             "vision_version": config.get("vision_model_version") or context.options.get("vision_model_version") or "",
         }.items()
         if value
     }
+    # Only an OCR stage that actually observed a worker runtime may add this
+    # provenance.  Empty metadata must not mutate unrelated stage checkpoints.
+    runtime_identity = context.options.get("ocr_runtime_identity")
+    if isinstance(runtime_identity, dict) and runtime_identity:
+        model_identity["ocr_actual_device"] = str(runtime_identity.get("actual_device") or "")
+        model_identity["ocr_runtime_identity"] = canonical_json(runtime_identity)
     prompt_identity = {
         key: str(value)
         for key, value in {

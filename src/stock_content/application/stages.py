@@ -58,7 +58,7 @@ from stock_content.domain.initial_verification import build_initial_verification
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindowPlanner
-from stock_content.domain.knowledge_frame_plan import KnowledgeFramePlanner, frame_id_for
+from stock_content.domain.knowledge_frame_plan import KnowledgeFramePlanner, frame_id_for, request_id_for
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
@@ -562,6 +562,92 @@ class FrameExtractionStage:
         return str(item.get("image_hash") or hashlib.sha256(canonical_json(item).encode()).hexdigest())
 
 
+class FixtureFrameRegistrationStage:
+    """Register deterministic, test-only visual fixtures without ffmpeg.
+
+    Live ingest may only receive frames from ``KnowledgeDirectedFrameExtractionStage``.
+    Keeping this isolated preserves existing offline pipeline fixtures without
+    allowing a request option to bypass transcript-derived frame planning.
+    """
+
+    name = "frame_fixture"
+    required_inputs = ("media",)
+    output_types = ("frame",)
+    optional_output_types = ("frame",)
+
+    @staticmethod
+    def _is_fixture(context: PipelineContext) -> bool:
+        return bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+            or "test_subtitle_candidates" in context.options
+        )
+
+    def execute(self, context: PipelineContext) -> StageResult:
+        supplied_frames = context.options.get("frames")
+        supplied_ids = {
+            str(item.get("frame_id"))
+            for key in ("ocr_evidence", "frame_insights")
+            for item in (context.options.get(key) or [])
+            if isinstance(item, dict) and item.get("frame_id")
+        }
+        if supplied_frames is None and not supplied_ids:
+            return StageResult(context=context)
+        if not self._is_fixture(context):
+            raise ValueError("live media cannot register fixture frames; use knowledge-directed extraction")
+        frames = list(supplied_frames or [])
+        existing_ids = {str(item.get("frame_id")) for item in frames if isinstance(item, dict) and item.get("frame_id")}
+        for frame_id in sorted(supplied_ids - existing_ids):
+            frames.append(
+                {
+                    "frame_id": frame_id,
+                    "timestamp_ms": 0,
+                    "image_hash": hashlib.sha256(frame_id.encode()).hexdigest(),
+                    "storage_ref": f"fixture://frame/{frame_id}",
+                }
+            )
+        media = context.artifacts.media
+        if media is None:
+            raise ValueError("fixture frame registration requires media")
+        artifacts: list[FrameArtifact] = []
+        for index, frame in enumerate(frames):
+            item = frame if isinstance(frame, dict) else {"image_path": str(frame)}
+            frame_artifact = FrameArtifact(
+                artifact_id="frame-pending",
+                artifact_type="frame",
+                producer_stage=self.name,
+                media_artifact_id=media.artifact_id,
+                frame_id=str(item.get("frame_id") or f"fixture-frame-{index}"),
+                timestamp_ms=int(item.get("timestamp_ms") or 0),
+                image_hash=FrameExtractionStage._image_hash(item),
+                storage_ref=str(item.get("image_path") or item.get("storage_ref") or ""),
+                extraction_reason="fixture",
+                parent_artifact_ids=(media.artifact_id,),
+            )
+            artifact = FrameArtifact(**{**frame_artifact.__dict__, "artifact_id": artifact_id_of(frame_artifact)})
+            context.artifacts.add("frames", artifact)
+            artifacts.append(artifact)
+            context.state.frames.append({**item, "frame_id": artifact.frame_id})
+        return StageResult(context=context, produced_artifacts=tuple(artifacts))
+
+
+class VisualEvidencePolicyStage:
+    """Fail closed when a live video cannot enter semantic visual planning."""
+
+    name = "visual_evidence_policy"
+    required_inputs = ("media", "transcript")
+    output_types = ()
+
+    def __init__(self, *, semantic_segmentation_enabled: bool) -> None:
+        self._semantic_segmentation_enabled = semantic_segmentation_enabled
+
+    def execute(self, context: PipelineContext) -> StageResult:
+        if context.runtime.video_path is not None and not self._semantic_segmentation_enabled:
+            raise ValueError("live media visual extraction requires semantic segmentation")
+        return StageResult(context=context)
+
+
 class ASRStage:
     name = "asr"
     required_inputs = ("media",)
@@ -1029,11 +1115,24 @@ class OCRStage:
         evidence: list[dict[str, Any]] = []
         if supplied is None:
             for frame in context.state.get("frames", []):
-                result = self._engine.recognize(str(frame["image_path"]))
+                result = self._engine.recognize(str(frame["image_path"]), str(frame.get("image_hash") or ""))
                 if not isinstance(result, dict):
                     raise ValueError("OCR engine returned a non-object response")
                 engine = _require_model_text(result.get("engine"), "OCR engine")
                 engine_version = _require_model_text(result.get("engine_version"), "OCR engine_version")
+                runtime_identity = result.get("runtime_identity") or {}
+                if not isinstance(runtime_identity, dict):
+                    raise ValueError("OCR runtime_identity must be an object")
+                requested_device = str(result.get("requested_device") or "")
+                actual_device = str(result.get("actual_device") or "")
+                if requested_device == "gpu:0" and not actual_device.lower().startswith("gpu:0"):
+                    raise ValueError("OCR actual device does not satisfy requested gpu:0")
+                if runtime_identity:
+                    frozen_identity = {str(key): str(value) for key, value in runtime_identity.items()}
+                    existing = context.options.get("ocr_runtime_identity")
+                    if existing and existing != frozen_identity:
+                        raise ValueError("OCR runtime identity changed during task")
+                    context.options["ocr_runtime_identity"] = frozen_identity
                 raw_blocks = result.get("blocks")
                 if not isinstance(raw_blocks, list):
                     raise ValueError("OCR blocks must be a list")
@@ -1052,6 +1151,9 @@ class OCRStage:
                         "confidence_score": _finite_confidence(raw_block.get("score"), "OCR score"),
                         "ocr_engine": engine,
                         "ocr_engine_version": engine_version,
+                        "ocr_requested_device": requested_device,
+                        "ocr_actual_device": actual_device,
+                        "ocr_runtime_identity": runtime_identity,
                     }
                     blocks.append(block)
                     evidence.append(block)
@@ -1099,6 +1201,11 @@ class OCRStage:
                 blocks=[dict(item)],
                 engine=str(item.get("ocr_engine") or "fixture"),
                 engine_version=str(item.get("ocr_engine_version") or "fixture.v1"),
+                requested_device=str(item.get("ocr_requested_device") or ""),
+                actual_device=str(item.get("ocr_actual_device") or ""),
+                runtime_identity={
+                    str(key): str(value) for key, value in dict(item.get("ocr_runtime_identity") or {}).items()
+                },
                 parent_artifact_ids=(parent,) if parent else (),
             )
             ocr_artifacts.append(OCRArtifact(**{**ocr.__dict__, "artifact_id": artifact_id_of(ocr)}))
@@ -1601,6 +1708,8 @@ class KnowledgeDirectedFrameExtractionStage:
         requests = self._frame_planner.plan(windows, media_duration_ms=_duration_ms(context))
         if context.runtime.video_path is None:
             return StageResult(context=context)
+        if not windows or not requests:
+            raise ValueError("live media requires transcript-derived semantic evidence windows for visual extraction")
         existing_hashes = {
             str(item.get("image_hash") or "")
             for item in context.state.frames
@@ -1626,13 +1735,20 @@ class KnowledgeDirectedFrameExtractionStage:
             planned = {
                 **item,
                 "frame_id": frame_id,
+                "timestamp_ms": timestamp_ms,
                 "image_path": str(durable_image),
                 "storage_ref": str(durable_image),
+                "extraction_reason": request.extraction_reason,
+                "semantic_segment_ids": list(request.semantic_segment_ids),
+                "evidence_window_ids": list(request.evidence_window_ids),
+                "planner_version": request.planner_version,
+                "planner_request_id": request_id_for(request),
             }
             frame = FrameArtifact(
                 artifact_id="frame-pending",
                 artifact_type="frame",
                 producer_stage=self.name,
+                producer_version=request.planner_version,
                 media_artifact_id=media.artifact_id,
                 frame_id=frame_id,
                 timestamp_ms=timestamp_ms,
@@ -1642,6 +1758,7 @@ class KnowledgeDirectedFrameExtractionStage:
                 semantic_segment_ids=request.semantic_segment_ids,
                 evidence_window_ids=request.evidence_window_ids,
                 planner_version=request.planner_version,
+                planner_request_id=request_id_for(request),
                 parent_artifact_ids=(media.artifact_id,),
             )
             artifact = FrameArtifact(**{**frame.__dict__, "artifact_id": artifact_id_of(frame)})
@@ -3957,6 +4074,11 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
         context.options.get("ocr_model_version")
         or (context.artifacts.ocr[0].engine_version if context.artifacts.ocr else "1"),
     )
+    if context.artifacts.ocr:
+        ocr = context.artifacts.ocr[0]
+        models.setdefault("ocr_requested_device", ocr.requested_device or "unknown")
+        models.setdefault("ocr_actual_device", ocr.actual_device or "unknown")
+        models.setdefault("ocr_runtime_identity", _config_hash_of(ocr.runtime_identity))
     models.setdefault(
         "vision",
         context.options.get("vision_model") or pipeline_config.get("vision_model") or "unknown",

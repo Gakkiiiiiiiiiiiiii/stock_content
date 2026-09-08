@@ -14,7 +14,7 @@ from stock_content.domain.semantic_segment import build_semantic_segment_artifac
 
 
 class _IndependentPaddleOcr:
-    def recognize(self, _path: str) -> dict:
+    def recognize(self, _path: str, _image_hash: str = "") -> dict:
         return {
             "text": "贵州茅台 600519 收入增长12%",
             "blocks": [{"text": "贵州茅台 600519 收入增长12%", "score": 0.99, "bbox": [1, 2, 30, 40]}],
@@ -142,11 +142,13 @@ def test_terra_fixture_identity_changes_with_version_or_content_and_rejects_miss
     baseline = _fixture(frame_id="frame-1", timestamp_ms=2_000, content_hash=content_hash)
     changed_version = _fixture(frame_id="frame-1", timestamp_ms=2_000, content_hash=content_hash, version="2026-09-09")
     changed_content = _fixture(frame_id="frame-1", timestamp_ms=2_000, content_hash="b" * 64)
-    assert TerraTestVisionFixtureAnalyzer(baseline, environment="test").identity["fixture_content_hash"] != (
-        TerraTestVisionFixtureAnalyzer(changed_version, environment="test").identity["fixture_content_hash"]
+    assert (
+        TerraTestVisionFixtureAnalyzer(baseline, environment="test").identity["fixture_content_hash"]
+        != (TerraTestVisionFixtureAnalyzer(changed_version, environment="test").identity["fixture_content_hash"])
     )
-    assert TerraTestVisionFixtureAnalyzer(baseline, environment="test").identity["fixture_content_hash"] != (
-        TerraTestVisionFixtureAnalyzer(changed_content, environment="test").identity["fixture_content_hash"]
+    assert (
+        TerraTestVisionFixtureAnalyzer(baseline, environment="test").identity["fixture_content_hash"]
+        != (TerraTestVisionFixtureAnalyzer(changed_content, environment="test").identity["fixture_content_hash"])
     )
 
     del baseline["frames"][0]["bbox"]

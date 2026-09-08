@@ -43,7 +43,7 @@ def _context(tmp_path: Path) -> PipelineContext:
 
 
 class _Ocr:
-    def recognize(self, _path: str) -> dict:
+    def recognize(self, _path: str, _image_hash: str = "") -> dict:
         return {
             "text": "贵州茅台 600519",
             "blocks": [{"text": "贵州茅台 600519", "score": 0.99, "bbox": [1, 2, 30, 40]}],
@@ -90,7 +90,7 @@ def test_malformed_model_visual_data_fails_closed(tmp_path):
     context = _context(tmp_path)
 
     class BadOcr(_Ocr):
-        def recognize(self, _path: str) -> dict:
+        def recognize(self, _path: str, _image_hash: str = "") -> dict:
             return {
                 "blocks": [{"text": "x", "score": float("nan"), "bbox": [1, 2, 3, 4]}],
                 "engine": "p",

@@ -172,7 +172,9 @@ def _video_components(dependencies: ReadinessDependencies, application: object |
     model_ok = bool(os.getenv("CONTENT_MODEL_URL", "") and os.getenv("CONTENT_MODEL_NAME", ""))
     vision_ok = bool(os.getenv("CONTENT_VISION_URL", "") and os.getenv("CONTENT_VISION_MODEL", ""))
     asr_ok = importlib.util.find_spec("faster_whisper") is not None
-    ocr_ok = importlib.util.find_spec("paddleocr") is not None
+    # API processes do not import Paddle.  Only the isolated worker's signed
+    # runtime observation can prove the requested GPU is available.
+    ocr_ok, ocr_payload = _ocr_heartbeat(os.getenv("CONTENT_OCR_HEARTBEAT_FILE", ""))
     queue_ok = bool(
         sessions is not None and callable(getattr(getattr(application, "_tasks", None), "claim_pending", None))
     )
@@ -193,7 +195,10 @@ def _video_components(dependencies: ReadinessDependencies, application: object |
         ),
         "xiaoe_browser": _component(browser_ok, "XIAOE_BROWSER_NOT_READY"),
         "asr": _component(asr_ok, "ASR_NOT_READY"),
-        "ocr_visual": _component(ocr_ok and vision_ok, "OCR_VISUAL_NOT_READY"),
+        "ocr_visual": {
+            **_component(ocr_ok and vision_ok, "OCR_VISUAL_NOT_READY"),
+            "ocr_runtime": ocr_payload,
+        },
         "content_model": _component(model_ok, "CONTENT_MODEL_NOT_READY"),
         "raw_storage": _component(raw_ok, "RAW_STORAGE_NOT_READY"),
         "queue_claim": _component(queue_ok, "QUEUE_CLAIM_NOT_READY"),
@@ -244,6 +249,47 @@ def _fresh_heartbeat(value: str) -> bool:
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
+
+
+def _ocr_heartbeat(value: str) -> tuple[bool, dict[str, object]]:
+    """Read only the worker's non-secret GPU health proof; never import Paddle."""
+    if not value:
+        return False, {"health_code": "OCR_HEARTBEAT_MISSING"}
+    try:
+        payload = json.loads(Path(value).read_text(encoding="utf-8"))
+        observed = datetime.fromisoformat(str(payload["observed_at"]).replace("Z", "+00:00"))
+        age = (datetime.now(UTC) - _as_utc(observed)).total_seconds()
+        identity = payload["runtime_identity"]
+        required = {
+            "paddle_version",
+            "paddleocr_version",
+            "cuda_version",
+            "cudnn_version",
+            "device_count",
+            "compiled_cuda",
+            "requested_device",
+            "actual_device",
+        }
+        requested = str(payload.get("requested_device") or "")
+        actual = str(payload.get("actual_device") or "")
+        ready = (
+            str(payload.get("profile")) == "ocr"
+            and str(payload.get("health_code")) == "READY"
+            and 0 <= age <= float(os.getenv("CONTENT_OCR_HEARTBEAT_MAX_AGE_SECONDS", "120"))
+            and requested == "gpu:0"
+            and actual.lower().startswith("gpu:0")
+            and isinstance(identity, dict)
+            and required <= set(identity)
+            and str(identity.get("requested_device")) == requested
+            and str(identity.get("actual_device")) == actual
+            and str(identity.get("compiled_cuda")).lower() == "true"
+            and int(str(identity.get("device_count"))) >= 1
+        )
+        safe = {key: identity[key] for key in sorted(required) if key in identity}
+        safe.update({"requested_device": requested, "actual_device": actual, "health_code": payload.get("health_code")})
+        return ready, safe
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False, {"health_code": "OCR_HEARTBEAT_INVALID"}
 
 
 def _sql_projection_state(session_factory) -> tuple[SnapshotReadiness, float, int]:
