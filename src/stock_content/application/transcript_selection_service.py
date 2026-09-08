@@ -49,8 +49,7 @@ class TranscriptSelectionService:
                 if report.quality_status is TranscriptQualityStatus.PASS:
                     return TranscriptSelection(candidate.ordered_segments, candidate.language, report)
                 if candidate in official and set(report.reason_codes) - {
-                    "COVERAGE_BELOW_95_PERCENT",
-                    "MAX_GAP_EXCEEDS_20_SECONDS",
+                    "COVERAGE_BELOW_90_PERCENT",
                 }:
                     raise TranscriptSelectionError(report)
         # Only augment explicit subtitle gaps, and only from aligned ASR.

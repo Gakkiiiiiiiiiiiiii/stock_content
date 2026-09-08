@@ -12,6 +12,8 @@ from stock_content.domain.transcript_quality import (
     source_mix,
 )
 
+MIN_TRANSCRIPT_COVERAGE = 0.90
+
 
 class TranscriptQualityService:
     def evaluate(
@@ -61,10 +63,8 @@ class TranscriptQualityService:
         preservation = 1.0 if not raw_tokens else preserved / len(raw_tokens)
         if not monotonic:
             reasons.append("TIMESTAMP_NON_MONOTONIC_OR_OVERLAP")
-        if covered / duration_ms < 0.95:
-            reasons.append("COVERAGE_BELOW_95_PERCENT")
-        if max_gap > 20_000:
-            reasons.append("MAX_GAP_EXCEEDS_20_SECONDS")
+        if covered / duration_ms < MIN_TRANSCRIPT_COVERAGE:
+            reasons.append("COVERAGE_BELOW_90_PERCENT")
         if preservation != 1.0:
             reasons.append("HARD_FACT_TOKEN_MUTATION")
         status = (
@@ -72,7 +72,7 @@ class TranscriptQualityService:
             if not reasons
             else (
                 TranscriptQualityStatus.RETRYABLE_ASR
-                if reasons == ["COVERAGE_BELOW_95_PERCENT"] or reasons == ["MAX_GAP_EXCEEDS_20_SECONDS"]
+                if reasons == ["COVERAGE_BELOW_90_PERCENT"]
                 else TranscriptQualityStatus.NEEDS_REVIEW
             )
         )
@@ -91,4 +91,4 @@ class TranscriptQualityService:
         )
 
 
-__all__ = ["TranscriptQualityService"]
+__all__ = ["MIN_TRANSCRIPT_COVERAGE", "TranscriptQualityService"]

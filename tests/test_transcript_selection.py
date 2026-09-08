@@ -9,7 +9,7 @@ from stock_content.application.stages import (
     TranscriptQualityStage,
     TranscriptSelectionStage,
 )
-from stock_content.application.transcript_quality_service import TranscriptQualityService
+from stock_content.application.transcript_quality_service import MIN_TRANSCRIPT_COVERAGE, TranscriptQualityService
 from stock_content.application.transcript_selection_service import TranscriptSelectionError, TranscriptSelectionService
 from stock_content.domain.artifacts import MediaArtifact
 from stock_content.domain.transcript_candidate import (
@@ -52,21 +52,82 @@ def test_selection_precedence_and_gap_fill_never_duplicate_authority():
     assert filled.report.quality_status is TranscriptQualityStatus.PASS
 
 
+def test_quality_accepts_exactly_90_percent_coverage():
+    assert MIN_TRANSCRIPT_COVERAGE == 0.90
+    report = TranscriptQualityService().evaluate(
+        _candidate(TranscriptSource.OFFICIAL_SUBTITLE, [(0, 90_000)]).ordered_segments,
+        duration_ms=100_000,
+        language="zh",
+    )
+    assert report.coverage_ratio == 0.90
+    assert report.quality_status is TranscriptQualityStatus.PASS
+    assert report.reason_codes == ()
+
+
+def test_quality_below_90_percent_is_retryable_only_for_new_coverage_reason():
+    report = TranscriptQualityService().evaluate(
+        _candidate(TranscriptSource.OFFICIAL_SUBTITLE, [(0, 89_999)]).ordered_segments,
+        duration_ms=100_000,
+        language="zh",
+    )
+    assert report.quality_status is TranscriptQualityStatus.RETRYABLE_ASR
+    assert report.reason_codes == ("COVERAGE_BELOW_90_PERCENT",)
+
+
+def test_quality_does_not_retry_asr_when_low_coverage_also_mutates_hard_facts():
+    report = TranscriptQualityService().evaluate(
+        (
+            TranscriptCandidateSegment(
+                TranscriptSource.OFFICIAL_SUBTITLE,
+                "official",
+                0,
+                89_999,
+                "营收100亿元",
+                "营收99亿元",
+                1.0,
+            ),
+        ),
+        duration_ms=100_000,
+        language="zh",
+    )
+    assert report.quality_status is TranscriptQualityStatus.NEEDS_REVIEW
+    assert report.reason_codes == ("COVERAGE_BELOW_90_PERCENT", "HARD_FACT_TOKEN_MUTATION")
+
+
+def test_quality_reports_max_gap_without_gating_or_legacy_reason():
+    service = TranscriptQualityService()
+    long_gap = service.evaluate(
+        _candidate(TranscriptSource.OFFICIAL_SUBTITLE, [(0, 270_000)]).ordered_segments,
+        duration_ms=300_000,
+        language="zh",
+    )
+    short_gap = service.evaluate(
+        _candidate(TranscriptSource.OFFICIAL_SUBTITLE, [(15_000, 285_000)]).ordered_segments,
+        duration_ms=300_000,
+        language="zh",
+    )
+    assert long_gap.quality_status is TranscriptQualityStatus.PASS
+    assert long_gap.max_gap_ms == 30_000
+    assert long_gap.to_dict()["max_gap_ms"] == 30_000
+    assert long_gap.reason_codes == ()
+    assert long_gap.report_hash != short_gap.report_hash
+
+
 @pytest.mark.parametrize(
     "spans, expected",
     [
         ([(0, 20_000), (10_000, 100_000)], "TIMESTAMP_NON_MONOTONIC_OR_OVERLAP"),
-        ([(0, 70_000)], "MAX_GAP_EXCEEDS_20_SECONDS"),
+        ([(0, 100_001)], "TIMESTAMP_OUT_OF_BOUNDS"),
     ],
 )
-def test_quality_fails_closed_for_overlap_and_gap(spans, expected):
+def test_quality_fails_closed_for_overlap_and_out_of_bounds(spans, expected):
     report = TranscriptQualityService().evaluate(
         _candidate(TranscriptSource.OFFICIAL_SUBTITLE, spans).ordered_segments,
         duration_ms=100_000,
         language="zh",
     )
     assert expected in report.reason_codes
-    assert report.quality_status is not TranscriptQualityStatus.PASS
+    assert report.quality_status is TranscriptQualityStatus.NEEDS_REVIEW
 
 
 def test_hard_facts_mutation_and_official_boundary_require_review():
@@ -123,3 +184,27 @@ def test_candidate_stages_preserve_candidates_and_skip_asr_when_manual_qualifies
     assert selected.produced_artifacts == (context.artifacts.transcript,)
     assert context.artifacts.transcript.segments[0].source == "OFFICIAL_SUBTITLE"
     assert context.state.transcript_quality_report.report_hash == context.state.transcript_quality_report.report_hash
+
+
+def test_candidate_stage_skips_asr_for_94_2489_percent_official_coverage():
+    context = PipelineContext(
+        task_id="coverage-94-2489",
+        source={"type": "bilibili", "ref": "BV1"},
+        options={
+            "duration_ms": 1_000_000,
+            "_test_subtitle_candidate_adapter": True,
+            "test_subtitle_candidates": [
+                {
+                    "source": "OFFICIAL_SUBTITLE",
+                    "source_artifact_id": "subtitle-manual",
+                    "language": "zh",
+                    "segments": [{"start_ms": 0, "end_ms": 942_489, "text": "600000 10%", "confidence": 1.0}],
+                }
+            ],
+        },
+    )
+    context.artifacts.media = MediaArtifact(artifact_id="media-94", artifact_type="media", duration_ms=1_000_000)
+    TranscriptCandidateStage().execute(context)
+    assert context.options["_asr_required"] is False
+    selected = TranscriptSelectionStage().execute(context)
+    assert selected.context.state.transcript_quality_report.quality_status is TranscriptQualityStatus.PASS

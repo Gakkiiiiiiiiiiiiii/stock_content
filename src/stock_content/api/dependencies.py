@@ -119,9 +119,12 @@ STAGE_VERSIONS: dict[str, str] = {
     "frame": "1.0.0",
     "audio": "1.0.0",
     "asr": "1.0.0",
-    "transcript_candidate": "1.0.0",
-    "transcript_selection": "1.0.0",
-    "transcript_quality": "1.0.0",
+    # Coverage policy changed from 95% with a max-gap gate to 90% without
+    # that gate.  All three transcript decision stages must reject old
+    # checkpoints rather than resume under the changed semantics.
+    "transcript_candidate": "2.0.0",
+    "transcript_selection": "2.0.0",
+    "transcript_quality": "2.0.0",
     "diarization": "1.0.0",
     "transcript_postprocess": "1.0.0",
     # C3 moves visual consumers after transcript-planned knowledge frames.

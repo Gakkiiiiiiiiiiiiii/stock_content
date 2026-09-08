@@ -109,6 +109,17 @@ def test_resume_rejects_incompatible_stage_version():
         validate_resume([record], {artifact.artifact_id: artifact}, stage_versions={"knowledge": "2.0.0"})
 
 
+def test_resume_rejects_pre_90_percent_transcript_policy_checkpoints():
+    from stock_content.api.dependencies import STAGE_VERSIONS
+
+    transcript_stages = ("transcript_candidate", "transcript_selection", "transcript_quality")
+    assert {STAGE_VERSIONS[stage] for stage in transcript_stages} == {"2.0.0"}
+    for stage in transcript_stages:
+        legacy = build_checkpoint(stage=stage, stage_version="1.0.0")
+        with pytest.raises(CheckpointValidationError, match=f"stage version incompatible for {stage}"):
+            validate_resume([legacy], {}, stage_versions=STAGE_VERSIONS)
+
+
 def test_validate_resume_stops_at_failed_checkpoint():
     artifact = SourceArtifact(artifact_id="source-1", artifact_type="source", source_content_hash="h")
     ok = build_checkpoint(stage="source", output_artifacts=[artifact])
