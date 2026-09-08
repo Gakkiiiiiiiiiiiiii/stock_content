@@ -28,7 +28,15 @@ from stock_content.domain.semantic_segment import build_semantic_segment_artifac
 from stock_content.domain.transcript_visual_crosscheck import TranscriptVisualCrossChecker
 
 
-def _check(transcript: str, ocr: str = "", vision: str = "", *, confidence: float = 0.99, owned=True):
+def _check(
+    transcript: str,
+    ocr: str = "",
+    vision: str = "",
+    *,
+    confidence: float = 0.99,
+    narration_aligned: bool = True,
+    owned=True,
+):
     return TranscriptVisualCrossChecker().check(
         frame={
             "frame_id": "f1",
@@ -42,9 +50,12 @@ def _check(transcript: str, ocr: str = "", vision: str = "", *, confidence: floa
         vision_item={
             "visual_summary": vision,
             "symbols": [],
-            "labels": [],
+            "labels": ["market_ui"],
+            "themes": [],
             "confidence_score": 0.8,
-            "narration_aligned": True,
+            "narration_aligned": narration_aligned,
+            "model": "fixture",
+            "model_version": "fixture.v1",
         }
         if vision
         else None,
@@ -76,14 +87,27 @@ def test_crosscheck_classifies_hard_facts_and_records_audit_reason(transcript, o
     assert result["evidence_window_ids"] == (["w1"] if relation != "UNKNOWN" else [])
 
 
-def test_high_confidence_ocr_candidate_is_trace_only_and_never_mutates_transcript():
+def test_high_confidence_ocr_contradiction_candidate_is_trace_only_and_never_mutates_transcript():
     transcript = "贵州茅台 600519 收入增长12%"
     result = _check(transcript, "贵州茅台 600519 收入增长13%")
-    assert result["relation"] == "SUPPORTS"
+    assert result["relation"] == "CONTRADICTS"
     candidate = next(item for item in result["correction_candidates"] if item["kind"] == "NUMBER")
     assert candidate["original"] == ["12%"] and candidate["replacement"] == ["13%"]
     assert candidate["status"] == "TRACE_ONLY_REQUIRES_INDEPENDENT_TRANSCRIPT_GROUNDING"
     assert transcript == "贵州茅台 600519 收入增长12%"
+
+
+def test_shared_term_anchor_with_conflicting_numbers_contradicts():
+    result = _check("增资的话一共是3600亿", "合计募资5200亿 增资")
+    assert result["relation"] == "CONTRADICTS"
+    assert result["matches"]["TERM"] == ["增资"]
+    assert result["mismatches"]["NUMBER"] == {"transcript": ["3600亿"], "visual": ["5200亿"]}
+
+
+def test_unanchored_number_difference_is_unrelated():
+    result = _check("一共是3600亿", "合计5200亿")
+    assert result["relation"] == "UNRELATED"
+    assert "NO_SHARED_HARD_FACT" in result["reason_codes"]
 
 
 def test_malformed_or_unconfident_visual_inputs_stay_unknown_or_do_not_create_candidate():
@@ -97,6 +121,55 @@ def test_model_narration_alignment_alone_never_becomes_financial_fact_support():
     result = _check("600519收入增长12%", vision="600519收入增长12%")
     assert result["relation"] == "UNKNOWN"
     assert "MODEL_ONLY_FACT_NOT_INDEPENDENT_SUPPORT" in result["reason_codes"]
+
+
+def test_model_narration_does_not_supply_support_when_ocr_exists_without_the_fact():
+    result = _check("600519收入增长12%", ocr="画面说明", vision="600519收入增长12%")
+    assert result["relation"] == "UNRELATED"
+    assert "NO_SHARED_HARD_FACT" in result["reason_codes"]
+
+
+@pytest.mark.parametrize(
+    "ocr",
+    [
+        "行情软件 银行 降准 上涨 1000",
+        "行情软件 银行 降准 下跌 900",
+    ],
+)
+def test_narration_unaligned_vision_rejects_accidental_ocr_hard_fact_overlap(ocr):
+    result = _check(
+        "银行降准后上涨1000点",
+        ocr=ocr,
+        vision="密集行情软件界面",
+        narration_aligned=False,
+    )
+    assert result["relation"] == "UNRELATED"
+    assert "VISION_NARRATION_NOT_ALIGNED" in result["reason_codes"]
+    assert result["matches"] == {} and result["mismatches"] == {}
+
+
+@pytest.mark.parametrize(
+    ("ocr", "relation"),
+    [
+        ("银行 降准 上涨 1000", "SUPPORTS"),
+        ("银行 降准 下跌 900", "CONTRADICTS"),
+    ],
+)
+def test_narration_aligned_vision_keeps_ocr_grounded_relation(ocr, relation):
+    result = _check(
+        "银行降准后上涨1000点",
+        ocr=ocr,
+        vision="密集行情软件界面",
+        narration_aligned=True,
+    )
+    assert result["relation"] == relation
+    assert "EXACT_TERM_MATCH" in result["reason_codes"]
+
+
+def test_missing_vision_keeps_ocr_only_hard_fact_semantics():
+    result = _check("银行降准后上涨1000点", ocr="银行 降准 上涨 1000")
+    assert result["relation"] == "SUPPORTS"
+    assert "EXACT_TERM_MATCH" in result["reason_codes"]
 
 
 def _stage_context() -> PipelineContext:

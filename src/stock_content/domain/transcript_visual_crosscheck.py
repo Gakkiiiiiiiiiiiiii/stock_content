@@ -17,7 +17,7 @@ _NUMBER = re.compile(
     r"(?<![\d.])\d+(?:,\d{3})*(?:\.\d+)?\s*(?:%|％|亿元|万亿元|万元|万|亿|倍|个|台|吨|美元|人民币|USD|CNY)?"
 )
 _DATE = re.compile(
-    r"(?:19|20)\d{2}(?:年|[-/.])(?:0?[1-9]|1[0-2])(?:月|[-/.])?(?:0?[1-9]|[12]\d|3[01])?|(?:20\d{2}\s*)?[Qq][1-4]|\d{1,2}月(?:\d{1,2}日)?"
+    r"(?:20\d{2}\s*年?\s*)?[Qq][1-4]|(?:19|20)\d{2}(?:年|[-/.])(?:0?[1-9]|1[0-2])(?:月|[-/.])?(?:0?[1-9]|[12]\d|3[01])?|\d{1,2}月(?:\d{1,2}日)?"
 )
 _ENTITY = re.compile(
     r"[\u4e00-\u9fffA-Za-z]{2,20}(?:股份有限公司|有限公司|集团|银行|证券|科技|控股|汽车|能源|算力|半导体|芯片|金融|保险|茅台|时代|英伟达|GPU|CPU|服务器|平台)"
@@ -46,6 +46,8 @@ _DIRECTION = {
     "UP": ("上涨", "上升", "增长", "走高", "利好", "突破", "increase", "up"),
     "DOWN": ("下跌", "下降", "回落", "走低", "利空", "跌破", "decrease", "down"),
 }
+_SEMANTIC_ANCHOR_KINDS = frozenset(("TERM", "ENTITY", "TICKER"))
+_MATERIAL_FACT_KINDS = frozenset(("NUMBER", "DATE", "DIRECTION"))
 
 
 def _normal(value: str) -> str:
@@ -60,7 +62,7 @@ def _facts(text: str) -> dict[str, set[str]]:
         # before this match would turn "600519 收入" into a false non-ticker.
         "TICKER": set(_TICKER.findall(text)),
         "NUMBER": {_normal(item) for item in _NUMBER.findall(text) if re.search(r"\d", item)},
-        "DATE": {_normal(item) for item in _DATE.findall(text)},
+        "DATE": {_normal(item).replace("年Q", "Q") for item in _DATE.findall(text)},
         "ENTITY": {_normal(item) for item in _ENTITY.findall(text)},
         "TERM": {term.upper() for term in _TERMS if term.upper() in normalized},
         "DIRECTION": directions,
@@ -72,6 +74,27 @@ def _finite(value: Any) -> float | None:
         return None
     result = float(value)
     return result if 0 <= result <= 1 else None
+
+
+def _is_structurally_valid_vision_item(value: Any) -> bool:
+    """Recognize the normalized vision shape emitted by the vision stage."""
+    if not isinstance(value, dict) or not isinstance(value.get("visual_summary"), str):
+        return False
+    if not value["visual_summary"].strip() or not isinstance(value.get("narration_aligned"), bool):
+        return False
+    for field, require_item in (("labels", True), ("themes", False), ("symbols", False)):
+        items = value.get(field)
+        if not isinstance(items, list) or (require_item and not items):
+            return False
+        if any(not isinstance(item, str) or not item.strip() for item in items):
+            return False
+    return (
+        _finite(value.get("confidence_score")) is not None
+        and isinstance(value.get("model"), str)
+        and bool(value["model"].strip())
+        and isinstance(value.get("model_version"), str)
+        and bool(value["model_version"].strip())
+    )
 
 
 @dataclass(frozen=True)
@@ -108,7 +131,10 @@ class TranscriptVisualCrossChecker:
                 ]
             )
         transcript_facts, ocr_facts, vision_facts = _facts(transcript_text), _facts(ocr_text), _facts(vision_text)
-        visual_facts = {kind: ocr_facts[kind] | vision_facts[kind] for kind in transcript_facts}
+        # OCR is the independently grounded visual evidence.  A vision model's
+        # narration remains auditable, but cannot supply a financial-fact match
+        # when OCR is available.
+        visual_facts = ocr_facts if ocr_text else vision_facts
         reasons: list[str] = []
         matches: dict[str, list[str]] = {}
         mismatches: dict[str, dict[str, list[str]]] = {}
@@ -118,6 +144,12 @@ class TranscriptVisualCrossChecker:
         elif not ocr_text and not vision_text:
             relation = "UNKNOWN"
             reasons.append("NO_VISUAL_FACT_EVIDENCE")
+        elif _is_structurally_valid_vision_item(vision_item) and vision_item["narration_aligned"] is False:
+            # OCR from a dense market UI can accidentally repeat a ticker, term,
+            # or number from the narration.  A normalized vision result that
+            # explicitly rejects alignment makes that overlap ineligible.
+            relation = "UNRELATED"
+            reasons.append("VISION_NARRATION_NOT_ALIGNED")
         else:
             for kind, expected in transcript_facts.items():
                 seen = visual_facts[kind]
@@ -125,9 +157,13 @@ class TranscriptVisualCrossChecker:
                 if overlap:
                     matches[kind] = overlap
                     reasons.append(f"EXACT_{kind}_MATCH")
-                elif expected and seen:
-                    mismatches[kind] = {"transcript": sorted(expected), "visual": sorted(seen)}
+                expected_only = expected - seen
+                seen_only = seen - expected
+                if expected_only and seen_only:
+                    mismatches[kind] = {"transcript": sorted(expected_only), "visual": sorted(seen_only)}
                     reasons.append(f"{kind}_MISMATCH")
+            semantic_anchors = _SEMANTIC_ANCHOR_KINDS & matches.keys()
+            material_mismatches = _MATERIAL_FACT_KINDS & mismatches.keys()
             if matches and not ocr_text:
                 # A vision response saying that it agrees with the narration is
                 # not an independent financial-fact source.  Keep it auditable
@@ -135,9 +171,14 @@ class TranscriptVisualCrossChecker:
                 # visual source carries the matching hard fact.
                 relation = "UNKNOWN"
                 reasons.append("MODEL_ONLY_FACT_NOT_INDEPENDENT_SUPPORT")
+            elif semantic_anchors and material_mismatches:
+                # A shared subject/action anchor makes a conflicting number,
+                # date, or direction a material contradiction rather than a
+                # partial visual confirmation.
+                relation = "CONTRADICTS"
             elif matches:
                 relation = "SUPPORTS"
-            elif mismatches:
+            elif "TICKER" in mismatches:
                 relation = "CONTRADICTS"
             else:
                 relation = "UNRELATED"
