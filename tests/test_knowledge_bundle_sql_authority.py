@@ -4,7 +4,7 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +56,9 @@ def _authority_with_snapshot(tmp_path, *, events: bool = True):
     with database.session_factory.begin() as session:
         session.add_all(
             [
+                ContentArtifactRow(
+                    artifact_id="transcript-1", artifact_type="transcript", content_hash="t" * 64, payload={},
+                ),
                 ContentArtifactRow(
                     artifact_id="source-1", artifact_type="source", content_hash="a" * 64,
                     payload={
@@ -236,3 +239,78 @@ def test_production_sql_evidence_item_bundle_uses_consumer_canonical_quote_hash(
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("claim_nature", "source_label", "expected_visual"),
+    [
+        ("ATTRIBUTED_SECONDARY_POLICY_REPORT", "displayed secondary policy page", True),
+        ("ATTRIBUTED_SECONDARY_MACRO_FACT_REPORT", "displayed secondary macro page", True),
+        # A speaker forecast/thesis may be adjacent to a news page, but it is
+        # not a proposition about what that page reported (KU10/KU09).
+        ("SOURCE_FORECAST", "displayed secondary page", False),
+        ("SOURCE_INTERPRETIVE_CAUSAL_THESIS", "speaker interpretation", False),
+    ],
+)
+def test_v2_sql_projection_adds_only_owned_displayed_secondary_page_evidence(
+    tmp_path, claim_nature, source_label, expected_visual
+):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        claim = session.get(FinancialClaimRow, "claim-1")
+        occurrence = session.get(ClaimOccurrenceRow, "occurrence-1")
+        occurrence.semantic_segment_id = "segment-1"
+        claim.normalized_statement = "2030年目标9800 EFLOPS"
+        claim.payload = {
+            "bundle_v2": {
+                "claim_nature": claim_nature,
+                "primary_domain": "INFORMATION_INFRASTRUCTURE_POLICY",
+                "attribution": {"attributed": True, "source_label": source_label},
+                "source_grade": "SECONDARY",
+                "detail": {"explanation": "展示页面写有2030和9800。"},
+                "temporal": {
+                    "kind": "FORECAST_TARGET", "start": "2030", "end": None,
+                    "as_of": None, "rule": None, "label": "2030", "precision": "YEAR",
+                    "explicitly_unknown": False,
+                },
+                "external_truth_status": "NOT_CHECKED",
+            }
+        }
+        session.add_all(
+            [
+                ContentArtifactRow(
+                    artifact_id="frame-page", artifact_type="frame", content_hash="f" * 64,
+                    payload={"frame_id": "frame-page", "timestamp_ms": 2},
+                ),
+                ContentArtifactRow(
+                    artifact_id="vision-page", artifact_type="vision", content_hash="v" * 64,
+                    payload={
+                        "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
+                        "semantic_segment_ids": ["segment-1"], "labels": ["secondary-news-page"],
+                        "label": "displayed secondary page", "model_name": "terra", "model_version": "1",
+                    },
+                ),
+                ContentArtifactRow(
+                    artifact_id="ocr-page", artifact_type="ocr", content_hash="o" * 64,
+                    payload={
+                        "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
+                        "text": "2030年目标9800 EFLOPS", "bbox": [0, 0, 1, 1],
+                        "engine": "paddleocr", "engine_version": "3.7.0",
+                    },
+                ),
+            ]
+        )
+        snapshot.artifact_ids = {
+            **snapshot.artifact_ids,
+            "frames:0": "frame-page",
+            "vision:0": "vision-page",
+        }
+    request = replace(_request(), contract_version="content-knowledge-bundle.v2")
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(request)["items"][0]
+    modalities = [entry["modality"] for entry in item["evidence"]]
+    assert ("frame" in modalities) is expected_visual
+    assert ("ocr" in modalities) is expected_visual
+    assert ("vision" in modalities) is expected_visual
+    assert item["source_grade"] == "SECONDARY"
+    assert item["external_truth_status"] == "NOT_CHECKED"

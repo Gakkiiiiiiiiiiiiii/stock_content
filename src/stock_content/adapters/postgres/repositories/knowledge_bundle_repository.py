@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime, time
 from typing import Any
 
@@ -312,6 +313,26 @@ class PostgresKnowledgeBundleAuthority:
                             )
                         })
                     direct_evidence = _v2_evidence(links, evidence_map, artifact_rows)
+                    # Snapshots written before ClaimVisualBinding understood
+                    # displayed-secondary pages have only transcript links.
+                    # Reconstruct a *read-only*, tightly scoped visual
+                    # citation from that snapshot's immutable artifacts.  It
+                    # never changes the occurrence, support state, source
+                    # grade, or external-truth status.
+                    direct_evidence.extend(
+                        _displayed_secondary_snapshot_evidence(
+                            session=session,
+                            snapshot=snapshot,
+                            occurrence=occurrence,
+                            semantic=semantic,
+                            primary_evidence=[
+                                evidence_map[link.evidence_id]
+                                for link in links
+                                if link.evidence_role == "PRIMARY" and link.evidence_id in evidence_map
+                            ],
+                            existing_artifact_ids={str(item.get("artifact_id") or "") for item in direct_evidence},
+                        )
+                    )
                     items.append(
                         {
                             "knowledge_id": occurrence.occurrence_id,
@@ -601,3 +622,147 @@ def _v2_model_identity(artifact: ContentArtifactRow, modality: str) -> dict[str,
         raise ValueError("BUNDLE_EVIDENCE_MODEL_IDENTITY_MISSING")
     confidence = payload.get("confidence_score")
     return {"name": str(name), "version": str(version), "confidence": confidence}
+
+
+_DISPLAYED_SECONDARY_NATURES = frozenset(
+    {"ATTRIBUTED_SECONDARY_POLICY_REPORT", "ATTRIBUTED_SECONDARY_MACRO_FACT_REPORT"}
+)
+_NUMBER_TOKEN = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _displayed_secondary_snapshot_evidence(
+    *,
+    session,
+    snapshot: ContentSnapshotRow,
+    occurrence: ClaimOccurrenceRow,
+    semantic: dict[str, Any],
+    primary_evidence: list[dict[str, Any]],
+    existing_artifact_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Return page-display citations for a legacy v2 snapshot, if exact.
+
+    This compatibility projection is deliberately unable to turn a generic
+    unaligned screen into evidence.  It accepts only a vision-labelled
+    ``secondary-news-page`` for an explicitly attributed displayed-secondary
+    report, owned by the same semantic segment and within that occurrence's
+    primary transcript interval.  The result documents what the video showed;
+    it does not authenticate the page's underlying external claim.
+    """
+    attribution = dict(semantic.get("attribution") or {})
+    if (
+        semantic.get("claim_nature") not in _DISPLAYED_SECONDARY_NATURES
+        or semantic.get("source_grade") != "SECONDARY"
+        or not attribution.get("attributed")
+        or "displayed" not in str(attribution.get("source_label") or "").lower()
+        or not primary_evidence
+    ):
+        return []
+    starts = [int(item.get("start_ms")) for item in primary_evidence if item.get("start_ms") is not None]
+    ends = [int(item.get("end_ms")) for item in primary_evidence if item.get("end_ms") is not None]
+    if not starts or not ends:
+        return []
+    # An occurrence may cite separated ASR fragments.  The frame must still
+    # be in its own transcript authority interval, not merely the chapter.
+    interval_start, interval_end = min(starts), max(ends)
+    artifact_ids = dict(snapshot.artifact_ids or {})
+    frame_ids = [value for key, value in artifact_ids.items() if str(key).startswith("frames:")]
+    vision_ids = [value for key, value in artifact_ids.items() if str(key).startswith("vision:")]
+    if not frame_ids or not vision_ids:
+        return []
+    frames = {
+        row.artifact_id: row
+        for row in session.scalars(
+            select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(sorted(set(frame_ids))))
+        )
+    }
+    visions = session.scalars(
+        select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(sorted(set(vision_ids))))
+    ).all()
+    candidates: list[tuple[ContentArtifactRow, ContentArtifactRow]] = []
+    for vision in visions:
+        payload = dict(vision.payload or {})
+        frame_artifact_id = str(payload.get("frame_artifact_id") or "")
+        frame = frames.get(frame_artifact_id)
+        labels = set(str(item) for item in (payload.get("labels") or ()))
+        timestamp = int(payload.get("timestamp_ms") or 0)
+        semantic_ids = set(str(item) for item in (payload.get("semantic_segment_ids") or ()))
+        if (
+            frame is not None
+            and "secondary-news-page" in labels
+            and str(occurrence.semantic_segment_id) in semantic_ids
+            and interval_start <= timestamp <= interval_end
+        ):
+            candidates.append((frame, vision))
+    if not candidates:
+        return []
+    # One nearest page is enough and avoids attaching a chapter's repeated
+    # screenshots as though each independently verified the same fact.
+    center = (interval_start + interval_end) // 2
+    frame, vision = min(
+        candidates,
+        key=lambda pair: (
+            abs(int((pair[1].payload or {}).get("timestamp_ms") or 0) - center),
+            pair[0].artifact_id,
+        ),
+    )
+    frame_payload, vision_payload = dict(frame.payload or {}), dict(vision.payload or {})
+    frame_id = str(frame_payload.get("frame_id") or vision_payload.get("frame_id") or "")
+    timestamp = int(vision_payload.get("timestamp_ms") or frame_payload.get("timestamp_ms") or 0)
+    if not frame_id or frame.artifact_id in existing_artifact_ids:
+        return []
+    locator = {"segment_id": None, "frame_id": frame_id, "start_ms": timestamp, "end_ms": timestamp, "bbox": None}
+    result = [
+        {
+            "evidence_id": f"{frame.artifact_id}:displayed-secondary",
+            "ownership": "SECONDARY",
+            "modality": "frame",
+            "artifact_id": frame.artifact_id,
+            "artifact_hash": "sha256:" + str(frame.content_hash),
+            "locator": locator,
+            "content": f"frame:{frame_id}",
+        },
+        {
+            "evidence_id": f"{vision.artifact_id}:displayed-secondary",
+            "ownership": "SECONDARY",
+            "modality": "vision",
+            "artifact_id": vision.artifact_id,
+            "artifact_hash": "sha256:" + str(vision.content_hash),
+            "locator": locator,
+            "content": str(vision_payload.get("label") or "displayed secondary page"),
+            "model": _v2_model_identity(vision, "vision"),
+        },
+    ]
+    detail_text = " ".join(str(value) for value in dict(semantic.get("detail") or {}).values() if value)
+    terms = set(_NUMBER_TOKEN.findall(f"{detail_text} {occurrence.normalized_statement or ''}"))
+    ocr_rows = session.scalars(
+        select(ContentArtifactRow).where(
+            ContentArtifactRow.artifact_type == "ocr",
+            ContentArtifactRow.payload["frame_artifact_id"].as_string() == frame.artifact_id,
+        )
+    ).all()
+    scored = []
+    for ocr in ocr_rows:
+        payload = dict(ocr.payload or {})
+        content = str(payload.get("text") or "").strip()
+        if not content:
+            continue
+        matches = len(terms & set(_NUMBER_TOKEN.findall(content)))
+        if not matches:
+            continue
+        scored.append((matches, len(content), str(ocr.artifact_id), ocr, payload, content))
+    # Preserve the clearest page lines, not UI chrome or every OCR box.
+    for _matches, _length, _artifact_id, ocr, payload, content in sorted(scored, reverse=True)[:4]:
+        bbox = payload.get("bbox")
+        result.append(
+            {
+                "evidence_id": f"{ocr.artifact_id}:displayed-secondary",
+                "ownership": "SECONDARY",
+                "modality": "ocr",
+                "artifact_id": ocr.artifact_id,
+                "artifact_hash": "sha256:" + str(ocr.content_hash),
+                "locator": {**locator, "bbox": bbox},
+                "content": content,
+                "model": _v2_model_identity(ocr, "ocr"),
+            }
+        )
+    return result

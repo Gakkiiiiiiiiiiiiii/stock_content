@@ -144,6 +144,17 @@ class TranscriptVisualCrossChecker:
         elif not ocr_text and not vision_text:
             relation = "UNKNOWN"
             reasons.append("NO_VISUAL_FACT_EVIDENCE")
+        elif (
+            _is_structurally_valid_vision_item(vision_item)
+            and vision_item["narration_aligned"] is False
+            and "secondary-news-page" in set(vision_item.get("labels") or ())
+        ):
+            # A displayed secondary page can prove only that the video showed
+            # that page.  It is deliberately not narration support and never
+            # an external verification result.  Claim binding applies this
+            # narrow relation only to explicit attributed-secondary reports.
+            relation = "SUPPORTS_DISPLAYED_SECONDARY"
+            reasons.extend(("DISPLAYED_SECONDARY_PAGE_ONLY", "VISION_NARRATION_NOT_ALIGNED"))
         elif _is_structurally_valid_vision_item(vision_item) and vision_item["narration_aligned"] is False:
             # OCR from a dense market UI can accidentally repeat a ticker, term,
             # or number from the narration.  A normalized vision result that

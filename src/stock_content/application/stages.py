@@ -1864,6 +1864,21 @@ class ClaimVisualBindingStage:
             if item.get("relation") in {"SUPPORTS", "CONTRADICTS"}
         }
         frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in admitted}
+        displayed_secondary = {
+            str(item.get("frame_id") or "")
+            for item in context.state.get("transcript_visual_crosschecks") or ()
+            if item.get("relation") == "SUPPORTS_DISPLAYED_SECONDARY"
+        }
+        # Keep this material separate from normally admitted multimodal
+        # evidence.  It is evidence that a secondary page was displayed, not
+        # independent confirmation of its policy or macro assertion.
+        frames.update(
+            {
+                item.frame_id: item
+                for item in context.artifacts.frames
+                if item.frame_id in displayed_secondary
+            }
+        )
         ocr_by_frame: dict[str, list[OCRArtifact]] = {}
         for item in context.artifacts.ocr:
             if item.frame_id in frames and item.text:
@@ -1875,9 +1890,12 @@ class ClaimVisualBindingStage:
         bound: list[ClaimOccurrenceDraft] = []
         for index, draft in enumerate(context.state.get("claim_drafts") or ()):
             window_ids = set(context.state.claim_evidence_window_ids.get(index, ()))
+            permit_displayed_secondary = _is_attributed_displayed_secondary_report(draft)
             anchors: list[VisualEvidenceAnchor] = []
             for frame in sorted(frames.values(), key=lambda item: (item.timestamp_ms, item.frame_id)):
                 if not window_ids.intersection(frame.evidence_window_ids):
+                    continue
+                if frame.frame_id in displayed_secondary and not permit_displayed_secondary:
                     continue
                 ocr = next(iter(ocr_by_frame.get(frame.frame_id, ())), None)
                 if ocr is not None:
@@ -1911,6 +1929,27 @@ class ClaimVisualBindingStage:
             bound.append(draft.model_copy(update={"visual_anchors": anchors}))
         context.state.claim_drafts = bound
         return _stage_result(context)
+
+
+def _is_attributed_displayed_secondary_report(draft: ClaimOccurrenceDraft) -> bool:
+    """Permit a page-display citation without upgrading it into a fact.
+
+    This is intentionally narrower than ``source_grade == SECONDARY``.  A
+    speaker thesis or forecast may have a related page on screen (KU09/KU10),
+    but that page is not evidence for the conclusion.  Only the two explicit
+    Bundle-v2 report natures describe the proposition as *what a displayed
+    secondary page says*.
+    """
+    semantic = dict(draft.bundle_v2 or {})
+    if semantic.get("claim_nature") not in {
+        "ATTRIBUTED_SECONDARY_POLICY_REPORT",
+        "ATTRIBUTED_SECONDARY_MACRO_FACT_REPORT",
+    } or semantic.get("source_grade") != "SECONDARY":
+        return False
+    attribution = dict(semantic.get("attribution") or {})
+    return bool(attribution.get("attributed")) and "displayed" in str(
+        attribution.get("source_label") or ""
+    ).lower()
 
 
 class AtomicClaimExtractionStage:

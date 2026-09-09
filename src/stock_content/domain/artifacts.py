@@ -484,7 +484,10 @@ class TranscriptVisualCrosscheckArtifact(ArtifactBase):
                 key=lambda item: (item.timestamp_ms, item.frame_id, item.frame_artifact_id),
             )
         )
-        if any(item.relation not in {"SUPPORTS", "CONTRADICTS", "UNRELATED", "UNKNOWN"} for item in records):
+        if any(
+            item.relation not in {"SUPPORTS", "CONTRADICTS", "SUPPORTS_DISPLAYED_SECONDARY", "UNRELATED", "UNKNOWN"}
+            for item in records
+        ):
             raise ValueError("invalid transcript visual crosscheck relation")
         if any(not item.frame_id or not item.frame_artifact_id for item in records):
             raise ValueError("crosscheck relation requires frame identity")
