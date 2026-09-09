@@ -14,6 +14,7 @@ from stock_content.api.security import ServiceAuthorizer
 class _Application:
     def __init__(self) -> None:
         self.calls = 0
+        self.replays = []
         self._tasks = type("Tasks", (), {"_sessions": None, "claim_pending": lambda *_args, **_kw: None})()
         self._knowledge_bundle_service = type("Bundles", (), {"create": lambda *_args: {}, "get": lambda *_args: {}})()
 
@@ -23,6 +24,10 @@ class _Application:
 
     def get_task(self, task_id):
         return {"task_id": task_id, "status": "PENDING"}
+
+    def replay_content_snapshot(self, content_snapshot_id, *, mode=None, pipeline_version=None, overrides=None):
+        self.replays.append((content_snapshot_id, mode, pipeline_version, overrides))
+        return {"content_snapshot_id": content_snapshot_id, "identity_match": True}
 
     def create_knowledge_bundle(self, _request):
         return {"bundle_id": "bundle-1"}
@@ -56,6 +61,26 @@ def test_private_ingestion_requires_rotating_bearer_and_allowed_caller(tmp_path)
         assert response.status_code == expected
         assert set(response.json()["error"]) >= {"code", "message", "retryable", "trace_id"}
     assert client.post("/v1/content/ingestions", json=body, headers=_headers("previous-token")).status_code == 200
+
+
+def test_replay_and_task_readback_require_the_service_acl(tmp_path):
+    client = _client(tmp_path)
+    replay_path = "/api/v1/content-snapshots/cs-private/replay"
+    task_path = "/api/v1/tasks/task-private"
+
+    assert client.post(
+        replay_path, json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.043.audit"}
+    ).status_code == 401
+    assert client.get(task_path).status_code == 401
+
+    assert client.get(task_path, headers=_headers()).status_code == 200
+    response = client.post(
+        replay_path,
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.043.audit"},
+        headers=_headers(),
+    )
+    assert response.status_code == 200
+    assert response.json()["identity_match"] is True
 
 
 def test_trace_content_type_validation_and_redacted_exception(tmp_path):

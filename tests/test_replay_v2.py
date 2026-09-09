@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import InMemorySnapshotStore, SnapshotService
 from stock_content.domain.artifacts import (
@@ -11,7 +13,12 @@ from stock_content.domain.artifacts import (
     ClaimArtifact,
     EvidenceArtifact,
     EvidenceItem,
+    FrameArtifact,
+    OCRArtifact,
+    TranscriptVisualCrosscheckArtifact,
+    TranscriptVisualCrosscheckRecord,
     VerificationArtifact,
+    VisionArtifact,
 )
 from stock_content.domain.claims import FinancialClaim, VerificationResult
 
@@ -55,6 +62,85 @@ def _snapshot(artifact_ids, *, store=None):
         source_artifact_id=artifact_ids.get("source", ""),
         code_sha="test-sha",
     )
+
+
+def _cs_8b_multimodal_snapshot(*, visual_source_id="frame-8b", include_visual_source=True):
+    """The persisted cs-8b shape: visual evidence is admitted by crosscheck.
+
+    The EvidenceArtifact itself predates copying selected visual parents into
+    its parent list.  The sealed crosscheck carries the Frame -> OCR/Vision
+    graph and the admitted relation instead.
+    """
+    source = ArtifactBase(artifact_id="source-8b", artifact_type="source")
+    media = ArtifactBase(
+        artifact_id="media-8b", artifact_type="media", parent_artifact_ids=(source.artifact_id,)
+    )
+    transcript = ArtifactBase(
+        artifact_id="transcript-8b", artifact_type="transcript", parent_artifact_ids=(media.artifact_id,)
+    )
+    semantic = ArtifactBase(
+        artifact_id="semantic-8b", artifact_type="semantic_segments", parent_artifact_ids=(transcript.artifact_id,)
+    )
+    frame = FrameArtifact(
+        artifact_id="frame-8b", artifact_type="frame", media_artifact_id=media.artifact_id,
+        frame_id="frame-8b", timestamp_ms=8_805, image_hash="frame-image",
+        parent_artifact_ids=(media.artifact_id,),
+    )
+    ocr = OCRArtifact(
+        artifact_id="ocr-8b", artifact_type="ocr", frame_artifact_id=frame.artifact_id,
+        frame_id=frame.frame_id, timestamp_ms=frame.timestamp_ms, image_hash=frame.image_hash,
+        text="审计证据", parent_artifact_ids=(frame.artifact_id,),
+    )
+    vision = VisionArtifact(
+        artifact_id="vision-8b", artifact_type="vision", frame_artifact_id=frame.artifact_id,
+        frame_id=frame.frame_id, timestamp_ms=frame.timestamp_ms, image_hash=frame.image_hash,
+        label="审计画面", labels=["审计画面"], parent_artifact_ids=(frame.artifact_id,),
+    )
+    crosscheck = TranscriptVisualCrosscheckArtifact(
+        artifact_id="crosscheck-8b", artifact_type="transcript_visual_crosscheck",
+        transcript_artifact_id=transcript.artifact_id, semantic_segment_artifact_id=semantic.artifact_id,
+        crosscheck_version="crosscheck.v1", eligible_frame_ids=(frame.frame_id,),
+        relations=(TranscriptVisualCrosscheckRecord(
+            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id,
+            timestamp_ms=frame.timestamp_ms, relation="SUPPORTS",
+        ),),
+        parent_artifact_ids=(
+            transcript.artifact_id, semantic.artifact_id, frame.artifact_id, ocr.artifact_id, vision.artifact_id,
+        ),
+    )
+    evidence = EvidenceArtifact(
+        artifact_id="evidence-8b", artifact_type="evidence", transcript_artifact_id=transcript.artifact_id,
+        source_artifact_ids=(transcript.artifact_id,),
+        parent_artifact_ids=(transcript.artifact_id, semantic.artifact_id),
+        evidences=(
+            EvidenceItem("evidence-asr-8b", "ASR", source_artifact_id=transcript.artifact_id),
+            EvidenceItem("evidence-frame-8b", "FRAME", source_artifact_id=visual_source_id),
+            EvidenceItem("evidence-ocr-8b", "OCR", source_artifact_id=ocr.artifact_id),
+            EvidenceItem("evidence-vision-8b", "VISION", source_artifact_id=vision.artifact_id),
+        ),
+    )
+    artifacts = [source, media, transcript, semantic, frame, ocr, vision, crosscheck, evidence]
+    artifact_ids = {
+        "source": source.artifact_id,
+        "media": media.artifact_id,
+        "transcript": transcript.artifact_id,
+        "semantic_segments": semantic.artifact_id,
+        "frames:0": frame.artifact_id,
+        "ocr:0": ocr.artifact_id,
+        "vision:0": vision.artifact_id,
+        "transcript_visual_crosscheck": crosscheck.artifact_id,
+        "evidence": evidence.artifact_id,
+    }
+    if include_visual_source and visual_source_id == "frame-outside-8b":
+        outside = FrameArtifact(
+            artifact_id=visual_source_id, artifact_type="frame", media_artifact_id=media.artifact_id,
+            frame_id="frame-outside-8b", timestamp_ms=9_999, image_hash="outside-image",
+            parent_artifact_ids=(media.artifact_id,),
+        )
+        artifacts.append(outside)
+        artifact_ids["frames:1"] = outside.artifact_id
+    snapshots, snapshot = _snapshot(artifact_ids)
+    return snapshots, snapshot, ArtifactRepo(artifacts)
 
 
 def test_verify_lineage_walks_all_parent_edges_and_detects_cycle():
@@ -144,6 +230,34 @@ def test_verify_lineage_checks_signal_snapshot_claim_and_verification_refs():
         signal_outbox=SignalRows([row]),
     ).replay(snapshot.content_snapshot_id)
     assert result["error"] == "REPLAY_LINEAGE_REFERENCE_MISSING"
+
+
+def test_cs_8b_shape_accepts_sealed_frame_ocr_and_vision_evidence_for_replay():
+    snapshots, snapshot, artifacts = _cs_8b_multimodal_snapshot()
+
+    result = ReplayService(snapshots, artifact_repository=artifacts).replay(snapshot.content_snapshot_id)
+
+    assert result["identity_match"] is True
+    assert result["artifact_validation"]["checked"] is True
+
+
+@pytest.mark.parametrize(
+    ("visual_source_id", "include_visual_source", "expected"),
+    [
+        ("frame-outside-8b", True, "REPLAY_LINEAGE_REFERENCE_INVALID"),
+        ("frame-unknown-8b", False, "REPLAY_LINEAGE_REFERENCE_MISSING"),
+    ],
+)
+def test_cs_8b_shape_keeps_unadmitted_or_unknown_visual_evidence_fail_closed(
+    visual_source_id, include_visual_source, expected
+):
+    snapshots, snapshot, artifacts = _cs_8b_multimodal_snapshot(
+        visual_source_id=visual_source_id, include_visual_source=include_visual_source
+    )
+
+    result = ReplayService(snapshots, artifact_repository=artifacts).replay(snapshot.content_snapshot_id)
+
+    assert result["error"] == expected
 
 
 def test_identity_mismatch_is_fail_closed_for_reprocess():

@@ -39,12 +39,14 @@ CONTRACT_VERSIONS.append(CONTRACT_NAME)
 
 
 def _private_route(method: str, path: str) -> bool:
-    """Private ingestion task data and formal bundles require service identity."""
+    """Private ingestion, replay, task data, and formal bundles require service identity."""
     if path.startswith("/v1/content/knowledge-bundles"):
         return True
     if path == "/v1/content/ingestions" or path.startswith("/v1/content/ingestions/"):
         return True
     if path in {"/api/v1/videos/bilibili/ingest", "/api/v1/videos/xiaoe/ingest"}:
+        return True
+    if path.startswith("/api/v1/content-snapshots/") and path.endswith("/replay"):
         return True
     return path.startswith("/api/v1/tasks/")
 
@@ -194,7 +196,14 @@ def create_app(
         request.state.trace_id = trace_id
         request.state.decision_id = decision_id
         private_route = _private_route(request.method, request.url.path)
-        if private_route and request.method in {"POST", "PUT", "PATCH"}:
+        # Replay has an intentionally optional request body: an empty POST is
+        # the historical VERIFY_LINEAGE form.  It remains private, but must
+        # not be rejected for lacking a JSON content type before auth runs.
+        if (
+            private_route
+            and request.method in {"POST", "PUT", "PATCH"}
+            and not request.url.path.endswith("/replay")
+        ):
             content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
             if content_type != "application/json":
                 return JSONResponse(

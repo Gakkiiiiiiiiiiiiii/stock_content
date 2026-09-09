@@ -497,8 +497,8 @@ def test_verify_lineage_rejects_occurrence_row_outside_snapshot(tmp_path, field,
     assert result["error"] == "REPLAY_LINEAGE_REFERENCE_INVALID"
 
 
-def test_verify_lineage_rejects_occurrence_evidence_outside_snapshot(tmp_path):
-    """All four occurrence evidence roles must be members of the active EvidenceArtifact."""
+def test_verify_lineage_rejects_secondary_occurrence_evidence_outside_snapshot(tmp_path):
+    """Secondary visual evidence must be a member of the active EvidenceArtifact."""
     from sqlalchemy import insert
 
     from stock_content.adapters.postgres.models import ClaimOccurrenceEvidenceRow
@@ -520,7 +520,7 @@ def test_verify_lineage_rejects_occurrence_evidence_outside_snapshot(tmp_path):
             insert(ClaimOccurrenceEvidenceRow).values(
                 occurrence_id=occurrence_id,
                 evidence_id="evidence-outside-snapshot",
-                evidence_role="PRIMARY",
+                evidence_role="SECONDARY",
                 ordinal=999,
             )
         )

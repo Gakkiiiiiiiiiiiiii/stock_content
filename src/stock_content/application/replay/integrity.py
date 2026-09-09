@@ -240,8 +240,12 @@ class ReplayIntegrityMixin:
                 raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
                                            f"evidence references missing source artifact {source_id}")
             if source_id not in loaded_evidence_parents:
-                raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID",
-                                           f"evidence source {source_id} is not an EvidenceArtifact parent")
+                self._validate_admitted_visual_evidence_source(
+                    evidence=evidence,
+                    evidence_artifact=evidence_artifact,
+                    source_artifact=loaded[source_id],
+                    loaded=loaded,
+                )
         claim_ids = {str(getattr(item, "claim_id", None) or
                           (item.get("claim_id") if isinstance(item, dict) else item))
                      for item in (getattr(claim_artifact, "claims", ()) or ())}
@@ -403,6 +407,7 @@ class ReplayIntegrityMixin:
                 )
             for role, refs in (
                 ("primary", getattr(occurrence, "evidence_refs", ()) or ()),
+                ("secondary", getattr(occurrence, "secondary_evidence_refs", ()) or ()),
                 ("condition", getattr(occurrence, "condition_evidence_refs", ()) or ()),
                 ("invalidation", getattr(occurrence, "invalidation_evidence_refs", ()) or ()),
                 ("temporal", getattr(occurrence, "temporal_evidence_refs", ()) or ()),
@@ -485,6 +490,83 @@ class ReplayIntegrityMixin:
                     raise ReplayIntegrityError(
                         "REPLAY_LINEAGE_REFERENCE_INVALID", "signal verification artifact mismatch"
                     )
+
+    @staticmethod
+    def _validate_admitted_visual_evidence_source(*, evidence: Any, evidence_artifact: Any,
+                                                  source_artifact: Any, loaded: dict[str, Any]) -> None:
+        """Accept only visual evidence admitted by the sealed crosscheck graph.
+
+        Historical EPIC-043 snapshots keep their visual evidence on the
+        occurrence ``SECONDARY`` role.  Their EvidenceArtifact predates the
+        visual parents being copied into that artifact, while the immutable
+        transcript-visual-crosscheck artifact already seals the Frame ->
+        OCR/Vision admission graph.  Do not treat membership in the snapshot
+        alone as proof: require that sealed graph and its admitted relation.
+        """
+        source_type = str(getattr(evidence, "source_type", "") or "").upper()
+        expected_type = {"FRAME": "frame", "OCR": "ocr", "VISION": "vision"}.get(source_type)
+        artifact_id = str(getattr(source_artifact, "artifact_id", "") or "")
+        actual_type = str(getattr(source_artifact, "artifact_type", "") or "")
+        if expected_type is None or actual_type != expected_type:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                f"evidence source {artifact_id} is not an EvidenceArtifact parent",
+                artifact_id=artifact_id,
+            )
+
+        frame_artifact_id = (
+            artifact_id if expected_type == "frame"
+            else str(getattr(source_artifact, "frame_artifact_id", "") or "")
+        )
+        frame_artifact = loaded.get(frame_artifact_id)
+        if frame_artifact is None or str(getattr(frame_artifact, "artifact_type", "")) != "frame":
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "visual evidence does not resolve to a snapshot frame",
+                artifact_id=artifact_id,
+                frame_artifact_id=frame_artifact_id,
+            )
+        if expected_type != "frame" and frame_artifact_id not in {
+            str(item) for item in (getattr(source_artifact, "parent_artifact_ids", ()) or ())
+        }:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "visual evidence source is not linked to its frame by a parent edge",
+                artifact_id=artifact_id,
+                frame_artifact_id=frame_artifact_id,
+            )
+        frame_id = str(getattr(source_artifact, "frame_id", "") or "")
+        if not frame_id or frame_id != str(getattr(frame_artifact, "frame_id", "") or ""):
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "visual evidence source frame identity does not match its frame artifact",
+                artifact_id=artifact_id,
+            )
+
+        evidence_transcript_id = str(getattr(evidence_artifact, "transcript_artifact_id", "") or "")
+        for crosscheck in loaded.values():
+            if str(getattr(crosscheck, "artifact_type", "")) != "transcript_visual_crosscheck":
+                continue
+            parent_ids = {str(item) for item in (getattr(crosscheck, "parent_artifact_ids", ()) or ())}
+            if artifact_id not in parent_ids or frame_artifact_id not in parent_ids:
+                continue
+            if evidence_transcript_id and str(getattr(crosscheck, "transcript_artifact_id", "") or "") != (
+                evidence_transcript_id
+            ):
+                continue
+            for relation in getattr(crosscheck, "relations", ()) or ():
+                if (
+                    str(getattr(relation, "relation", "")) in {"SUPPORTS", "CONTRADICTS"}
+                    and str(getattr(relation, "frame_id", "") or "") == frame_id
+                    and str(getattr(relation, "frame_artifact_id", "") or "") == frame_artifact_id
+                    and frame_id in set(getattr(crosscheck, "eligible_frame_ids", ()) or ())
+                ):
+                    return
+        raise ReplayIntegrityError(
+            "REPLAY_LINEAGE_REFERENCE_INVALID",
+            "visual evidence source is outside the admitted snapshot crosscheck graph",
+            artifact_id=artifact_id,
+        )
 
 
 __all__ = ["ReplayIntegrityMixin"]
