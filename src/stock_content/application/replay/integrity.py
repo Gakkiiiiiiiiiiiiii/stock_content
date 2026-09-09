@@ -555,11 +555,19 @@ class ReplayIntegrityMixin:
             ):
                 continue
             for relation in getattr(crosscheck, "relations", ()) or ():
+                relation_type = str(getattr(relation, "relation", "") or "")
+                admitted = relation_type in {"SUPPORTS", "CONTRADICTS"}
+                displayed_secondary = relation_type == "SUPPORTS_DISPLAYED_SECONDARY"
                 if (
-                    str(getattr(relation, "relation", "")) in {"SUPPORTS", "CONTRADICTS"}
+                    (admitted or displayed_secondary)
                     and str(getattr(relation, "frame_id", "") or "") == frame_id
                     and str(getattr(relation, "frame_artifact_id", "") or "") == frame_artifact_id
-                    and frame_id in set(getattr(crosscheck, "eligible_frame_ids", ()) or ())
+                    # Displayed-secondary pages are intentionally excluded
+                    # from the normal eligible frame set: they prove only
+                    # that the attributed page was shown.  The immutable
+                    # relation plus exact Frame -> OCR/Vision parent graph is
+                    # their narrow admission boundary.
+                    and (displayed_secondary or frame_id in set(getattr(crosscheck, "eligible_frame_ids", ()) or ()))
                 ):
                     return
         raise ReplayIntegrityError(

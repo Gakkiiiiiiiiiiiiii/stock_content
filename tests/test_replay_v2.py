@@ -98,7 +98,12 @@ def _snapshot(artifact_ids, *, store=None):
     )
 
 
-def _cs_8b_multimodal_snapshot(*, visual_source_id="frame-8b", include_visual_source=True):
+def _cs_8b_multimodal_snapshot(
+    *,
+    visual_source_id="frame-8b",
+    include_visual_source=True,
+    crosscheck_relation="SUPPORTS",
+):
     """The persisted cs-8b shape: visual evidence is admitted by crosscheck.
 
     The EvidenceArtifact itself predates copying selected visual parents into
@@ -133,10 +138,11 @@ def _cs_8b_multimodal_snapshot(*, visual_source_id="frame-8b", include_visual_so
     crosscheck = TranscriptVisualCrosscheckArtifact(
         artifact_id="crosscheck-8b", artifact_type="transcript_visual_crosscheck",
         transcript_artifact_id=transcript.artifact_id, semantic_segment_artifact_id=semantic.artifact_id,
-        crosscheck_version="crosscheck.v1", eligible_frame_ids=(frame.frame_id,),
+        crosscheck_version="crosscheck.v1",
+        eligible_frame_ids=(frame.frame_id,) if crosscheck_relation in {"SUPPORTS", "CONTRADICTS"} else (),
         relations=(TranscriptVisualCrosscheckRecord(
             frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id,
-            timestamp_ms=frame.timestamp_ms, relation="SUPPORTS",
+            timestamp_ms=frame.timestamp_ms, relation=crosscheck_relation,
         ),),
         parent_artifact_ids=(
             transcript.artifact_id, semantic.artifact_id, frame.artifact_id, ocr.artifact_id, vision.artifact_id,
@@ -308,6 +314,49 @@ def test_cs_8b_shape_accepts_sealed_frame_ocr_and_vision_evidence_for_replay():
 
     assert result["identity_match"] is True
     assert result["artifact_validation"]["checked"] is True
+
+
+def test_cs_8b_shape_accepts_sealed_displayed_secondary_visual_evidence_for_replay():
+    snapshots, snapshot, artifacts = _cs_8b_multimodal_snapshot(
+        crosscheck_relation="SUPPORTS_DISPLAYED_SECONDARY"
+    )
+
+    result = ReplayService(snapshots, artifact_repository=artifacts).replay(snapshot.content_snapshot_id)
+
+    assert result["identity_match"] is True
+    assert result["artifact_validation"]["checked"] is True
+
+
+def test_migration_replay_accepts_sealed_displayed_secondary_visual_evidence():
+    snapshots, snapshot, artifacts = _cs_8b_multimodal_snapshot(
+        crosscheck_relation="SUPPORTS_DISPLAYED_SECONDARY"
+    )
+
+    class FixtureArtifacts(ArtifactRepo):
+        def find_task_options_for_snapshot(self, _artifact_ids):
+            return {"offline_fixture": True}
+
+    class ReplayPipeline:
+        def process(self, context):
+            context.state.content_snapshot_id = snapshot.content_snapshot_id
+            return context
+
+    result = ReplayService(
+        snapshots,
+        artifact_repository=FixtureArtifacts(artifacts.items.values()),
+        pipeline=ReplayPipeline(),
+    ).replay(snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v4.043.audit")
+
+    assert result["mode"] == "MIGRATION_REPLAY"
+    assert "error" not in result
+
+
+def test_cs_8b_shape_rejects_visual_evidence_without_an_admitted_relation():
+    snapshots, snapshot, artifacts = _cs_8b_multimodal_snapshot(crosscheck_relation="UNRELATED")
+
+    result = ReplayService(snapshots, artifact_repository=artifacts).replay(snapshot.content_snapshot_id)
+
+    assert result["error"] == "REPLAY_LINEAGE_REFERENCE_INVALID"
 
 
 @pytest.mark.parametrize(
