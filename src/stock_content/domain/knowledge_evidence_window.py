@@ -7,11 +7,12 @@ only use these plans to *add* visual corroboration.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
-from .artifacts import TranscriptArtifact
+from .artifacts import TranscriptArtifact, canonical_json
 from .semantic_segment import SemanticSegment
 
 KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION = "knowledge-evidence-window.v1"
@@ -42,6 +43,10 @@ class KnowledgeEvidenceWindow:
     transcript_segment_ids: tuple[str, ...]
     high_signals: tuple[HighSignal, ...]
     planner_version: str = KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION
+    # A semantic segment can contain several unrelated atomic propositions.
+    # This opaque, deterministic identity keeps their visual plans distinct
+    # without putting source text into a frame request.
+    knowledge_identity: str = ""
 
 
 _SIGNAL_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
@@ -142,6 +147,70 @@ class KnowledgeEvidenceWindowPlanner:
                 )
             )
         return tuple(sorted(output, key=lambda item: (item.start_ms, item.end_ms, item.semantic_segment_id)))
+
+    def plan_claim_drafts(
+        self,
+        transcript: TranscriptArtifact,
+        claim_drafts: Iterable[Any],
+        *,
+        media_duration_ms: int | None = None,
+    ) -> tuple[KnowledgeEvidenceWindow, ...]:
+        """Plan one visual window per transcript-grounded atomic draft.
+
+        This is intentionally before OCR/vision.  It uses only accepted
+        transcript coordinates, so visual material cannot influence which
+        proposition is selected or where its evidence window begins.
+        """
+        if media_duration_ms is not None and media_duration_ms < 0:
+            raise ValueError("media_duration_ms must be non-negative")
+        duration_ms = (
+            media_duration_ms
+            if media_duration_ms is not None
+            else max((item.end_ms for item in transcript.segments), default=0)
+        )
+        by_index = {item.segment_index: item for item in transcript.segments}
+        output: list[KnowledgeEvidenceWindow] = []
+        seen: set[str] = set()
+        for draft in claim_drafts:
+            semantic_id = str(getattr(draft, "semantic_segment_id", "") or "")
+            indices = tuple(
+                sorted(
+                    {int(value) for value in getattr(draft, "evidence_segment_indices", ()) if int(value) in by_index}
+                )
+            )
+            if not semantic_id or not indices:
+                # An atomic draft without transcript coordinates is never a
+                # visual-planning authority; later grounding will reject it.
+                continue
+            selected = tuple(by_index[index] for index in indices)
+            identity_payload = {
+                "semantic_segment_id": semantic_id,
+                "evidence_segment_indices": indices,
+                "normalized_statement": str(
+                    getattr(draft, "normalized_statement", "") or getattr(draft, "conclusion", "")
+                ),
+            }
+            knowledge_identity = (
+                "kd_" + hashlib.sha256(canonical_json(identity_payload).encode("utf-8")).hexdigest()[:57]
+            )
+            if knowledge_identity in seen:
+                continue
+            seen.add(knowledge_identity)
+            spoken_start = self._clamp(min(item.start_ms for item in selected), duration_ms)
+            spoken_end = self._clamp(max(item.end_ms for item in selected), duration_ms)
+            output.append(
+                KnowledgeEvidenceWindow(
+                    semantic_segment_id=semantic_id,
+                    start_ms=self._clamp(spoken_start - self._padding_ms, duration_ms),
+                    end_ms=self._clamp(spoken_end + self._padding_ms, duration_ms),
+                    center_ms=self._clamp((spoken_start + spoken_end) // 2, duration_ms),
+                    transcript_segment_ids=tuple(item.segment_id for item in selected),
+                    high_signals=self._signals(selected),
+                    planner_version=self._planner_version,
+                    knowledge_identity=knowledge_identity,
+                )
+            )
+        return tuple(sorted(output, key=lambda item: (item.start_ms, item.end_ms, item.knowledge_identity)))
 
     @staticmethod
     def _clamp(value: int, duration_ms: int) -> int:

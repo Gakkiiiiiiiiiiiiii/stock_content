@@ -78,6 +78,9 @@ class PipelineState:
     transcript: str = ""
     frames: list[Any] = field(default_factory=list)
     knowledge_evidence_windows: list[Any] = field(default_factory=list)
+    # Indexed by draft order, populated by transcript-only claim-directed
+    # planning and consumed only after visual cross-check admission.
+    claim_evidence_window_ids: dict[int, tuple[str, ...]] = field(default_factory=dict)
     frame_insights: list[dict[str, Any]] = field(default_factory=list)
     ocr_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Internal audit records only.  These do not change transcript or Bundle.

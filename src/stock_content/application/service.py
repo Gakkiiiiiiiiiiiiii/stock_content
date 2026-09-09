@@ -84,6 +84,7 @@ _OCR_RUNTIME_BOUND_STAGES = frozenset(
         "ocr",
         "vision",
         "transcript_visual_crosscheck",
+        "claim_visual_binding",
         "multimodal_context",
         "temporal_window",
         "semantic_context",

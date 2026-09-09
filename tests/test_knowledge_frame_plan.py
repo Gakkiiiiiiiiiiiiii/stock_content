@@ -1,6 +1,12 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
-from stock_content.domain.knowledge_evidence_window import HighSignal, KnowledgeEvidenceWindow
+from stock_content.domain.artifacts import TranscriptArtifact, TranscriptSegmentItem
+from stock_content.domain.knowledge_evidence_window import (
+    HighSignal,
+    KnowledgeEvidenceWindow,
+    KnowledgeEvidenceWindowPlanner,
+)
 from stock_content.domain.knowledge_frame_plan import (
     HIGH_SIGNAL,
     KNOWLEDGE_CENTER,
@@ -77,3 +83,41 @@ def test_frame_identity_binds_media_timestamp_reason_version_and_window_identity
     assert same != frame_id_for(media_artifact_id="media-content-a", request=changed_reason)
     assert evidence_window_id(window).startswith("kew_")
     assert "https://" not in repr(request)
+
+
+def test_claim_directed_windows_keep_unrelated_drafts_in_one_semantic_segment_distinct():
+    transcript = TranscriptArtifact(
+        artifact_id="transcript",
+        artifact_type="transcript",
+        media_artifact_id="media",
+        asr_model="fixture",
+        asr_model_version="1",
+        segments=[
+            TranscriptSegmentItem(segment_index=0, start_seconds=10, end_seconds=12, text="第一个知识点"),
+            TranscriptSegmentItem(segment_index=1, start_seconds=100, end_seconds=102, text="第二个知识点 2030年"),
+        ],
+    )
+    windows = KnowledgeEvidenceWindowPlanner().plan_claim_drafts(
+        transcript,
+        [
+            SimpleNamespace(
+                semantic_segment_id="semantic-long", evidence_segment_indices=[0], normalized_statement="第一"
+            ),
+            SimpleNamespace(
+                semantic_segment_id="semantic-long", evidence_segment_indices=[1], normalized_statement="第二"
+            ),
+        ],
+        media_duration_ms=120_000,
+    )
+
+    assert len(windows) == 2
+    assert [item.center_ms for item in windows] == [11_000, 101_000]
+    assert len({evidence_window_id(item) for item in windows}) == 2
+    plan = KnowledgeFramePlanner(max_frames_per_media=120).plan(windows, media_duration_ms=120_000)
+    by_window = {
+        window_id: [request.timestamp_ms for request in plan if window_id in request.evidence_window_ids]
+        for window_id in {evidence_window_id(item) for item in windows}
+    }
+    assert by_window[evidence_window_id(windows[0])] == [10_000, 11_000, 12_000]
+    assert 101_000 in by_window[evidence_window_id(windows[1])]
+    assert len(by_window[evidence_window_id(windows[1])]) == 7  # date cue -> dense +/-1..3 seconds

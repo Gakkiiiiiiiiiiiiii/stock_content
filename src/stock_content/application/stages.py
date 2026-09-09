@@ -43,7 +43,7 @@ from stock_content.domain.atomic_claim_extractor import AtomicClaimExtractor
 from stock_content.domain.atomic_claim_validator import AtomicClaimDraftValidator
 from stock_content.domain.chapter import ChapterSegmenter
 from stock_content.domain.claim_canonicalizer import ClaimCanonicalizer
-from stock_content.domain.claim_draft import ClaimOccurrenceDraft, TemporalExpressionDraft
+from stock_content.domain.claim_draft import ClaimOccurrenceDraft, TemporalExpressionDraft, VisualEvidenceAnchor
 from stock_content.domain.claim_draft_grounder import ClaimDraftGrounder
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.claim_occurrence import ClaimOccurrence
@@ -58,7 +58,12 @@ from stock_content.domain.initial_verification import build_initial_verification
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindowPlanner
-from stock_content.domain.knowledge_frame_plan import KnowledgeFramePlanner, frame_id_for, request_id_for
+from stock_content.domain.knowledge_frame_plan import (
+    KnowledgeFramePlanner,
+    evidence_window_id,
+    frame_id_for,
+    request_id_for,
+)
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
 from stock_content.domain.knowledge_semantics import atomic_statement, bundle_v2_semantics
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
@@ -1700,12 +1705,32 @@ class KnowledgeDirectedFrameExtractionStage:
         media = context.artifacts.media
         if transcript is None or media is None:
             raise ValueError("knowledge-directed frame extraction requires media and transcript artifacts")
-        windows = self._window_planner.plan(
-            transcript,
-            context.state.semantic_segments,
-            media_duration_ms=_duration_ms(context),
+        drafts = list(context.state.get("claim_drafts") or ())
+        windows = (
+            self._window_planner.plan_claim_drafts(transcript, drafts, media_duration_ms=_duration_ms(context))
+            if drafts
+            else self._window_planner.plan(
+                transcript, context.state.semantic_segments, media_duration_ms=_duration_ms(context)
+            )
         )
         context.state.knowledge_evidence_windows = list(windows)
+        draft_window_ids: dict[int, tuple[str, ...]] = {}
+        for index, draft in enumerate(drafts):
+            indices = tuple(sorted({int(value) for value in draft.evidence_segment_indices}))
+            matching = [
+                window
+                for window in windows
+                if window.semantic_segment_id == draft.semantic_segment_id
+                and tuple(
+                    item.segment_index
+                    for item in transcript.segments
+                    if item.segment_id in window.transcript_segment_ids
+                )
+                == indices
+            ]
+            if matching:
+                draft_window_ids[index] = tuple(evidence_window_id(item) for item in matching)
+        context.state.claim_evidence_window_ids = draft_window_ids
         requests = self._frame_planner.plan(windows, media_duration_ms=_duration_ms(context))
         if context.runtime.video_path is None:
             return StageResult(context=context)
@@ -1805,6 +1830,75 @@ class SemanticContextStage:
             for segment in context.state.get("semantic_segments") or ()
         ]
         context.state["semantic_contexts"] = contexts
+        return _stage_result(context)
+
+
+class ClaimVisualBindingStage:
+    """Bind only cross-check-admitted targeted visual artifacts to each draft.
+
+    The draft was validated before visual processing.  This stage cannot add a
+    proposition or alter transcript coordinates; it simply records the exact
+    Frame/OCR/Vision artifact evidence that supports or contradicts that
+    already-grounded occurrence window.
+    """
+
+    name = "claim_visual_binding"
+    required_inputs = ("semantic_segments", "transcript_visual_crosscheck")
+    output_types = ()
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        admitted = {
+            str(item.get("frame_id") or "")
+            for item in context.state.get("transcript_visual_crosschecks") or ()
+            if item.get("relation") in {"SUPPORTS", "CONTRADICTS"}
+        }
+        frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in admitted}
+        ocr_by_frame: dict[str, list[OCRArtifact]] = {}
+        for item in context.artifacts.ocr:
+            if item.frame_id in frames and item.text:
+                ocr_by_frame.setdefault(item.frame_id, []).append(item)
+        vision_by_frame: dict[str, list[VisionArtifact]] = {}
+        for item in context.artifacts.vision:
+            if item.frame_id in frames and (item.label or item.labels):
+                vision_by_frame.setdefault(item.frame_id, []).append(item)
+        bound: list[ClaimOccurrenceDraft] = []
+        for index, draft in enumerate(context.state.get("claim_drafts") or ()):
+            window_ids = set(context.state.claim_evidence_window_ids.get(index, ()))
+            anchors: list[VisualEvidenceAnchor] = []
+            for frame in sorted(frames.values(), key=lambda item: (item.timestamp_ms, item.frame_id)):
+                if not window_ids.intersection(frame.evidence_window_ids):
+                    continue
+                ocr = next(iter(ocr_by_frame.get(frame.frame_id, ())), None)
+                if ocr is not None:
+                    anchors.append(
+                        VisualEvidenceAnchor(
+                            frame_id=frame.frame_id,
+                            timestamp_ms=frame.timestamp_ms,
+                            bbox=tuple(float(value) for value in (ocr.bbox or (0, 0, 0, 0))),
+                            ocr_text=ocr.text,
+                            model_id=ocr.engine,
+                            model_version=ocr.engine_version,
+                            confidence=float(ocr.confidence_score or 0.0),
+                            support_type="OCR",
+                        )
+                    )
+                    continue
+                vision = next(iter(vision_by_frame.get(frame.frame_id, ())), None)
+                if vision is not None:
+                    anchors.append(
+                        VisualEvidenceAnchor(
+                            frame_id=frame.frame_id,
+                            timestamp_ms=frame.timestamp_ms,
+                            bbox=(0.0, 0.0, 0.0, 0.0),
+                            visual_label=vision.label or vision.labels[0],
+                            model_id=vision.model_name,
+                            model_version=vision.model_version,
+                            confidence=float(vision.confidence_score or 0.0),
+                            support_type="LABEL",
+                        )
+                    )
+            bound.append(draft.model_copy(update={"visual_anchors": anchors}))
+        context.state.claim_drafts = bound
         return _stage_result(context)
 
 

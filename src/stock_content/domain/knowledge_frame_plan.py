@@ -47,6 +47,7 @@ def evidence_window_id(window: KnowledgeEvidenceWindow) -> str:
             (item.kind, item.reason, item.transcript_segment_ids) for item in window.high_signals
         ],
         "planner_version": window.planner_version,
+        "knowledge_identity": window.knowledge_identity,
     }
     return "kew_" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:57]
 

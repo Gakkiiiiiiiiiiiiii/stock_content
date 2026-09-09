@@ -64,6 +64,7 @@ from stock_content.application.stages import (
     ClaimCanonicalizationStage,
     ClaimOccurrencePersistenceStage,
     ClaimPersistenceStage,
+    ClaimVisualBindingStage,
     DownloadStage,
     EvidenceGroundingStage,
     FinancialEnrichmentStage,
@@ -132,22 +133,25 @@ STAGE_VERSIONS: dict[str, str] = {
     "transcript_quality": "2.0.0",
     "diarization": "1.0.0",
     "transcript_postprocess": "1.0.0",
-    # C3 moves visual consumers after transcript-planned knowledge frames.
+    # C4 plans frames from accepted transcript-grounded atomic drafts.  Every
+    # affected visual checkpoint is invalidated rather than treating a former
+    # semantic-wide sample as claim-directed visual provenance.
     # Bumping their checkpoint identities prevents resume from accepting
     # pre-targeted OCR/vision context as if it covered the complete frame set.
     # GPU runtime/device identity is now a checkpoint input. Pre-isolation
     # (including CPU) OCR results cannot resume into a required-GPU task.
-    "ocr": "5.0.0",
-    "vision": "4.0.0",
-    "transcript_visual_crosscheck": "3.0.0",
-    "multimodal_context": "5.0.0",
+    "ocr": "6.0.0",
+    "vision": "5.0.0",
+    "transcript_visual_crosscheck": "4.0.0",
+    "claim_visual_binding": "1.0.0",
+    "multimodal_context": "6.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
-    "knowledge_frame": "3.0.0",
+    "knowledge_frame": "4.0.0",
     "visual_evidence_policy": "1.0.0",
-    "semantic_context": "4.0.0",
-    "atomic_claim_extraction": "1.0.0",
-    "atomic_claim_validation": "1.0.0",
+    "semantic_context": "5.0.0",
+    "atomic_claim_extraction": "2.0.0",
+    "atomic_claim_validation": "2.0.0",
     "evidence_grounding": "1.0.0",
     "temporal_normalization": "final.1.0",
     "claim_canonicalization": "1.0.0",
@@ -468,10 +472,23 @@ def build_application(
     )
     semantic_enabled = bool(config["semantic_segmentation_enabled"])
     legacy_enabled = bool(config["legacy_chapter_extraction_enabled"]) or not semantic_enabled
+    # Atomic extraction/validation is deliberately text-first.  It supplies
+    # only transcript-grounded draft coordinates to targeted-frame planning;
+    # visual consumers later corroborate or contradict, never select, claims.
+    claim_planning_stages = (
+        [
+            SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
+            AtomicClaimExtractionStage(extractor=atomic_extractor),
+            AtomicClaimValidationStage(),
+        ]
+        if semantic_enabled
+        else []
+    )
     semantic_stages = (
         [
             ChapterStage(ChapterSegmenter()),
             SemanticSegmentationStage(segmenter=semantic_segmenter, repository=semantic_segments),
+            *claim_planning_stages,
             KnowledgeDirectedFrameExtractionStage(
                 FfmpegFrameExtractor(),
                 window_planner=KnowledgeEvidenceWindowPlanner(
@@ -489,9 +506,6 @@ def build_application(
     compatibility_stages = [] if semantic_enabled else [ChapterStage(ChapterSegmenter())]
     semantic_claim_stages = (
         [
-            SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
-            AtomicClaimExtractionStage(extractor=atomic_extractor),
-            AtomicClaimValidationStage(),
             EvidenceGroundingStage(),
             TemporalNormalizationStage(
                 normalization_version=str(config["temporal_normalization_version"]),
@@ -525,6 +539,7 @@ def build_application(
         TranscriptVisualCrosscheckStage(
             TranscriptVisualCrossChecker(version=str(config["transcript_visual_crosscheck_version"]))
         ),
+        ClaimVisualBindingStage(),
         MultimodalContextStage(MultimodalContextBuilder()),
         TemporalWindowStage(TemporalWindowBuilder()),
         *compatibility_stages,
