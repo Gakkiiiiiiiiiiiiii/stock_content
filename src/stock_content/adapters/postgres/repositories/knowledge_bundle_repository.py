@@ -26,6 +26,7 @@ from stock_content.adapters.postgres.models import (
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.knowledge_bundle import V2_CONTRACT, KnowledgeBundleRequest, sha256
+from stock_content.domain.knowledge_semantics import bundle_v2_semantics
 from stock_content.ports.repositories import IdempotencyConflict
 
 
@@ -505,22 +506,16 @@ def _v2_semantics(claim: FinancialClaimRow, occurrence: ClaimOccurrenceRow) -> d
             "status": "HUMAN_REVIEW_REQUIRED" if conflict_reasons else "NOT_REQUIRED",
             "reason_codes": conflict_reasons,
         }
-    return {
-        "primary_domain": str(semantic.get("primary_domain") or "UNKNOWN"),
-        "claim_nature": nature,
-        "attribution": dict(semantic.get("attribution") or {
-            "attributed": nature in {"OPINION", "FORECAST", "CAUSAL_THESIS"},
-            "source_label": "source_material" if nature in {"OPINION", "FORECAST", "CAUSAL_THESIS"} else None,
-        }),
-        "source_grade": str(semantic.get("source_grade") or "UNKNOWN"),
-        "detail": dict(semantic.get("detail") or {}),
-        "temporal": dict(semantic.get("temporal") or {
-            "kind": "UNKNOWN", "start": None, "end": None, "as_of": None,
-            "rule": None, "label": None, "precision": "UNKNOWN", "explicitly_unknown": True,
-        }),
-        "occurrence_review": review,
-        "external_truth_status": str(semantic.get("external_truth_status") or "NOT_CHECKED"),
-    }
+    # Reapply the envelope normalizer when projecting persisted rows.  The
+    # immutable snapshot may predate a wire-level normalizer release; Bundle
+    # publication must still never emit a bare calendar string such as
+    # ``"2030"`` into a RFC3339 field.  This is a deterministic projection,
+    # not a mutation of source evidence or business-time authority.
+    return bundle_v2_semantics(
+        statement=claim.normalized_statement or claim.predicate,
+        claim_type=claim.claim_type,
+        supplied={**semantic, "claim_nature": nature, "occurrence_review": review},
+    )
 
 
 def _v2_evidence(

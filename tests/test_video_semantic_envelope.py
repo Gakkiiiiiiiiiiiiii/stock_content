@@ -67,6 +67,64 @@ def test_semantic_envelope_strips_presentation_framing_and_keeps_unknown_year_un
     assert envelope["external_truth_status"] == "NOT_CHECKED"
 
 
+def test_semantic_envelope_normalizes_a_bare_forecast_year_to_a_utc_target_interval():
+    envelope = bundle_v2_semantics(
+        statement="信息基础设施投资预计到2030年达到三万亿元。",
+        claim_type="FORECAST",
+        supplied={
+            "temporal": {
+                "kind": "FORECAST_TARGET",
+                "start": "2030",
+                "end": None,
+                "as_of": None,
+                "rule": None,
+                "label": "2030",
+                "precision": "YEAR",
+                "explicitly_unknown": False,
+            }
+        },
+    )
+    assert envelope["temporal"] == {
+        "kind": "FORECAST_TARGET",
+        "start": "2030-01-01T00:00:00Z",
+        "end": "2030-12-31T23:59:59.999999Z",
+        "as_of": None,
+        "rule": None,
+        "label": "2030",
+        "precision": "YEAR",
+        "explicitly_unknown": False,
+    }
+
+
+def test_semantic_envelope_does_not_invent_a_year_for_an_as_of_month_end():
+    envelope = bundle_v2_semantics(
+        statement="截至8月末黄金储备增加。",
+        claim_type="OPINION",
+        supplied={
+            "temporal": {
+                "kind": "AS_OF",
+                "start": None,
+                "end": None,
+                "as_of": "8月末",
+                "rule": None,
+                "label": None,
+                "precision": "MONTH",
+                "explicitly_unknown": False,
+            }
+        },
+    )
+    assert envelope["temporal"] == {
+        "kind": "AS_OF",
+        "start": None,
+        "end": None,
+        "as_of": None,
+        "rule": None,
+        "label": "8月末",
+        "precision": "YEAR_UNSPECIFIED",
+        "explicitly_unknown": False,
+    }
+
+
 def test_producer_persists_occurrence_owned_frame_ocr_and_vision_evidence(tmp_path):
     context = PipelineContext(
         task_id="semantic-envelope",

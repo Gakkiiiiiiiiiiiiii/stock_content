@@ -7,6 +7,7 @@ import sys
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,7 @@ from stock_content.adapters.postgres.repositories.claim_event_repository import 
 from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
     PostgresKnowledgeBundleAuthority,
     PostgresKnowledgeBundleRepository,
+    _v2_semantics,
 )
 from stock_content.application.knowledge_bundle_service import BundleProducerMetadata, KnowledgeBundleService
 from stock_content.domain.artifacts import EvidenceItem
@@ -159,6 +161,37 @@ def test_sql_bundle_authority_fails_closed_without_claim_history(tmp_path):
     database, _ = _authority_with_snapshot(tmp_path, events=False)
     with pytest.raises(ValueError, match="HISTORICAL_CLAIM_AUTHORITY_MISSING"):
         PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(_request())
+
+
+def test_v2_sql_projection_normalizes_legacy_bare_year_without_mutating_its_snapshot_payload():
+    raw_temporal = {
+        "kind": "FORECAST_TARGET", "start": "2030", "end": None, "as_of": None,
+        "rule": None, "label": "2030", "precision": "YEAR", "explicitly_unknown": False,
+    }
+    semantic = _v2_semantics(
+        SimpleNamespace(
+            payload={
+                "bundle_v2": {
+                    "claim_nature": "FORECAST",
+                    "primary_domain": "INFORMATION_INFRASTRUCTURE_POLICY",
+                    "attribution": {"attributed": True, "source_label": "source_speaker"},
+                    "source_grade": "SOURCE_ASSERTION",
+                    "detail": {"explanation": "目标对应信息基础设施建设需求。"},
+                    "temporal": raw_temporal,
+                    "external_truth_status": "NOT_CHECKED",
+                }
+            },
+            fact_category="FORECAST",
+            claim_type="FORECAST",
+            grounding_reason_codes=[],
+            normalized_statement="信息基础设施投资预计到2030年达到三万亿元",
+            predicate="investment_target",
+        ),
+        SimpleNamespace(provenance={}),
+    )
+    assert semantic["temporal"]["start"] == "2030-01-01T00:00:00Z"
+    assert semantic["temporal"]["end"] == "2030-12-31T23:59:59.999999Z"
+    assert raw_temporal["start"] == "2030"
 
 
 def test_production_sql_evidence_item_bundle_uses_consumer_canonical_quote_hash(tmp_path):
