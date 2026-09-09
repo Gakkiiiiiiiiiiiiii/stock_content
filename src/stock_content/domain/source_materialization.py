@@ -37,6 +37,10 @@ class SubtitleTrack(BaseModel):
 class ResolvedSource(BaseModel):
     source_type: str
     canonical_source_ref: str
+    # A stable, secret-free public page projection.  It is intentionally
+    # separate from ``canonical_source_ref`` because Xiaoe queues a compact
+    # product/lesson identity rather than a browser URL.
+    canonical_url: str | None = None
     source_identity_hash: str
     platform_id: str
     part_id: str | None = None

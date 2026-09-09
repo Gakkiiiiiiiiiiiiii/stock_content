@@ -82,6 +82,35 @@ def test_external_source_ref_never_becomes_retention_locator(tmp_path, monkeypat
         assert session.get(RetentionArtifactLocatorRow, source.artifact_id) is None
 
 
+def test_xiaoe_page_metadata_keeps_only_its_public_product_identity(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'xiaoe-content.db'}")
+    database.create_schema()
+    source = _source(str(tmp_path / "raw.mp4"))
+    source = SourceArtifact(**{
+        **source.__dict__,
+        "source_type": "xiaoe",
+        "source_ref": "p_123/v_456",
+        "content_hash": "",
+        "source_metadata": {
+            **source.source_metadata,
+            "canonical_url": (
+                "https://tenant.h5.xiaoeknow.com/p/course/video/v_456"
+                "?product_id=p_123&signature=must-not-persist"
+            ),
+        },
+    })
+    source = SourceArtifact(**{**source.__dict__, "artifact_id": artifact_id_of(source)})
+    SqlArtifactRepository(database.session_factory).put(source)
+
+    with database.session_factory() as session:
+        metadata = session.get(SourceArtifactMetadataRow, source.artifact_id)
+    assert metadata is not None
+    assert metadata.canonical_url == (
+        "https://tenant.h5.xiaoeknow.com/p/course/video/v_456?product_id=p_123"
+    )
+    assert "signature" not in repr(metadata)
+
+
 def test_nonexistent_retention_root_is_never_reported_ready(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTENT_RETENTION_ENABLED", "true")
     monkeypatch.setenv("CONTENT_RETENTION_PRIVATE_ROOT", str(tmp_path / "missing"))

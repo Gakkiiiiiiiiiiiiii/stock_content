@@ -76,6 +76,7 @@ from stock_content.domain.semantic_context_builder import SemanticContextBuilder
 from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
 from stock_content.domain.source_policy import policy_for_source
+from stock_content.domain.source_url import canonical_public_source_url
 from stock_content.domain.summary import SummaryGenerator
 from stock_content.domain.temporal_normalizer import TemporalNormalizer
 from stock_content.domain.temporal_semantics import (
@@ -240,16 +241,13 @@ def _refresh_source_artifact(context: PipelineContext, raw_hash: str, length: in
     metadata = dict(existing.source_metadata if existing else context.state.metadata)
     # Materializers expose only a public projection. Normalize the finite
     # provenance fields while runtime-only stream URLs remain out of it.
-    canonical_ref = metadata.get("canonical_source_ref") or metadata.get("canonical_url")
+    # ``canonical_source_ref`` is intentionally a compact Xiaoe
+    # product/lesson identity, not a public browser URL.  Prefer the explicit
+    # resolver-provided page projection when it exists.
+    canonical_ref = metadata.get("canonical_url") or metadata.get("canonical_source_ref")
     if not canonical_ref and source_type == "bilibili" and str(source_ref).upper().startswith("BV"):
         canonical_ref = f"https://www.bilibili.com/video/{source_ref.upper()}"
-    if isinstance(canonical_ref, str) and canonical_ref.startswith(("https://", "http://")):
-        from urllib.parse import urlsplit, urlunsplit
-
-        parsed = urlsplit(canonical_ref)
-        canonical_ref = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-    else:
-        canonical_ref = None
+    canonical_ref = canonical_public_source_url(source_type, canonical_ref)
     metadata.update(
         {
             "canonical_url": canonical_ref,

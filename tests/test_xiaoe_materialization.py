@@ -11,12 +11,17 @@ from pydantic import SecretStr
 import stock_content.adapters.sources.xiaoe_materializer as materializer_module
 from stock_content.adapters.browser.playwright_session import CapturedResponse, PageCapture
 from stock_content.adapters.credentials.file_secret_provider import FileSecretProvider
-from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer
+from stock_content.adapters.postgres.database import Database
+from stock_content.adapters.postgres.models import SourceArtifactMetadataRow
+from stock_content.adapters.postgres.repositories.artifact_repository import SqlArtifactRepository
+from stock_content.adapters.sources.bilibili_materializer import BilibiliMaterializer, MaterializedMedia
 from stock_content.adapters.sources.dash_materializer import DashLocalizer, DashMaterializationError
 from stock_content.adapters.sources.security import HlsResourceLimitError, SourceDownloadHTTPError, UnsafeSourceURL
 from stock_content.adapters.sources.xiaoe import XiaoeHlsSourceAdapter
 from stock_content.adapters.sources.xiaoe_materializer import XiaoeMaterializationError, XiaoeMaterializer
 from stock_content.adapters.sources.xiaoe_page import XiaoeHlsResolver, XiaoePageResolver, XiaoeResolutionError
+from stock_content.application.pipeline import PipelineContext
+from stock_content.application.stages import DownloadStage, ResolveSourceStage
 from stock_content.domain.source_materialization import MediaStream, ResolvedSource, SourceMaterialization
 
 
@@ -87,6 +92,84 @@ def test_page_resolution_uses_hash_selected_state_and_keeps_all_locators_secret(
     assert "secret-url-canary" not in projection
     assert "secret-cookie-canary" not in projection
     assert "secret-url-canary" not in repr(materialization)
+
+
+def test_page_resolution_projects_the_safe_canonical_course_page(monkeypatch, tmp_path: Path) -> None:
+    """The queued course/lesson identity is not itself Bundle provenance."""
+    import stock_content.adapters.sources.xiaoe_page as page_module
+
+    monkeypatch.setattr(page_module, "validate_source_url", lambda value, **_: value)
+    provider, reference_hash = _provider(tmp_path)
+    resolver = XiaoePageResolver(
+        credential_provider=provider,
+        browser=_Browser(_capture()),
+        allowed_domains=frozenset({"example.test", "xiaoe-tech.com"}),
+        public_url_for=lambda _: (
+            "https://tenant.h5.xiaoeknow.com/p/course/video/lesson-2"
+            "?product_id=course-1&tracking=must-not-persist"
+        ),
+    )
+    materialization = resolver.resolve("course-1/lesson-2", credential_ref_hash=reference_hash)
+
+    assert materialization.public.canonical_url == (
+        "https://tenant.h5.xiaoeknow.com/p/course/video/lesson-2?product_id=course-1"
+    )
+    assert "tracking" not in materialization.model_dump_json()
+
+
+def test_resolve_download_and_sql_provenance_keep_xiaoe_public_page_only(monkeypatch, tmp_path: Path) -> None:
+    """Exercise the real resolver → SourceArtifact → SQL metadata boundary."""
+    import stock_content.adapters.sources.xiaoe_page as page_module
+
+    monkeypatch.setattr(page_module, "validate_source_url", lambda value, **_: value)
+    provider, reference_hash = _provider(tmp_path)
+    resolver = XiaoePageResolver(
+        credential_provider=provider,
+        browser=_Browser(_capture()),
+        allowed_domains=frozenset({"example.test", "xiaoe-tech.com"}),
+        public_url_for=lambda _: (
+            "https://tenant.h5.xiaoeknow.com/p/course/video/lesson-2"
+            "?product_id=course-1&signature=must-not-persist"
+        ),
+    )
+
+    class Adapter:
+        def resolve_materialization(self, source_ref: str, **_: object) -> SourceMaterialization:
+            return resolver.resolve(source_ref, credential_ref_hash=reference_hash)
+
+        def materialize(self, _: SourceMaterialization, directory: Path, **__: object) -> MaterializedMedia:
+            media = directory / "source.mp4"
+            media.write_bytes(b"safe-media")
+            return MaterializedMedia(media, hashlib.sha256(b"safe-media").hexdigest(), 1.0, {})
+
+    context = PipelineContext(
+        "xiaoe-safe-page",
+        source={"type": "xiaoe", "ref": "course-1/lesson-2"},
+        options={
+            "credential_ref_hash": reference_hash,
+            "source_artifact_metadata_required": True,
+            "source_policy_version": "source-policy.v1",
+            "retention_class": "standard",
+            "access_classification": "RESTRICTED",
+            "raw_storage_dir": str(tmp_path / "raw"),
+        },
+    )
+    adapter = Adapter()
+    ResolveSourceStage({"xiaoe": adapter}).execute(context)
+    DownloadStage({"xiaoe": adapter}, work_root=tmp_path).execute(context)
+    source = context.artifacts.source
+    assert source is not None
+    expected_url = "https://tenant.h5.xiaoeknow.com/p/course/video/lesson-2?product_id=course-1"
+    assert source.source_metadata["canonical_url"] == expected_url
+    assert "signature" not in repr(source)
+
+    database = Database(f"sqlite:///{tmp_path / 'provenance.db'}")
+    database.create_schema()
+    SqlArtifactRepository(database.session_factory).put(source)
+    with database.session_factory() as session:
+        row = session.get(SourceArtifactMetadataRow, source.artifact_id)
+    assert row is not None and row.canonical_url == expected_url
+    assert "signature" not in repr(row)
 
 
 def test_signed_hls_secret_reference_is_resolved_at_worker_and_can_reresolve(

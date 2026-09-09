@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import SecretStr
@@ -18,6 +19,7 @@ from stock_content.domain.source_materialization import (
     SourceMaterialization,
     SubtitleTrack,
 )
+from stock_content.domain.source_url import canonical_public_source_url
 
 _XIAOE_BASE_DOMAINS = frozenset({"xiaoe-tech.com", "m.xiaoe-tech.com"})
 _IDENTITY = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
@@ -67,10 +69,12 @@ class XiaoePageResolver:
         credential_provider: FileSecretProvider,
         browser: PlaywrightSession,
         allowed_domains: frozenset[str] | None = None,
+        public_url_for: Callable[[str], str] | None = None,
     ) -> None:
         self._credential_provider = credential_provider
         self._browser = browser
         self._allowed_domains = allowed_domains or xiaoe_allowed_domains()
+        self._public_url_for = public_url_for
 
     def resolve(self, source_identity: str, *, credential_ref_hash: str | None) -> SourceMaterialization:
         try:
@@ -118,8 +122,13 @@ class XiaoePageResolver:
                 track_id=f"subtitle-{index}", language="und", source="official", format="vtt",
                 url=subtitle.url, headers=_safe_headers(subtitle.headers),
             ))
+        canonical_url = (
+            canonical_public_source_url("xiaoe", self._public_url_for(source_identity))
+            if self._public_url_for is not None
+            else None
+        )
         public = ResolvedSource(
-            source_type="xiaoe", canonical_source_ref=source_identity,
+            source_type="xiaoe", canonical_source_ref=source_identity, canonical_url=canonical_url,
             source_identity_hash=hashlib.sha256(f"xiaoe:{source_identity}".encode()).hexdigest(),
             platform_id=capture.course_id, part_id=capture.lesson_id, title=capture.title,
             author=capture.author, published_at=capture.published_at, duration_seconds=capture.duration_seconds,
@@ -144,7 +153,7 @@ class XiaoeHlsResolver:
         public_url = _public_url(source_url)
         title = urlsplit(public_url).path.rsplit("/", 1)[-1] or "Xiaoe course video"
         public = ResolvedSource(
-            source_type="xiaoe_hls", canonical_source_ref=public_url,
+            source_type="xiaoe_hls", canonical_source_ref=public_url, canonical_url=public_url,
             source_identity_hash=hashlib.sha256(f"xiaoe_hls:{public_url}".encode()).hexdigest(),
             platform_id=hashlib.sha256(public_url.encode()).hexdigest()[:24], title=title,
         )
@@ -181,13 +190,17 @@ def page_resolver_from_environment() -> XiaoePageResolver | None:
         return None
     domains = xiaoe_allowed_domains()
     timeout = float(os.getenv("CONTENT_XIAOE_PAGE_TIMEOUT_SECONDS", "60"))
+
+    def page_url_for(source_ref: str) -> str:
+        return _page_url_from_template(template, source_ref)
+
     return XiaoePageResolver(
         credential_provider=FileSecretProvider({credential_ref: state_file}),
         browser=PlaywrightSession(
-            allowed_domains=domains, page_url_for=lambda source_ref: _page_url_from_template(template, source_ref),
+            allowed_domains=domains, page_url_for=page_url_for,
             timeout_seconds=timeout,
         ),
-        allowed_domains=domains,
+        allowed_domains=domains, public_url_for=page_url_for,
     )
 
 

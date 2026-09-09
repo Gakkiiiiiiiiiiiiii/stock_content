@@ -226,7 +226,7 @@ class BilibiliResolver:
         published_at = payload.get("timestamp")
         timestamp = datetime.fromtimestamp(published_at, UTC) if isinstance(published_at, (int, float)) else None
         public = ResolvedSource(
-            source_type="bilibili", canonical_source_ref=reported_url,
+            source_type="bilibili", canonical_source_ref=reported_url, canonical_url=reported_url,
             source_identity_hash=hashlib.sha256(f"bilibili:{reported_url}".encode()).hexdigest(),
             platform_id=platform_id, part_id=str(selected_part) if selected_part is not None else None,
             title=str(payload.get("title") or platform_id), author=str(payload.get("uploader") or "") or None,

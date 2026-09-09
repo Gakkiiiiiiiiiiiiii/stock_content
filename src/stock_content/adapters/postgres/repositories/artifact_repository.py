@@ -35,6 +35,7 @@ from stock_content.domain.artifacts import (
     serialize_artifact,
 )
 from stock_content.domain.checkpoint import CheckpointRecord, CheckpointValidationError, checkpoint_state_checksum
+from stock_content.domain.source_url import canonical_public_source_url
 from stock_content.ports.repositories import StaleTaskLease
 
 
@@ -595,7 +596,7 @@ def _persist_source_provenance(session, artifact: SourceArtifact) -> None:
         "content_size": int(artifact.raw_content_length or 0),
         "mime_type": str(required["mime_type"]),
         "encryption_key_id": _safe_identifier(metadata.get("encryption_key_id")),
-        "canonical_url": _public_url(metadata.get("canonical_url")),
+        "canonical_url": canonical_public_source_url(artifact.source_type, metadata.get("canonical_url")),
         "source_type": _safe_identifier(artifact.source_type),
         "source_id": _safe_identifier(metadata.get("source_id")),
         "source_part": _safe_identifier(metadata.get("source_part")),
@@ -660,15 +661,6 @@ def _register_private_locator(session, artifact: SourceArtifact) -> None:
         ))
     elif (existing.private_root_id, existing.relative_locator) != (root_id, relative):
         raise ArtifactIntegrityError("retention locator is immutable")
-
-
-def _public_url(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
-        return None
-    return f"https://{parsed.netloc}{parsed.path}"
 
 
 def _safe_identifier(value: Any) -> str | None:
