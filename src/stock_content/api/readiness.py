@@ -6,7 +6,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
@@ -23,6 +22,11 @@ from stock_content.adapters.postgres.models import (
 )
 from stock_content.adapters.qdrant import NullKnowledgeIndex
 from stock_content.application.readiness_service import ReadinessDependencies, ReadinessService, SnapshotReadiness
+from stock_content.application.source_resolution_service import credential_allowlist_from_environment
+
+_VIDEO_HEARTBEAT_SCHEMA = "video-worker-readiness.v1"
+_XIAOE_MATERIALIZER_IDENTITY = "XiaoeMaterializer.local.v1"
+_TARGETED_FRAME_EXTRACTOR_IDENTITY = "FfmpegFrameExtractor.extract_targeted.v1"
 
 
 def create_readiness_router(
@@ -166,7 +170,7 @@ def _video_components(dependencies: ReadinessDependencies, application: object |
     schema = bool(dependencies.postgres_ok and sessions is not None)
     xiaoe_enabled = os.getenv("CONTENT_XIAOE_PAGE_RESOLVER_ENABLED", "").lower() == "true"
     heartbeat_path = os.getenv("CONTENT_VIDEO_WORKER_HEARTBEAT_FILE", "")
-    heartbeat_ok = _fresh_heartbeat(heartbeat_path)
+    heartbeat_ok, heartbeat_payload = _video_worker_heartbeat(heartbeat_path)
     raw_dir = os.getenv("CONTENT_RAW_STORAGE_DIR", "")
     raw_ok = bool(raw_dir and Path(raw_dir).is_dir() and os.access(raw_dir, os.R_OK | os.W_OK))
     model_ok = bool(os.getenv("CONTENT_MODEL_URL", "") and os.getenv("CONTENT_MODEL_NAME", ""))
@@ -178,21 +182,24 @@ def _video_components(dependencies: ReadinessDependencies, application: object |
     queue_ok = bool(
         sessions is not None and callable(getattr(getattr(application, "_tasks", None), "claim_pending", None))
     )
-    browser_ok = (not xiaoe_enabled) or (
-        importlib.util.find_spec("playwright") is not None
-        and bool(os.getenv("CONTENT_XIAOE_STORAGE_STATE_FILE", ""))
-        and Path(os.getenv("CONTENT_XIAOE_STORAGE_STATE_FILE", "")).is_file()
-    )
+    # The API is deliberately not mounted with browser storage state.  It
+    # trusts only the fresh, non-secret video-worker proof and verifies that
+    # the worker's opaque credential reference/provider are allowlisted.
+    browser_ok = (not xiaoe_enabled) or heartbeat_ok
     retention_status = str(getattr(application, "_retention_status", "RETENTION_DISABLED"))
     retention_ready = retention_status == "READY"
     return {
         "schema": _component(schema, "SCHEMA_NOT_READY"),
-        "video_worker_heartbeat": _component(heartbeat_ok, "VIDEO_WORKER_HEARTBEAT_STALE"),
-        "ffmpeg": _component(shutil.which("ffmpeg") is not None, "FFMPEG_UNAVAILABLE"),
-        "ffprobe": _component(shutil.which("ffprobe") is not None, "FFPROBE_UNAVAILABLE"),
-        "yt_dlp": _component(
-            shutil.which("yt-dlp") is not None or importlib.util.find_spec("yt_dlp") is not None, "YTDLP_UNAVAILABLE"
-        ),
+        "video_worker_heartbeat": {
+            **_component(heartbeat_ok, "VIDEO_WORKER_HEARTBEAT_INVALID"),
+            "proof": heartbeat_payload,
+        },
+        # Media binaries are worker capabilities, not API-container
+        # capabilities.  Their tested identity is part of the signed
+        # heartbeat above, preventing an API-side false positive.
+        "ffmpeg": _component(heartbeat_ok, "FFMPEG_UNAVAILABLE"),
+        "ffprobe": _component(heartbeat_ok, "FFPROBE_UNAVAILABLE"),
+        "yt_dlp": _component(heartbeat_ok, "YTDLP_UNAVAILABLE"),
         "xiaoe_browser": _component(browser_ok, "XIAOE_BROWSER_NOT_READY"),
         "asr": _component(asr_ok, "ASR_NOT_READY"),
         "ocr_visual": {
@@ -237,18 +244,53 @@ def _bundle_contract_checksum() -> str:
     return "sha256:EBFD13B78622C3846890438A4FB3CB858278F571FDAB247CDD72EF18CA211621"
 
 
-def _fresh_heartbeat(value: str) -> bool:
+def _video_worker_heartbeat(value: str) -> tuple[bool, dict[str, object]]:
+    """Validate the worker-only, non-secret video capability attestation.
+
+    A stale, malformed, CPU-attesting, or allowlist-mismatched proof fails
+    closed.  Deliberately return only diagnostic statuses; the credential
+    reference itself is never exposed by the public health endpoint.
+    """
     if not value:
-        return False
+        return False, {"health_code": "VIDEO_WORKER_HEARTBEAT_MISSING"}
     try:
         payload = json.loads(Path(value).read_text(encoding="utf-8"))
         observed = datetime.fromisoformat(str(payload["observed_at"]).replace("Z", "+00:00"))
         age = (datetime.now(UTC) - _as_utc(observed)).total_seconds()
-        return str(payload.get("profile")) == "video" and 0 <= age <= float(
-            os.getenv("CONTENT_VIDEO_HEARTBEAT_MAX_AGE_SECONDS", "120")
+        xiaoe = payload["xiaoe_page"]
+        extractor = payload["frame_extractor"]
+        ocr = payload["ocr"]
+        allowed_refs, allowed_providers = credential_allowlist_from_environment()
+        requested = str(ocr.get("requested_device") or "")
+        actual = str(ocr.get("actual_device") or "")
+        ready = (
+            str(payload.get("schema")) == _VIDEO_HEARTBEAT_SCHEMA
+            and str(payload.get("profile")) == "video"
+            and str(payload.get("health_code")) == "READY"
+            and 0 <= age <= float(os.getenv("CONTENT_VIDEO_HEARTBEAT_MAX_AGE_SECONDS", "120"))
+            and isinstance(xiaoe, dict)
+            and bool(xiaoe.get("enabled"))
+            and bool(xiaoe.get("ready"))
+            and str(xiaoe.get("credential_ref") or "") in allowed_refs
+            and str(xiaoe.get("credential_provider") or "") in allowed_providers
+            and str(xiaoe.get("materializer_identity")) == _XIAOE_MATERIALIZER_IDENTITY
+            and isinstance(extractor, dict)
+            and bool(extractor.get("ready"))
+            and str(extractor.get("identity")) == _TARGETED_FRAME_EXTRACTOR_IDENTITY
+            and isinstance(ocr, dict)
+            and str(ocr.get("health_code")) == "READY"
+            and requested == "gpu:0"
+            and actual.lower().startswith("gpu:0")
         )
+        return ready, {
+            "health_code": "READY" if ready else "VIDEO_WORKER_CAPABILITY_MISMATCH",
+            "schema": str(payload.get("schema") or ""),
+            "ocr_actual_device": actual,
+            "frame_extractor": str(extractor.get("identity") or ""),
+            "xiaoe_page_resolver": "READY" if bool(xiaoe.get("ready")) else "NOT_READY",
+        }
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return False
+        return False, {"health_code": "VIDEO_WORKER_HEARTBEAT_INVALID"}
 
 
 def _ocr_heartbeat(value: str) -> tuple[bool, dict[str, object]]:

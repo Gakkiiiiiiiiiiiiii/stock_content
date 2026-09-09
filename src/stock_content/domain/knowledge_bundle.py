@@ -15,6 +15,9 @@ from typing import Any, Mapping
 CONTRACT = "content-knowledge-bundle.v1"
 SCHEMA_VERSION = "1.0.0"
 CANONICALIZATION_VERSION = "content-bundle-c14n-v1"
+V2_CONTRACT = "content-knowledge-bundle.v2"
+V2_SCHEMA_VERSION = "2.0.0"
+V2_CANONICALIZATION_VERSION = "content-bundle-c14n-v2"
 PUBLIC_STRICT = "PUBLIC_STRICT"
 _TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT")
 _SET_ARRAYS = frozenset({"reason_codes", "warnings", "evidence_refs", "evidence_ids"})
@@ -147,12 +150,27 @@ class KnowledgeBundleRequest:
     max_items: int
     policy: str = PUBLIC_STRICT
     policy_version: str = "content-bundle-policy.v1"
+    # The default deliberately remains v1.  In particular, this field is not
+    # included in ``canonical_request`` for v1, so old bundle ids and hashes
+    # replay byte-for-byte.
+    contract_version: str = CONTRACT
+    # v2 makes topic scope explicit.  It is derived from ``symbol`` so a
+    # caller cannot use an all-subject request to silently claim a symbol
+    # scoped Bundle (or vice versa).
+    subject_scope: str | None = None
 
     def __post_init__(self) -> None:
         if not self.content_snapshot_id or self.content_snapshot_id.lower() in {"latest", "current", "default"}:
             raise ValueError("content_snapshot_id must be a concrete snapshot id")
         if not self.query or not self.symbol or self.policy != PUBLIC_STRICT or not self.policy_version:
             raise ValueError("bundle request has invalid required binding")
+        if self.contract_version not in {CONTRACT, V2_CONTRACT}:
+            raise ValueError("unsupported bundle contract version")
+        derived_subject_scope = "ALL_SUBJECTS" if self.symbol.strip().upper() == "UNSPECIFIED" else "SUBJECT_ONLY"
+        if self.contract_version == CONTRACT and self.subject_scope is not None:
+            raise ValueError("subject_scope requires content-knowledge-bundle.v2")
+        if self.contract_version == V2_CONTRACT and self.subject_scope not in {None, derived_subject_scope}:
+            raise ValueError("SUBJECT_SCOPE_SYMBOL_MISMATCH")
         if not 1 <= self.max_items <= 100:
             raise ValueError("max_items must be between 1 and 100")
         for field in ("business_as_of", "knowledge_as_of", "availability_as_of"):
@@ -173,11 +191,13 @@ class KnowledgeBundleRequest:
             "max_items",
             "policy",
             "policy_version",
+            "contract_version",
+            "subject_scope",
         }
         unexpected = set(value) - allowed
         if unexpected:
             raise ValueError(f"unknown bundle request fields: {', '.join(sorted(unexpected))}")
-        required = allowed - {"policy", "policy_version"}
+        required = allowed - {"policy", "policy_version", "contract_version", "subject_scope"}
         missing = sorted(key for key in required if value.get(key) is None)
         if missing:
             raise ValueError(f"bundle request missing {', '.join(missing)}")
@@ -197,7 +217,7 @@ class KnowledgeBundleRequest:
         )
 
     def canonical_request(self) -> dict[str, Any]:
-        return {
+        request = {
             "content_snapshot_id": self.content_snapshot_id,
             "query": self.query,
             "symbol": self.symbol,
@@ -209,6 +229,15 @@ class KnowledgeBundleRequest:
             "policy": self.policy,
             "policy_version": self.policy_version,
         }
+        if self.contract_version != CONTRACT:
+            request["contract_version"] = self.contract_version
+            # A multi-topic source must say so explicitly rather than using a
+            # fabricated common subject.  ``UNSPECIFIED`` is a scope marker,
+            # never a knowledge-item subject.
+            request["subject_scope"] = self.subject_scope or (
+                "ALL_SUBJECTS" if self.symbol.strip().upper() == "UNSPECIFIED" else "SUBJECT_ONLY"
+            )
+        return request
 
     @property
     def request_hash(self) -> str:

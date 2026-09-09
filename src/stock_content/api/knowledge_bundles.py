@@ -20,6 +20,10 @@ class BundleRequestBody(BaseModel):
     max_items: int = Field(ge=1, le=100)
     policy: str = "PUBLIC_STRICT"
     policy_version: str = "content-bundle-policy.v1"
+    # Omitted callers retain the locked v1 wire contract.  v2 is opt-in so
+    # consumers can deploy its richer semantics independently.
+    contract_version: str = "content-knowledge-bundle.v1"
+    subject_scope: str | None = None
 
 
 def create_knowledge_bundles_router(application):

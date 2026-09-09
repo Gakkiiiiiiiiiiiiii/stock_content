@@ -223,6 +223,11 @@ def test_canonicalizer_ignores_untrusted_category_and_uses_binding_version():
     claim = ClaimCanonicalizer().canonicalize(draft, temporal_bindings=[binding])
     assert claim.fact_category == "FACT"
     assert claim.normalization_version == "temporal-normalization.final.7"
+    # This is a legacy, explicitly ungrounded DTO.  It must retain the
+    # historical canonicalization path without becoming a publishable v2
+    # knowledge item merely because semantic metadata was added.
+    assert claim.normalized_statement == ""
+    assert claim.bundle_v2 == {}
     with pytest.raises(ValueError, match="normalization version"):
         ClaimCanonicalizer(normalization_version="temporal-normalization.final.8").canonicalize(
             draft, temporal_bindings=[binding]

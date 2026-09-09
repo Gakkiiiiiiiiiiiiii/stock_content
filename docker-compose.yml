@@ -23,11 +23,14 @@ services:
       CONTENT_SERVICE_API_KEY_FILE: /run/secrets/content-service-api-key
       # This is read-only in the API container and written only by the video
       # worker after a real GPU OCR probe.
+      CONTENT_VIDEO_WORKER_HEARTBEAT_FILE: /var/run/stock-content/video-worker-heartbeat.json
       CONTENT_OCR_HEARTBEAT_FILE: /var/run/stock-content/ocr-heartbeat.json
       CONTENT_OCR_HEARTBEAT_MAX_AGE_SECONDS: "120"
       CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
       CONTENT_BILIBILI_STORAGE_STATE_REF: ${CONTENT_BILIBILI_STORAGE_STATE_REF:-bilibili-storage-state}
       CONTENT_XIAOE_HLS_CREDENTIAL_REF: ${CONTENT_XIAOE_HLS_CREDENTIAL_REF:-xiaoe-hls-locator}
+      CONTENT_XIAOE_CREDENTIAL_REF: ${CONTENT_XIAOE_CREDENTIAL_REF:-xiaoe-storage-state}
+      CONTENT_XIAOE_CREDENTIAL_PROVIDER: ${CONTENT_XIAOE_CREDENTIAL_PROVIDER:-file-secret}
       CONTENT_INGESTION_CREDENTIAL_REFS: ${CONTENT_INGESTION_CREDENTIAL_REFS:-bilibili-storage-state,bilibili-cookiefile,xiaoe-hls-locator,xiaoe-storage-state}
     secrets:
       - content-service-api-key
@@ -91,6 +94,8 @@ services:
       CONTENT_OCR_CACHE_HOME: /var/cache/stock-content/ocr
       CONTENT_OCR_LIBRARY_PATH: /usr/local/cuda/lib64:/opt/ocr/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:/opt/ocr/lib/python3.11/site-packages/nvidia/cudnn/lib
       CONTENT_XIAOE_STORAGE_STATE_FILE: /run/secrets/xiaoe-storage-state
+      CONTENT_XIAOE_CREDENTIAL_REF: ${CONTENT_XIAOE_CREDENTIAL_REF:-xiaoe-storage-state}
+      CONTENT_XIAOE_CREDENTIAL_PROVIDER: ${CONTENT_XIAOE_CREDENTIAL_PROVIDER:-file-secret}
       CONTENT_BILIBILI_CREDENTIAL_REF: ${CONTENT_BILIBILI_CREDENTIAL_REF:-bilibili-cookiefile}
       CONTENT_BILIBILI_COOKIEFILE: /run/secrets/bilibili-cookiefile
       CONTENT_BILIBILI_STORAGE_STATE_REF: ${CONTENT_BILIBILI_STORAGE_STATE_REF:-bilibili-storage-state}

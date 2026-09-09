@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import shutil
 import socket
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from stock_content.adapters.media.ocr import PaddleOcrEngine
+from stock_content.adapters.sources.xiaoe_page import page_resolver_from_environment
 from stock_content.api.dependencies import build_application
 from stock_content.domain.worker_capability import TaskKind, WorkerProfile, require_capability
 
@@ -19,6 +23,67 @@ QUEUE = TaskKind(
         TaskKind.VIDEO_PIPELINE.value if WORKER_PROFILE is WorkerProfile.VIDEO else TaskKind.CORE.value,
     )
 )
+
+_VIDEO_HEARTBEAT_SCHEMA = "video-worker-readiness.v1"
+_XIAOE_MATERIALIZER_IDENTITY = "XiaoeMaterializer.local.v1"
+_TARGETED_FRAME_EXTRACTOR_IDENTITY = "FfmpegFrameExtractor.extract_targeted.v1"
+
+
+def _ocr_attestation() -> dict[str, str]:
+    """Copy only the isolated OCR process's non-secret device proof.
+
+    The video worker does not infer GPU availability from its own environment.
+    It republishes the observed proof produced by the separate Paddle runtime,
+    so a configured ``gpu:0`` can never silently become a CPU capability.
+    """
+    path = os.getenv("CONTENT_OCR_HEARTBEAT_FILE", "")
+    if not path:
+        return {"health_code": "OCR_HEARTBEAT_MISSING"}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {
+            "health_code": str(payload.get("health_code") or "OCR_HEARTBEAT_INVALID"),
+            "requested_device": str(payload.get("requested_device") or ""),
+            "actual_device": str(payload.get("actual_device") or ""),
+        }
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"health_code": "OCR_HEARTBEAT_INVALID"}
+
+
+def _video_readiness_payload() -> dict[str, Any]:
+    """Build a durable, non-secret capability proof for the API process."""
+    xiaoe_enabled = os.getenv("CONTENT_XIAOE_PAGE_RESOLVER_ENABLED", "").lower() == "true"
+    credential_ref = os.getenv("CONTENT_XIAOE_CREDENTIAL_REF", "xiaoe-storage-state").strip()
+    credential_provider = os.getenv("CONTENT_XIAOE_CREDENTIAL_PROVIDER", "file-secret").strip()
+    template = os.getenv("CONTENT_XIAOE_PAGE_URL_TEMPLATE", "")
+    state_file = os.getenv("CONTENT_XIAOE_STORAGE_STATE_FILE", "")
+    resolver_ready = False
+    if xiaoe_enabled and credential_ref and credential_provider and template and Path(state_file).is_file():
+        # This only verifies worker-local configuration and the private mount's
+        # existence through the resolver constructor.  The storage state is
+        # never read or copied into the heartbeat.
+        resolver_ready = page_resolver_from_environment() is not None
+    extractor_ready = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+    return {
+        "schema": _VIDEO_HEARTBEAT_SCHEMA,
+        "profile": "video",
+        "health_code": "READY" if resolver_ready and extractor_ready else "CAPABILITY_NOT_READY",
+        "observed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "xiaoe_page": {
+            "enabled": xiaoe_enabled,
+            "ready": resolver_ready,
+            # These are opaque identifiers, not credential values.  They stay
+            # in the worker-state volume and are never returned by the API.
+            "credential_ref": credential_ref,
+            "credential_provider": credential_provider,
+            "materializer_identity": _XIAOE_MATERIALIZER_IDENTITY,
+        },
+        "frame_extractor": {
+            "ready": extractor_ready,
+            "identity": _TARGETED_FRAME_EXTRACTOR_IDENTITY,
+        },
+        "ocr": _ocr_attestation(),
+    }
 
 
 def _write_video_heartbeat() -> None:
@@ -33,8 +98,7 @@ def _write_video_heartbeat() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
-            '{"profile":"video","observed_at":"' + datetime.now(UTC).isoformat().replace("+00:00", "Z") + '"}',
-            encoding="utf-8",
+            json.dumps(_video_readiness_payload(), sort_keys=True, separators=(",", ":")), encoding="utf-8"
         )
         temporary.replace(path)
     except OSError:

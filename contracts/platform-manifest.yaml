@@ -10,6 +10,16 @@ contracts:
     deprecated: false
     sunset: null
     owner: content-platform
+  - id: content-knowledge-bundle.v2
+    schema: contracts/content-knowledge-bundle.v2.json
+    checksum: sha256:23C1D9C6BE131CBA8F270F01F7F45EB5D3148EE219EDF43D689F1C5707115800
+    producer: stock_content
+    consumers: [stock_agent]
+    compatibility: additive
+    formal_expected: false
+    deprecated: false
+    sunset: null
+    owner: content-platform
   - id: content-ingestion.v1
     schema: contracts/content-ingestion.v1.json
     checksum: sha256:4F2D0AFF88E3231D6722A5C3C78B0E145BF3AB709A696C089764D76140FDD805

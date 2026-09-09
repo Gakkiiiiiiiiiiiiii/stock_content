@@ -10,6 +10,7 @@ from stock_content.application.source_resolution_service import (
     IngestionValidationError,
     canonical_bilibili_ref,
     canonical_xiaoe_hls_ref,
+    canonical_xiaoe_page_ref,
     command_with_legacy_policy,
     credential_allowlist_from_environment,
     normalize_command,
@@ -145,16 +146,25 @@ def create_ingestions_router(application_for_request: Callable[[], object]) -> A
     ) -> dict:
         options, part, transcript_policy, body_key = _legacy_options(request.options)
         try:
-            public_ref, locator_secret_input = canonical_xiaoe_hls_ref(request.m3u8_url)
-            signed_locator = locator_secret_input is not None
-            if signed_locator and request.credential_ref is None:
-                raise IngestionValidationError("signed Xiaoe HLS requires an allowlisted credential_ref")
             allowed_refs, allowed_providers = credential_allowlist_from_environment()
+            if bool(request.url) == bool(request.m3u8_url):
+                raise IngestionValidationError("exactly one of url or m3u8_url is required")
+            if request.url:
+                source_type = "xiaoe"
+                public_ref = canonical_xiaoe_page_ref(request.url)
+                if request.credential_ref is None:
+                    raise IngestionValidationError("xiaoe requires an allowlisted credential_ref")
+            else:
+                source_type = "xiaoe_hls"
+                public_ref, locator_secret_input = canonical_xiaoe_hls_ref(request.m3u8_url)
+                signed_locator = locator_secret_input is not None
+                if signed_locator and request.credential_ref is None:
+                    raise IngestionValidationError("signed Xiaoe HLS requires an allowlisted credential_ref")
             command = normalize_command(
                 # A public locator is safe to queue without a credential.  A
                 # signed locator instead resolves from the worker's secret
                 # reference; the request URL itself is never recoverable.
-                source_type="xiaoe" if request.credential_ref else "xiaoe_hls",
+                source_type=source_type,
                 source_ref=public_ref,
                 part=part,
                 transcript_policy=transcript_policy,

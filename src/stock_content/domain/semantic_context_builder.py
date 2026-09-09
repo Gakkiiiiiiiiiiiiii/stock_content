@@ -46,9 +46,12 @@ class SemanticContextBuilder:
         ]
         low, high = semantic_segment.start_ms - self.padding_ms, semantic_segment.end_ms + self.padding_ms
         frame_list = [item for item in frames if low <= item.timestamp_ms <= high]
-        frame_ids = {item.frame_id for item in frame_list}
-        ocr_list = [item for item in ocr if item.frame_artifact_id in frame_ids]
-        vision_list = [item for item in vision if item.frame_artifact_id in frame_ids]
+        # OCR/Vision point at a FrameArtifact id, whereas the model-facing
+        # anchor needs the stable Frame ID.  Keep both identities rather than
+        # accidentally dropping every visual item at this join boundary.
+        frame_artifact_ids = {item.artifact_id for item in frame_list}
+        ocr_list = [item for item in ocr if item.frame_artifact_id in frame_artifact_ids]
+        vision_list = [item for item in vision if item.frame_artifact_id in frame_artifact_ids]
         return SemanticContext(
             semantic_segment_id=semantic_segment.semantic_segment_id,
             start_ms=semantic_segment.start_ms,

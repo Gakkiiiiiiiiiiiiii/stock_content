@@ -123,6 +123,9 @@ class AtomicClaimDraft(BaseModel):
     invalidation_evidence_segment_indices: list[int] = Field(default_factory=list)
     temporal_expressions: list[AtomicTemporalExpression] = Field(default_factory=list)
     visual_anchors: list[VisualEvidenceAnchor] = Field(default_factory=list)
+    # Additive consumer-facing semantics.  They remain untrusted until the
+    # transcript/visual acceptance boundary has accepted the atomic claim.
+    bundle_v2: dict[str, Any] = Field(default_factory=dict)
     extraction_confidence: float
 
     @field_validator("extraction_confidence")
@@ -168,6 +171,8 @@ class ClaimOccurrenceDraft(BaseModel):
     extraction_confidence: float = Field(default=0.0, ge=0, le=1)
     extraction_model_id: str = ""
     extraction_prompt_version: str = ""
+    visual_anchors: list[VisualEvidenceAnchor] = Field(default_factory=list)
+    bundle_v2: dict[str, Any] = Field(default_factory=dict)
     # These fields are only populated by the SC-07A accepted-draft adapter.
     # Their legacy defaults are intentionally fail-closed for formal use.
     verbatim_quote: str | None = None

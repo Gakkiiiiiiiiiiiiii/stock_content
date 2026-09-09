@@ -167,7 +167,7 @@ class AtomicClaimExtractor:
             # These keys are extractor/model metadata, not acceptance facts.
             # A model must never make its own output formally grounded.
             for key in (
-                "polarity", "assertion_tense", "visual_anchors", "claim_schema_version",
+                "polarity", "assertion_tense", "claim_schema_version",
                 "grounding_status", "grounding_reason_codes", "contradiction_group_id",
                 "legacy_grounding_incomplete",
             ):
@@ -212,7 +212,13 @@ class AtomicClaimExtractor:
             "Extract atomic claims from this semantic context. Split independent claims. "
             "Include condition and invalidation text where present. Every evidence coordinate and every temporal "
             "expression must carry its own evidence_segment_indices. Do not invent dates, numbers, tickers, or "
-            "evidence. Do not call another temporal model. Empty claims are valid. Return exactly "
+            "evidence. Do not call another temporal model. Statements must be proposition-only: never prefix "
+            "them with phrases such as '课程提出' or '课程设置'. Return bundle_v2 with primary_domain, "
+            "claim_nature, attribution, detail (explanation/mechanism/procedure/formula/example/scope/risks when "
+            "supported), and temporal. Opinion, forecast, and causal thesis claims must set attribution.attributed "
+            "true. Use visual_anchors only for an OCR/vision item supplied in the context, with its exact frame_id, "
+            "timestamp, bbox, model identity and confidence; visual evidence never substitutes transcript evidence. "
+            "Empty claims are valid. Return exactly "
             '{"claims":[...]} and no prose.\n'
             + json.dumps(
                 {"metadata": metadata, "context": payload},

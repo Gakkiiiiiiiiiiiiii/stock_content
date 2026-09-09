@@ -16,6 +16,7 @@ class GroundedClaimOccurrence:
     draft: ClaimOccurrenceDraft
     evidences: tuple[EvidenceItem, ...]
     primary_evidence_refs: tuple[str, ...] = ()
+    secondary_evidence_refs: tuple[str, ...] = ()
     condition_evidence_refs: tuple[str, ...] = ()
     invalidation_evidence_refs: tuple[str, ...] = ()
     temporal_evidence_refs: tuple[str, ...] = ()
@@ -25,6 +26,7 @@ class GroundedClaimOccurrence:
         """Relationship refs; roles intentionally do not affect evidence IDs."""
         return {
             "PRIMARY": self.primary_evidence_refs,
+            "SECONDARY": self.secondary_evidence_refs,
             "CONDITION": self.condition_evidence_refs,
             "INVALIDATION": self.invalidation_evidence_refs,
             "TEMPORAL": self.temporal_evidence_refs,

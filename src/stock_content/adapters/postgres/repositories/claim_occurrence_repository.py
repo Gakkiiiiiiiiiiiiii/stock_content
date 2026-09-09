@@ -61,6 +61,7 @@ class ClaimOccurrenceRepository:
             return ClaimOccurrence.model_validate(existing)
         roles = {
             "PRIMARY": occurrence.evidence_refs,
+            "SECONDARY": occurrence.secondary_evidence_refs,
             "CONDITION": occurrence.condition_evidence_refs,
             "INVALIDATION": occurrence.invalidation_evidence_refs,
             "TEMPORAL": occurrence.temporal_evidence_refs,
@@ -104,10 +105,11 @@ class ClaimOccurrenceRepository:
                 .order_by(ClaimOccurrenceEvidenceRow.evidence_role, ClaimOccurrenceEvidenceRow.ordinal,
                           ClaimOccurrenceEvidenceRow.evidence_id)
             ).all()
-        refs = {"PRIMARY": [], "CONDITION": [], "INVALIDATION": [], "TEMPORAL": []}
+        refs = {"PRIMARY": [], "SECONDARY": [], "CONDITION": [], "INVALIDATION": [], "TEMPORAL": []}
         for item in role_rows:
             refs.setdefault(item.evidence_role, []).append(item.evidence_id)
         payload["evidence_refs"] = sorted({*payload.get("evidence_refs", []), *refs["PRIMARY"]})
+        payload["secondary_evidence_refs"] = refs["SECONDARY"]
         payload["condition_evidence_refs"] = refs["CONDITION"]
         payload["invalidation_evidence_refs"] = refs["INVALIDATION"]
         payload["temporal_evidence_refs"] = refs["TEMPORAL"]
@@ -147,6 +149,7 @@ def _row_payload(row: ClaimOccurrenceRow) -> dict:
         "semantic_segment_id": row.semantic_segment_id,
         "assertion_locator_hash": row.assertion_locator_hash,
         "evidence_refs": [],
+        "secondary_evidence_refs": [],
         "condition_evidence_refs": [],
         "invalidation_evidence_refs": [],
         "temporal_evidence_refs": [],
@@ -202,6 +205,7 @@ def _validate_occurrence_identity(occurrence: ClaimOccurrence) -> None:
         occurrence.transcript_artifact_id,
         occurrence.semantic_segment_id,
         occurrence.evidence_refs
+        + occurrence.secondary_evidence_refs
         + occurrence.condition_evidence_refs
         + occurrence.invalidation_evidence_refs,
         occurrence.temporal_evidence_refs,
@@ -226,6 +230,7 @@ def _occurrence_identity(value: dict) -> dict:
             ref
             for field in (
                 "evidence_refs",
+                "secondary_evidence_refs",
                 "condition_evidence_refs",
                 "invalidation_evidence_refs",
                 "temporal_evidence_refs",
@@ -259,6 +264,9 @@ def _existing_payload(session, row: ClaimOccurrenceRow) -> dict:
     ).all()
     payload["evidence_refs"] = sorted(
         item.evidence_id for item in role_rows if item.evidence_role == "PRIMARY"
+    )
+    payload["secondary_evidence_refs"] = sorted(
+        item.evidence_id for item in role_rows if item.evidence_role == "SECONDARY"
     )
     payload["condition_evidence_refs"] = sorted(
         item.evidence_id for item in role_rows if item.evidence_role == "CONDITION"

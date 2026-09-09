@@ -6,7 +6,7 @@ import os
 import shutil
 import tempfile
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,7 @@ from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
 from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindowPlanner
 from stock_content.domain.knowledge_frame_plan import KnowledgeFramePlanner, frame_id_for, request_id_for
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
+from stock_content.domain.knowledge_semantics import atomic_statement, bundle_v2_semantics
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
 from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
@@ -1959,7 +1960,7 @@ def _extractor_draft_to_atomic_payload(draft: ClaimOccurrenceDraft, transcript: 
         "claim_type": draft.claim_type,
         "knowledge_kind": draft.knowledge_kind,
         "verbatim_quote": draft.verbatim_quote or authority_quote,
-        "normalized_statement": draft.normalized_statement or draft.conclusion,
+        "normalized_statement": atomic_statement(draft.normalized_statement or draft.conclusion),
         "subject": {
             "subject_type": draft.subject_type or "UNKNOWN",
             "subject_key": draft.subject_key,
@@ -1979,7 +1980,8 @@ def _extractor_draft_to_atomic_payload(draft: ClaimOccurrenceDraft, transcript: 
         "condition_evidence_segment_indices": list(draft.condition_evidence_segment_indices),
         "invalidation_evidence_segment_indices": list(draft.invalidation_evidence_segment_indices),
         "temporal_expressions": temporal,
-        "visual_anchors": [],
+        "visual_anchors": [item.model_dump(mode="json") for item in draft.visual_anchors],
+        "bundle_v2": dict(draft.bundle_v2),
         "extraction_confidence": draft.extraction_confidence,
     }
 
@@ -1995,7 +1997,7 @@ def _accepted_atomic_to_claim_draft(item) -> ClaimOccurrenceDraft:
         subject_key=draft.subject.subject_key or (draft.subject.subject_name or ""),
         subject_name=draft.subject.subject_name,
         predicate_key=draft.predicate,
-        conclusion=draft.normalized_statement,
+        conclusion=atomic_statement(draft.normalized_statement),
         value=(
             draft.object.value
             if draft.object and draft.object.value is not None
@@ -2028,6 +2030,8 @@ def _accepted_atomic_to_claim_draft(item) -> ClaimOccurrenceDraft:
         extraction_confidence=draft.extraction_confidence,
         extraction_model_id="atomic-claim-validator",
         extraction_prompt_version="atomic-claim-validator.v1",
+        visual_anchors=list(draft.visual_anchors),
+        bundle_v2=dict(draft.bundle_v2),
         verbatim_quote=draft.verbatim_quote,
         normalized_statement=draft.normalized_statement,
         grounding_status="GROUNDED",
@@ -2066,6 +2070,17 @@ class EvidenceGroundingStage:
         rejected = len(drafts) - len(grounded)
         context.runtime.metrics["claim_grounding_reject_rate"] = rejected / max(1.0, float(len(drafts)))
         context.runtime.metrics["temporal_expression_grounding_reject_rate"] = 0.0
+        enriched = []
+        for item in grounded:
+            visual_items = _occurrence_visual_evidence(context, item.draft)
+            if visual_items:
+                item = replace(
+                    item,
+                    evidences=tuple([*item.evidences, *visual_items]),
+                    secondary_evidence_refs=tuple(entry.evidence_id for entry in visual_items),
+                )
+            enriched.append(item)
+        grounded = enriched
         evidence_items = []
         for item in grounded:
             evidence_items.extend(item.evidences)
@@ -2090,6 +2105,130 @@ class EvidenceGroundingStage:
         context.state.evidence = list(unique.values())
         context.runtime.metrics["grounding_reject_count"] = 0.0
         return _stage_result(context, "evidence")
+
+
+def _evidence_item_for_visual(*, artifact, source_type: str, frame_id: str, timestamp_ms: int, content: str, bbox):
+    locator = {"frame_id": frame_id, "timestamp_ms": timestamp_ms, "bbox": list(bbox) if bbox else None}
+    evidence_id = (
+        "ev_"
+        + hashlib.sha256(
+            canonical_json(
+                {"source_artifact_id": artifact.artifact_id, "locator": locator, "content": content}
+            ).encode()
+        ).hexdigest()
+    )
+    return EvidenceItem(
+        evidence_id=evidence_id,
+        source_type=source_type,
+        source_artifact_id=artifact.artifact_id,
+        evidence_text=content,
+        raw_text=content,
+        normalized_text=content,
+        start_ms=timestamp_ms,
+        end_ms=timestamp_ms,
+        confidence_score=getattr(artifact, "confidence_score", None),
+        locator=locator,
+    )
+
+
+def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrenceDraft) -> list[EvidenceItem]:
+    """Materialise only model-selected, crosscheck-admitted visual evidence.
+
+    Evidence IDs are occurrence-owned through the later SECONDARY relation;
+    a frame/OCR/Vision artifact never becomes a transcript substitute.
+    """
+    if not draft.visual_anchors:
+        return []
+    eligible = _eligible_visual_ids(context)
+    frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in eligible}
+    ocr_by_frame: dict[str, list[Any]] = {}
+    vision_by_frame: dict[str, list[Any]] = {}
+    for item in context.artifacts.ocr:
+        ocr_by_frame.setdefault(item.frame_id, []).append(item)
+    for item in context.artifacts.vision:
+        vision_by_frame.setdefault(item.frame_id, []).append(item)
+    selected: dict[str, EvidenceItem] = {}
+    for anchor in draft.visual_anchors:
+        frame = frames.get(anchor.frame_id)
+        if frame is None:
+            raise ValueError("VISUAL_ANCHOR_ARTIFACT_MISSING_OR_NOT_ADMITTED")
+        timestamp = int(anchor.timestamp_ms)
+        selected_item = _evidence_item_for_visual(
+            artifact=frame,
+            source_type="FRAME",
+            frame_id=frame.frame_id,
+            timestamp_ms=timestamp,
+            content=f"frame:{frame.frame_id}",
+            bbox=anchor.bbox,
+        )
+        selected[selected_item.evidence_id] = selected_item
+        if anchor.support_type == "OCR":
+            matches = [
+                item
+                for item in ocr_by_frame.get(anchor.frame_id, [])
+                if item.engine == anchor.model_id
+                and item.engine_version == anchor.model_version
+                and (not anchor.ocr_text or anchor.ocr_text in item.text)
+            ]
+            if not matches:
+                raise ValueError("VISUAL_OCR_ANCHOR_NOT_BACKED_BY_ARTIFACT")
+            for item in matches:
+                entry = _evidence_item_for_visual(
+                    artifact=item,
+                    source_type="OCR",
+                    frame_id=item.frame_id,
+                    timestamp_ms=item.timestamp_ms,
+                    content=item.text,
+                    bbox=anchor.bbox,
+                )
+                selected[entry.evidence_id] = entry
+        else:
+            matches = [
+                item
+                for item in vision_by_frame.get(anchor.frame_id, [])
+                if item.model_name == anchor.model_id
+                and item.model_version == anchor.model_version
+                and (not anchor.visual_label or anchor.visual_label in {item.label, *item.labels})
+            ]
+            if not matches:
+                raise ValueError("VISUAL_VISION_ANCHOR_NOT_BACKED_BY_ARTIFACT")
+            for item in matches:
+                content = item.label or " ".join(item.labels)
+                entry = _evidence_item_for_visual(
+                    artifact=item,
+                    source_type="VISION",
+                    frame_id=item.frame_id,
+                    timestamp_ms=item.timestamp_ms,
+                    content=content,
+                    bbox=anchor.bbox,
+                )
+                selected[entry.evidence_id] = entry
+    return list(selected.values())
+
+
+def _occurrence_review_reason_codes(context: PipelineContext, draft: ClaimOccurrenceDraft) -> list[str]:
+    reasons: set[str] = set()
+    checks = list(context.state.get("transcript_visual_crosschecks") or ())
+    if not checks and context.artifacts.transcript_visual_crosscheck is not None:
+        checks = [
+            {
+                "relation": item.relation,
+                "semantic_segment_ids": list(item.semantic_segment_ids),
+                "mismatches": dict(item.mismatches),
+            }
+            for item in context.artifacts.transcript_visual_crosscheck.relations
+        ]
+    for check in checks:
+        if not isinstance(check, dict) or check.get("relation") != "CONTRADICTS":
+            continue
+        if draft.semantic_segment_id not in set(check.get("semantic_segment_ids") or []):
+            continue
+        mismatches = dict(check.get("mismatches") or {})
+        if "NUMBER" in mismatches:
+            reasons.add("ASR_OCR_NUMERIC_CONFLICT")
+        else:
+            reasons.add("ASR_VISUAL_CONFLICT")
+    return sorted(reasons)
 
 
 class TemporalNormalizationStage:
@@ -2454,6 +2593,14 @@ class ClaimOccurrencePersistenceStage:
                 snapshot_committed_at=candidate,
                 available_from=candidate,
             )
+            review_codes = _occurrence_review_reason_codes(context, draft)
+            semantic_envelope = bundle_v2_semantics(
+                statement=claim.normalized_statement or draft.conclusion,
+                claim_type=claim.claim_type,
+                supplied={**dict(claim.bundle_v2), **dict(draft.bundle_v2)},
+                temporal_expressions=[item.model_dump(mode="json") for item in draft.temporal_expressions],
+                review_reason_codes=review_codes,
+            )
             occurrences.append(
                 ClaimOccurrence(
                     claim_id=claim.claim_id,
@@ -2463,6 +2610,7 @@ class ClaimOccurrencePersistenceStage:
                     transcript_artifact_id=transcript.artifact_id,
                     semantic_segment_id=draft.semantic_segment_id,
                     evidence_refs=refs,
+                    secondary_evidence_refs=list(relation.secondary_evidence_refs),
                     condition_evidence_refs=list(relation.condition_evidence_refs),
                     invalidation_evidence_refs=list(relation.invalidation_evidence_refs),
                     temporal_evidence_refs=list(relation.temporal_evidence_refs),
@@ -2493,6 +2641,7 @@ class ClaimOccurrencePersistenceStage:
                     provenance={
                         "model_id": draft.extraction_model_id,
                         "prompt_version": draft.extraction_prompt_version,
+                        "bundle_v2": semantic_envelope,
                     },
                     primary_quote=draft.verbatim_quote,
                     normalized_statement=draft.normalized_statement,

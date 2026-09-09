@@ -6,7 +6,7 @@ import json
 import os
 import re
 from dataclasses import replace
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from stock_content.domain.source_materialization import ContentIngestionCommand, CredentialReference
 
@@ -18,6 +18,7 @@ class IngestionValidationError(ValueError):
 _FORBIDDEN_OPTION_PARTS = ("cookie", "header", "storage_state", "storage state", "signed_url", "signed url")
 _BILIBILI_BV = re.compile(r"\b(BV[0-9A-Za-z]+)\b", re.IGNORECASE)
 _BILIBILI_AV = re.compile(r"\b(av[1-9][0-9]*)\b", re.IGNORECASE)
+_XIAOE_PAGE_PATH = re.compile(r"^/p/course/video/([A-Za-z0-9_-]{1,160})/?$")
 _STABLE_XIAOE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*(?:/[A-Za-z0-9][A-Za-z0-9_.:-]*)?$")
 _ALLOWED_OPTIONS = {"language"}
 _LEGACY_ALLOWED_OPTIONS = _ALLOWED_OPTIONS | {
@@ -48,7 +49,16 @@ def credential_allowlist_from_environment() -> tuple[frozenset[str], frozenset[s
         for value in (
             os.getenv("CONTENT_BILIBILI_CREDENTIAL_REF", ""),
             os.getenv("CONTENT_XIAOE_HLS_CREDENTIAL_REF", ""),
+            # The page resolver consumes the Playwright storage state only in
+            # the video worker.  The API still needs to recognise its opaque,
+            # operator-configured reference when it validates a command.
+            os.getenv("CONTENT_XIAOE_CREDENTIAL_REF", ""),
         )
+        if value.strip()
+    )
+    providers = providers | frozenset(
+        value.strip()
+        for value in (os.getenv("CONTENT_XIAOE_CREDENTIAL_PROVIDER", ""),)
         if value.strip()
     )
     return references, providers
@@ -128,6 +138,36 @@ def canonical_xiaoe_hls_ref(m3u8_url: str | None) -> tuple[str, str | None]:
     return public_url, _hash(m3u8_url) if public_url != m3u8_url else None
 
 
+def canonical_xiaoe_page_ref(value: str) -> str:
+    """Reduce a public Xiaoe lesson page to its stable product/lesson identity.
+
+    The page URL is not queued because it can contain tracking material and
+    the worker must use its operator-configured URL template.  Keeping only
+    these two identifiers also makes HTTP retries idempotent across equivalent
+    page links while preserving the source resolver's course/lesson contract.
+    """
+    parsed = urlsplit(value.strip())
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or not host
+        or not (host == "xiaoeknow.com" or host.endswith(".xiaoeknow.com")
+                or host == "xiaoe-tech.com" or host.endswith(".xiaoe-tech.com"))
+    ):
+        raise IngestionValidationError("Xiaoe source URL is not an approved course page")
+    match = _XIAOE_PAGE_PATH.fullmatch(parsed.path)
+    if match is None or parsed.fragment:
+        raise IngestionValidationError("Xiaoe source URL is invalid")
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if len(pairs) != 1 or pairs[0][0] != "product_id" or not _STABLE_XIAOE_REF.fullmatch(pairs[0][1]):
+        raise IngestionValidationError("Xiaoe source URL must contain exactly one product_id")
+    product_id = pairs[0][1]
+    lesson_id = match.group(1)
+    return f"{product_id}/{lesson_id}"
+
+
 def _is_public_xiaoe_hls_ref(value: str) -> bool:
     parsed = urlsplit(value)
     return (
@@ -173,6 +213,8 @@ def normalize_command(
     if unexpected:
         raise IngestionValidationError("unsupported ingestion options")
     if source_type == "xiaoe":
+        if source_ref.startswith(("https://", "http://")):
+            source_ref = canonical_xiaoe_page_ref(source_ref)
         is_direct_hls = _is_public_xiaoe_hls_ref(source_ref)
         if not is_direct_hls and (not _STABLE_XIAOE_REF.fullmatch(source_ref) or "://" in source_ref):
             raise IngestionValidationError("xiaoe source_ref must be a stable course/lesson identity or public HLS URL")
@@ -229,6 +271,7 @@ def command_with_legacy_policy(command: ContentIngestionCommand) -> ContentInges
 
 __all__ = [
     "IngestionValidationError", "canonical_bilibili_ref", "canonical_xiaoe_hls_ref",
+    "canonical_xiaoe_page_ref",
     "command_with_legacy_policy",
     "credential_allowlist_from_environment",
     "normalize_command",

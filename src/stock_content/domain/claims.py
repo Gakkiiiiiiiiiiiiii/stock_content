@@ -110,6 +110,10 @@ class FinancialClaim(BaseModel):
     temporal_relations: list[ClaimTemporalRelation] = Field(default_factory=list)
     claim_schema_version: str = "claim.v2"
     normalization_version: str = "normalization.v1"
+    # Semantic metadata is part of the immutable canonical claim payload.
+    # Occurrence-local values (notably visual conflict review) are overlaid
+    # from ClaimOccurrence.provenance at Bundle v2 projection time.
+    bundle_v2: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("claim_type")
     @classmethod
@@ -156,6 +160,7 @@ class FinancialClaim(BaseModel):
             "normalized_statement": self.normalized_statement,
             "grounding_status": self.grounding_status,
             "contradiction_group_id": self.contradiction_group_id,
+            "bundle_v2": self.bundle_v2,
         }
         if self.condition_key or self.temporal_bindings or self.temporal_relations:
             # Legacy fact_time/period fields are compatibility projections and

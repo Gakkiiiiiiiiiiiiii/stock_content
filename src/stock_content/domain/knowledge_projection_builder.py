@@ -61,8 +61,10 @@ class KnowledgeProjectionBuilder:
                 "verbatim_quote": occurrence.primary_quote,
                 "primary_quote": occurrence.primary_quote,
                 "evidence_refs": list(occurrence.evidence_refs),
+                "secondary_evidence_refs": list(occurrence.secondary_evidence_refs),
                 "condition_evidence_refs": list(occurrence.condition_evidence_refs),
                 "invalidation_evidence_refs": list(occurrence.invalidation_evidence_refs),
+                "bundle_v2": dict(occurrence.provenance.get("bundle_v2") or claim.bundle_v2),
             })
             payload["available_from"] = occurrence.times.available_from
         if verification is not None:

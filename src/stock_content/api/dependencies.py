@@ -315,10 +315,17 @@ def build_application(
             .hexdigest()
             .upper()
         )
+        v2_checksum = (
+            "sha256:"
+            + sha256((Path(__file__).parents[3] / "contracts" / "content-knowledge-bundle.v2.json").read_bytes())
+            .hexdigest()
+            .upper()
+        )
         bundle_service = KnowledgeBundleService(
             PostgresKnowledgeBundleAuthority(database.session_factory),
             PostgresKnowledgeBundleRepository(database.session_factory),
             BundleProducerMetadata("stock_content", *bundle_environment, checksum),
+            v2_contract_checksum=v2_checksum,
         )
     verification_jobs = PostgresVerificationJobRepository(database.session_factory)
     summaries = PostgresSummaryRepository(database.session_factory)

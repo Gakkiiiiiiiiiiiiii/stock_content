@@ -18,12 +18,18 @@ from stock_content.adapters.postgres.repositories.knowledge_bundle_repository im
 from stock_content.api.dependencies import build_application
 from stock_content.api.knowledge_bundles import create_knowledge_bundles_router
 from stock_content.application.knowledge_bundle_service import BundleProducerMetadata, KnowledgeBundleService
-from stock_content.domain.knowledge_bundle import CanonicalizationError, KnowledgeBundleRequest, canonical_json
+from stock_content.domain.knowledge_bundle import (
+    V2_CONTRACT,
+    CanonicalizationError,
+    KnowledgeBundleRequest,
+    canonical_json,
+)
 from stock_content.domain.temporal_normalizer import TemporalNormalizer
 from stock_content.ports.knowledge_bundle_repository import InMemoryKnowledgeBundleRepository
 
 NOW = datetime(2026, 9, 6, tzinfo=UTC)
 CHECKSUM = "sha256:EBFD13B78622C3846890438A4FB3CB858278F571FDAB247CDD72EF18CA211621"
+V2_CHECKSUM = "sha256:23C1D9C6BE131CBA8F270F01F7F45EB5D3148EE219EDF43D689F1C5707115800"
 
 
 def _request(**changes):
@@ -106,6 +112,59 @@ def _service(authority=None):
         InMemoryKnowledgeBundleRepository(),
         BundleProducerMetadata("stock_content", "1.0.0", "abc123", "pipeline.v3", CHECKSUM),
     )
+
+
+def _v2_service(authority=None):
+    return KnowledgeBundleService(
+        authority or Authority(),
+        InMemoryKnowledgeBundleRepository(),
+        BundleProducerMetadata("stock_content", "1.0.0", "abc123", "pipeline.v3", CHECKSUM),
+        v2_contract_checksum=V2_CHECKSUM,
+    )
+
+
+def _v2_item(identifier="co_1", *, review=False, nature="METHOD"):
+    item = _item(identifier)
+    item.update({
+        "statement": "课程提出三层资金池分别承担压舱、核心和卫星风险",
+        "subject": {"type": "TOPIC", "key": "capital_allocation"},
+        "primary_domain": "PORTFOLIO_RISK_MANAGEMENT",
+        "claim_nature": nature,
+        "source_grade": "PRIMARY",
+        "external_truth_status": "EXTERNALLY_VERIFIED",
+        "attribution": {
+            "attributed": nature in {"FORECAST", "CAUSAL_THESIS", "OPINION"},
+            "source_label": "视频讲者" if nature in {"FORECAST", "CAUSAL_THESIS", "OPINION"} else None,
+        },
+        "detail": {
+            "explanation": "以不同资金桶隔离波动风险。",
+            "mechanism": "压舱层降低组合波动，卫星层承载高波动机会。",
+            "procedure": "先确定各层比例，再按层设置标的和集中度限制。",
+            "formula": "压舱30%-40%，核心40%-50%，卫星10%-20%。",
+            "example": None,
+            "scope": "适用于课程所述的长期权益配置框架。",
+            "risks": "比例不是个体化投资建议，需要结合风险承受能力。",
+        },
+        "temporal": {
+            "kind": "RECURRING_RULE", "start": None, "end": None, "as_of": None,
+            "rule": "按月复核", "label": None, "precision": "RULE", "explicitly_unknown": False,
+        },
+        "occurrence_review": {
+            "status": "HUMAN_REVIEW_REQUIRED" if review else "NOT_REQUIRED",
+            "reason_codes": ["ASR_OCR_NUMERIC_CONFLICT"] if review else [],
+        },
+        "numeric_claim": True,
+        "evidence": [{
+            "evidence_id": "ev_" + identifier,
+            "ownership": "PRIMARY",
+            "modality": "transcript",
+            "artifact_id": "tr_1",
+            "artifact_hash": "sha256:" + "a" * 64,
+            "locator": {"segment_id": "seg_1", "frame_id": None, "start_ms": 1, "end_ms": 2, "bbox": None},
+            "content": "压舱层三到四成，核心层四到五成，卫星层一到二成。",
+        }],
+    })
+    return item
 
 
 def test_c14n_vectors_and_rejection():
@@ -361,3 +420,124 @@ def test_immutable_migration_declares_update_rejection():
     assert "content_knowledge_bundle" in migration
     assert "BEFORE UPDATE" in migration
     assert "immutable" in migration
+
+
+def test_v2_bundle_keeps_v1_replay_locked_and_exposes_reviewed_multitopic_semantics():
+    first, conflict = _v2_item("co_1"), _v2_item("co_2", review=True)
+    authority = Authority([first, conflict])
+    request = _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT)
+    bundle = _v2_service(authority).create(request)
+    schema = json.loads((Path(__file__).parents[1] / "contracts" / "content-knowledge-bundle.v2.json").read_text())
+    schema_path = Path(__file__).parents[1] / "contracts" / "content-knowledge-bundle.v2.json"
+    assert "sha256:" + hashlib.sha256(schema_path.read_bytes()).hexdigest().upper() == V2_CHECKSUM
+    assert not list(Draft202012Validator(schema, format_checker=FormatChecker()).iter_errors(bundle))
+    assert bundle["request"]["subject_scope"] == "ALL_SUBJECTS"
+    assert bundle["scope"] == {"subject_scope": "ALL_SUBJECTS", "requested_subject": None}
+    assert bundle["items"][0]["statement"] == "三层资金池分别承担压舱、核心和卫星风险"
+    assert bundle["quality"]["candidate_count"] == 2
+    assert bundle["quality"]["knowledge_count"] == 1
+    assert bundle["quality"]["eligible_candidate_count"] == 1
+    assert bundle["quality"]["excluded_candidate_count"] == 1
+    assert bundle["quality"]["truncated_candidate_count"] == 0
+    assert bundle["quality"]["grounded_count"] == 1
+    assert bundle["quality"]["grounded_ratio"] == 1
+    assert bundle["quality"]["numeric_grounded_ratio"] == 1
+    assert bundle["quality"]["human_review_required_count"] == 1
+    assert "HUMAN_REVIEW_REQUIRED_ITEMS_EXCLUDED" in bundle["quality"]["warnings"]
+    # Contract selection never mutates v1's canonical request/hash path.
+    assert _service(Authority([_item()])).create(_request())["contract"] == "content-knowledge-bundle.v1"
+
+
+def test_v2_requires_attribution_for_source_forecasts_and_explicit_unknown_time():
+    item = _v2_item(nature="FORECAST")
+    item["attribution"] = {"attributed": False, "source_label": None}
+    with pytest.raises(ValueError, match="ATTRIBUTION_REQUIRED"):
+        _v2_service(Authority([item])).create(_request(contract_version=V2_CONTRACT))
+    item = _v2_item()
+    item["temporal"] = {
+        "kind": "UNKNOWN", "start": "2026-09-06T00:00:00Z", "end": None, "as_of": None,
+        "rule": None, "label": None, "precision": "UNKNOWN", "explicitly_unknown": True,
+    }
+    with pytest.raises(ValueError, match="UNKNOWN_TEMPORAL_MUST_NOT_INVENT_DATE"):
+        _v2_service(Authority([item])).create(_request(contract_version=V2_CONTRACT))
+
+
+def test_v2_request_body_accepts_consistent_subject_scope_and_rejects_a_mismatch():
+    service = _v2_service(Authority([_v2_item()]))
+    application = type("App", (), {"create_knowledge_bundle": service.create, "get_knowledge_bundle": service.get})()
+    app = FastAPI()
+    app.include_router(create_knowledge_bundles_router(lambda: application))
+    request = _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT).canonical_request()
+    request = {
+        key: value.isoformat().replace("+00:00", "Z") if isinstance(value, datetime) else value
+        for key, value in request.items()
+    }
+    request["subject_scope"] = "ALL_SUBJECTS"
+    with TestClient(app) as client:
+        response = client.post("/v1/content/knowledge-bundles", json=request)
+        assert response.status_code == 200
+        assert response.json()["request"]["subject_scope"] == "ALL_SUBJECTS"
+        request["subject_scope"] = "SUBJECT_ONLY"
+        assert client.post("/v1/content/knowledge-bundles", json=request).status_code == 422
+
+
+def test_v2_quality_reconciles_published_items_after_truncation_and_excludes_conflicts():
+    eligible = [_v2_item(f"co_{letter}") for letter in ("a", "b", "c")]
+    for index, item in enumerate(eligible):
+        item["primary_domain"] = (
+            "AI_INFERENCE_COMPUTE",
+            "INFORMATION_INFRASTRUCTURE_POLICY",
+            "CENTRAL_BANK_GOLD_RESERVES",
+        )[index]
+        item["subject"] = {"type": "TOPIC", "key": f"topic_{index}"}
+        item["predicate"] = f"predicate_{index}"
+    review = _v2_item("co_review", review=True)
+    contradictory = _v2_item("co_conflict")
+    contradictory["contradiction_group_id"] = "cg_1"
+    bundle = _v2_service(Authority([review, eligible[2], contradictory, eligible[1], eligible[0]])).create(
+        _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT, max_items=2)
+    )
+    quality = bundle["quality"]
+    assert len(bundle["items"]) == quality["knowledge_count"] == 2
+    assert {item["occurrence_id"] for item in bundle["items"]}.isdisjoint({"co_review", "co_conflict"})
+    assert quality["candidate_count"] == 5
+    assert quality["eligible_candidate_count"] == 3
+    assert quality["excluded_candidate_count"] == 2
+    assert quality["truncated_candidate_count"] == 1
+    assert quality["grounded_count"] == 2
+    assert quality["numeric_candidate_count"] == quality["numeric_grounded_count"] == 2
+    assert quality["grounded_ratio"] == quality["numeric_grounded_ratio"] == 1
+    assert "PUBLIC_STRICT_ELIGIBLE_ITEMS_TRUNCATED" in quality["warnings"]
+    assert "CONFLICT_OR_REVIEW_EVIDENCE_PRESENT" in quality["warnings"]
+
+
+def test_v2_secondary_unchecked_fact_is_attributed_and_never_in_grounded_quality():
+    primary = _v2_item("co_primary")
+    secondary = _v2_item("co_secondary")
+    secondary.update({
+        "primary_domain": "CENTRAL_BANK_GOLD_RESERVES",
+        "claim_nature": "POLICY_FACT",
+        "source_grade": "SECONDARY",
+        "external_truth_status": "NOT_CHECKED",
+        "attribution": {"attributed": True, "source_label": "财经媒体报道"},
+    })
+    bundle = _v2_service(Authority([primary, secondary])).create(
+        _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT)
+    )
+    quality = bundle["quality"]
+    assert quality["knowledge_count"] == quality["numeric_candidate_count"] == 2
+    assert quality["grounded_count"] == quality["numeric_grounded_count"] == 1
+    assert quality["grounded_ratio"] == quality["numeric_grounded_ratio"] == 0.5
+    assert quality["secondary_only_count"] == quality["external_truth_not_checked_count"] == 1
+    assert "SECONDARY_EXTERNAL_FACTS_PRESENT" in quality["warnings"]
+    assert "EXTERNAL_TRUTH_NOT_CHECKED_ITEMS_PRESENT" in quality["warnings"]
+    item = next(value for value in bundle["items"] if value["occurrence_id"] == "co_secondary")
+    assert item["source_grade"] == "SECONDARY"
+    assert item["external_truth_status"] == "NOT_CHECKED"
+
+
+def test_v2_detail_that_only_repeats_the_statement_fails_closed():
+    item = _v2_item()
+    item["detail"] = {"explanation": item["statement"]}
+    with pytest.raises(ValueError, match="NONTRIVIAL_KNOWLEDGE_DETAIL_REQUIRED"):
+        _v2_service(Authority([item])).create(_request(contract_version=V2_CONTRACT))

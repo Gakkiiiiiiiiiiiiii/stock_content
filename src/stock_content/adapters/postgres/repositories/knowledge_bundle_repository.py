@@ -24,7 +24,7 @@ from stock_content.adapters.postgres.models import (
 )
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.domain.claim_state_event import ClaimStateEvent
-from stock_content.domain.knowledge_bundle import KnowledgeBundleRequest, sha256
+from stock_content.domain.knowledge_bundle import V2_CONTRACT, KnowledgeBundleRequest, sha256
 
 
 class PostgresKnowledgeBundleRepository:
@@ -137,22 +137,26 @@ class PostgresKnowledgeBundleAuthority:
                 for item in dict(evidence_artifact.payload or {}).get("evidences", [])
                 if isinstance(item, dict)
             }
+            predicates = [
+                ClaimArtifactMemberRow.artifact_id == claim_artifact_id,
+                FinancialClaimRow.claim_schema_version == "claim.atomic.v1",
+                FinancialClaimRow.grounding_status == "GROUNDED",
+                FinancialClaimRow.legacy_grounding_incomplete.is_(False),
+                ClaimOccurrenceRow.claim_schema_version == "claim.atomic.v1",
+                ClaimOccurrenceRow.grounding_status == "GROUNDED",
+                ClaimOccurrenceRow.legacy_grounding_incomplete.is_(False),
+                ClaimOccurrenceRow.available_from <= request.availability_as_of,
+                ClaimOccurrenceRow.snapshot_committed_at <= request.knowledge_as_of,
+            ]
+            # UNSPECIFIED is an explicit v2 *scope* selector.  It is never
+            # written back as a common subject for a multi-topic video.
+            if request.symbol.upper() != "UNSPECIFIED":
+                predicates.append(FinancialClaimRow.subject_id == request.symbol)
             rows = session.execute(
                 select(FinancialClaimRow, ClaimOccurrenceRow)
                 .join(ClaimArtifactMemberRow, ClaimArtifactMemberRow.claim_id == FinancialClaimRow.claim_id)
                 .join(ClaimOccurrenceRow, ClaimOccurrenceRow.claim_id == FinancialClaimRow.claim_id)
-                .where(
-                    ClaimArtifactMemberRow.artifact_id == claim_artifact_id,
-                    FinancialClaimRow.subject_id == request.symbol,
-                    FinancialClaimRow.claim_schema_version == "claim.atomic.v1",
-                    FinancialClaimRow.grounding_status == "GROUNDED",
-                    FinancialClaimRow.legacy_grounding_incomplete.is_(False),
-                    ClaimOccurrenceRow.claim_schema_version == "claim.atomic.v1",
-                    ClaimOccurrenceRow.grounding_status == "GROUNDED",
-                    ClaimOccurrenceRow.legacy_grounding_incomplete.is_(False),
-                    ClaimOccurrenceRow.available_from <= request.availability_as_of,
-                    ClaimOccurrenceRow.snapshot_committed_at <= request.knowledge_as_of,
-                ).order_by(
+                .where(*predicates).order_by(
                     FinancialClaimRow.subject_type,
                     FinancialClaimRow.subject_id,
                     FinancialClaimRow.predicate,
@@ -208,6 +212,71 @@ class PostgresKnowledgeBundleAuthority:
                     if link.evidence_id in evidence_map
                 ]
                 if not any(entry["ownership"] == "PRIMARY" for entry in evidence):
+                    continue
+                if request.contract_version == V2_CONTRACT:
+                    semantic = _v2_semantics(claim, occurrence)
+                    artifact_ids = {
+                        str(evidence_map[link.evidence_id].get("source_artifact_id") or "")
+                        for link in links
+                        if link.evidence_id in evidence_map
+                    }
+                    artifact_rows = {
+                        row.artifact_id: row
+                        for row in session.scalars(
+                            select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(artifact_ids - {""}))
+                        )
+                    }
+                    frame_artifact_ids = {
+                        str((row.payload or {}).get("frame_artifact_id") or "")
+                        for row in artifact_rows.values()
+                    } - {""}
+                    if frame_artifact_ids:
+                        artifact_rows.update({
+                            row.artifact_id: row
+                            for row in session.scalars(
+                                select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(frame_artifact_ids))
+                            )
+                        })
+                    direct_evidence = _v2_evidence(links, evidence_map, artifact_rows)
+                    items.append(
+                        {
+                            "knowledge_id": occurrence.occurrence_id,
+                            "claim_id": claim.claim_id,
+                            "occurrence_id": occurrence.occurrence_id,
+                            "statement": claim.normalized_statement,
+                            "subject": {"type": claim.subject_type, "key": claim.subject_id},
+                            "predicate": claim.predicate,
+                            "object": {"value": claim.value, "unit": claim.unit},
+                            "condition": claim.condition_text,
+                            "invalidation": claim.invalidation_text,
+                            "primary_domain": semantic["primary_domain"],
+                            "claim_nature": semantic["claim_nature"],
+                            "attribution": semantic["attribution"],
+                            "source_grade": semantic["source_grade"],
+                            "detail": semantic["detail"],
+                            "temporal": semantic["temporal"],
+                            "occurrence_review": semantic["occurrence_review"],
+                            "support_status": support_status,
+                            "lifecycle_status": lifecycle["status"],
+                            "confidence": claim.source_confidence,
+                            "evidence": direct_evidence,
+                            "verification": {
+                                "status": (
+                                    semantic["external_truth_status"]
+                                    if semantic["attribution"].get("attributed")
+                                    else verification_status
+                                ),
+                                "reason_codes": list(projection.get("verification_reason_codes") or []),
+                            },
+                            "external_truth_status": semantic["external_truth_status"],
+                            "contradiction_group_id": claim.contradiction_group_id,
+                            "known_from": lifecycle.get("known_from"),
+                            "available_from": projection.get("available_from"),
+                            "claim_schema_version": claim.claim_schema_version,
+                            "grounding_status": claim.grounding_status,
+                            "legacy_grounding_incomplete": claim.legacy_grounding_incomplete,
+                        }
+                    )
                     continue
                 items.append(
                     {
@@ -340,3 +409,127 @@ def _citation(value: dict[str, Any]) -> dict[str, Any]:
         "quote": quote,
         "quote_hash": sha256(quote),
     }
+
+
+def _v2_semantics(claim: FinancialClaimRow, occurrence: ClaimOccurrenceRow) -> dict[str, Any]:
+    """Read explicit occurrence semantics from immutable JSON authority.
+
+    The JSON columns are intentionally used for this additive projection: they
+    are already snapshot-bound, transactional and available to replayed rows.
+    Missing detail is not replaced with a vague sentence; the v2 validator
+    fails closed until the producer supplied an auditable structured detail.
+    """
+    payload = dict(claim.payload or {})
+    occurrence_payload = dict(occurrence.provenance or {})
+    semantic = dict(payload.get("bundle_v2") or {})
+    semantic.update(dict(occurrence_payload.get("bundle_v2") or {}))
+    nature = str(semantic.get("claim_nature") or claim.fact_category or "OPINION")
+    grounded_reasons = [str(value) for value in (claim.grounding_reason_codes or [])]
+    review = dict(semantic.get("occurrence_review") or {})
+    if not review:
+        conflict_reasons = [value for value in grounded_reasons if "CONFLICT" in value or "REVIEW" in value]
+        review = {
+            "status": "HUMAN_REVIEW_REQUIRED" if conflict_reasons else "NOT_REQUIRED",
+            "reason_codes": conflict_reasons,
+        }
+    return {
+        "primary_domain": str(semantic.get("primary_domain") or "UNKNOWN"),
+        "claim_nature": nature,
+        "attribution": dict(semantic.get("attribution") or {
+            "attributed": nature in {"OPINION", "FORECAST", "CAUSAL_THESIS"},
+            "source_label": "source_material" if nature in {"OPINION", "FORECAST", "CAUSAL_THESIS"} else None,
+        }),
+        "source_grade": str(semantic.get("source_grade") or "UNKNOWN"),
+        "detail": dict(semantic.get("detail") or {}),
+        "temporal": dict(semantic.get("temporal") or {
+            "kind": "UNKNOWN", "start": None, "end": None, "as_of": None,
+            "rule": None, "label": None, "precision": "UNKNOWN", "explicitly_unknown": True,
+        }),
+        "occurrence_review": review,
+        "external_truth_status": str(semantic.get("external_truth_status") or "NOT_CHECKED"),
+    }
+
+
+def _v2_evidence(
+    links, evidence_map: dict[str, dict[str, Any]], artifact_rows: dict[str, ContentArtifactRow]
+) -> list[dict[str, Any]]:
+    """Project direct immutable transcript/frame/OCR/vision citations.
+
+    Every evidence record keeps the exact content-addressed artifact hash. OCR
+    and vision records also retain their frame locator and model identity.  A
+    linked visual record emits its source Frame artifact as a distinct evidence
+    member, so consumers do not have to infer cross-modal support from text.
+    """
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in links:
+        value = evidence_map.get(link.evidence_id)
+        if value is None:
+            continue
+        artifact_id = str(value.get("source_artifact_id") or "")
+        artifact = artifact_rows.get(artifact_id)
+        if artifact is None:
+            raise ValueError("BUNDLE_EVIDENCE_ARTIFACT_MISSING")
+        modality = _v2_modality(value.get("source_type"))
+        locator_data = dict(value.get("locator") or {})
+        start_ms = value.get("start_ms")
+        end_ms = value.get("end_ms")
+        locator = {
+            "segment_id": locator_data.get("segment_id") or locator_data.get("segment_index"),
+            "frame_id": locator_data.get("frame_id"),
+            "start_ms": int(start_ms if start_ms is not None else locator_data.get("timestamp_ms") or 0),
+            "end_ms": int(end_ms if end_ms is not None else locator_data.get("timestamp_ms") or 0),
+            "bbox": locator_data.get("bbox"),
+        }
+        content = str(value.get("normalized_text") or value.get("evidence_text") or "")
+        if not content.strip():
+            raise ValueError("BUNDLE_EVIDENCE_QUOTE_MISSING")
+        entry: dict[str, Any] = {
+            "evidence_id": str(link.evidence_id),
+            "ownership": link.evidence_role,
+            "modality": modality,
+            "artifact_id": artifact.artifact_id,
+            "artifact_hash": "sha256:" + str(artifact.content_hash),
+            "locator": locator,
+            "content": content,
+        }
+        if modality in {"ocr", "vision"}:
+            entry["model"] = _v2_model_identity(artifact, modality)
+        result.append(entry)
+        seen.add(entry["evidence_id"])
+        frame_artifact_id = str((artifact.payload or {}).get("frame_artifact_id") or "")
+        frame = artifact_rows.get(frame_artifact_id)
+        if modality in {"ocr", "vision"} and frame is not None:
+            frame_id = str(locator.get("frame_id") or (frame.payload or {}).get("frame_id") or "")
+            frame_entry_id = f"{link.evidence_id}:frame"
+            if frame_entry_id not in seen and frame_id:
+                result.append({
+                    "evidence_id": frame_entry_id,
+                    "ownership": link.evidence_role,
+                    "modality": "frame",
+                    "artifact_id": frame.artifact_id,
+                    "artifact_hash": "sha256:" + str(frame.content_hash),
+                    "locator": {**locator, "frame_id": frame_id},
+                    "content": f"frame:{frame_id}",
+                })
+                seen.add(frame_entry_id)
+    return result
+
+
+def _v2_modality(value: Any) -> str:
+    source = str(value or "").strip().lower()
+    if source in {"ocr", "vision", "frame"}:
+        return source
+    return "transcript"
+
+
+def _v2_model_identity(artifact: ContentArtifactRow, modality: str) -> dict[str, Any]:
+    payload = dict(artifact.payload or {})
+    if modality == "ocr":
+        name, version = payload.get("engine"), payload.get("engine_version")
+    else:
+        name, version = payload.get("model_name") or payload.get("model"), payload.get("model_version")
+    if not str(name or "").strip() or not str(version or "").strip():
+        raise ValueError("BUNDLE_EVIDENCE_MODEL_IDENTITY_MISSING")
+    confidence = payload.get("confidence_score")
+    return {"name": str(name), "version": str(version), "confidence": confidence}

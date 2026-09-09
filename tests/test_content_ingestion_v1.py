@@ -93,6 +93,44 @@ def test_legacy_xiaoe_signed_locator_requires_secret_reference_and_never_records
     assert rejected.status_code == 422
 
 
+def test_xiaoe_page_url_is_reduced_to_stable_identity_before_durable_queue(monkeypatch, tmp_path):
+    """HTTP ingress persists an idempotent, secret-free page task.
+
+    This intentionally stops at the durable queue boundary.  The production
+    HTTP runner exercises the separately deployed media worker; this test
+    proves a retry cannot create a second logical task before that worker
+    claims it.
+    """
+    monkeypatch.setenv("CONTENT_INGESTION_CREDENTIAL_REFS", "xiaoe-storage-state")
+    database = Database(f"sqlite:///{tmp_path / 'xiaoe-ingestion.db'}")
+    database.create_schema()
+    application = _application(PostgresContentTaskRepository(database.session_factory))
+    client = _client(application)
+    page_url = (
+        "https://appaoswidcd4711.h5.xiaoeknow.com/p/course/video/"
+        "v_6a9e9ff1e4b0694c5c07a1f1?product_id=p_6a5ed542e4b0694c352d9382"
+    )
+    body = {
+        "source_type": "xiaoe",
+        "source_ref": page_url,
+        "part": 1,
+        "transcript_policy": "subtitle_first",
+        "options": {"language": "zh"},
+        "credential_ref": {"credential_ref": "xiaoe-storage-state", "provider": "file-secret"},
+    }
+    first = client.post("/v1/content/ingestions", json=body, headers={"Idempotency-Key": "xiaoe-http-e2e"})
+    second = client.post("/v1/content/ingestions", json=body, headers={"Idempotency-Key": "xiaoe-http-e2e"})
+    assert first.status_code == second.status_code == 200
+    assert first.json()["task_id"] == second.json()["task_id"]
+    with database.session_factory() as session:
+        rows = list(session.scalars(select(ContentTaskRow)))
+    assert len(rows) == 1
+    assert rows[0].source_type == "xiaoe"
+    assert rows[0].source_ref == "p_6a5ed542e4b0694c352d9382/v_6a9e9ff1e4b0694c5c07a1f1"
+    assert page_url not in repr(rows[0])
+    assert "xiaoe-storage-state" not in repr(rows[0])
+
+
 def test_bilibili_xor_and_idempotency_header_body_errors_are_stable():
     client = _client(_RecordingApplication())
     invalid = client.post(

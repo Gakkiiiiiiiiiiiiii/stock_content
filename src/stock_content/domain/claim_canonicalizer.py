@@ -9,6 +9,7 @@ from typing import Any
 from .artifacts import canonical_json
 from .claim_draft import ClaimOccurrenceDraft
 from .claims import CLAIM_CATEGORY, FinancialClaim
+from .knowledge_semantics import atomic_statement, bundle_v2_semantics
 
 
 def condition_key_of(condition_text: str | None, bindings: list[Any] | None = None) -> str | None:
@@ -79,6 +80,14 @@ class ClaimCanonicalizer:
         fact_time = getattr(primary_binding, "start_time", None) if primary_binding else None
         if fact_time is None and period_start is not None:
             fact_time = datetime.combine(period_start, time.min, tzinfo=UTC)
+        # ``ClaimOccurrenceDraft`` remains a legacy DTO and historical rows
+        # can lack proposition text.  Preserve their canonical identity and
+        # fail-closed grounding marker rather than applying Bundle v2's
+        # publication rule at this compatibility boundary.  Accepted atomic
+        # drafts always provide a statement; Bundle v2 validates that the
+        # published item is non-empty and proposition-only.
+        source_statement = draft.normalized_statement or draft.conclusion
+        statement = atomic_statement(source_statement) if source_statement else ""
         claim = FinancialClaim(
             claim_type=draft.claim_type,
             # Stage 2 may not promote an arbitrary knowledge_kind into the
@@ -98,7 +107,7 @@ class ClaimCanonicalizer:
             condition_text=draft.condition_text,
             invalidation_text=draft.invalidation_text,
             condition_key=condition_key_of(draft.condition_text, bindings),
-            normalized_statement=draft.normalized_statement or draft.conclusion,
+            normalized_statement=statement,
             grounding_status=draft.grounding_status,
             grounding_reason_codes=list(draft.grounding_reason_codes),
             contradiction_group_id=draft.contradiction_group_id,
@@ -112,6 +121,16 @@ class ClaimCanonicalizer:
             extractor_confidence=draft.extraction_confidence,
             claim_schema_version=draft.claim_schema_version,
             normalization_version=effective_normalization_version,
+            bundle_v2=(
+                bundle_v2_semantics(
+                    statement=statement,
+                    claim_type=draft.claim_type,
+                    supplied=draft.bundle_v2,
+                    temporal_expressions=[item.model_dump(mode="json") for item in draft.temporal_expressions],
+                )
+                if statement
+                else {}
+            ),
         )
         return claim
 

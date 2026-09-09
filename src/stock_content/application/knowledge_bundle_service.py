@@ -10,9 +10,18 @@ from stock_content.domain.knowledge_bundle import (
     CANONICALIZATION_VERSION,
     CONTRACT,
     SCHEMA_VERSION,
+    V2_CANONICALIZATION_VERSION,
+    V2_CONTRACT,
+    V2_SCHEMA_VERSION,
     KnowledgeBundleRequest,
     canonical_json,
     sha256,
+)
+from stock_content.domain.knowledge_bundle_v2 import (
+    conservative_quality,
+    public_strict_eligible,
+    sort_v2_items,
+    validate_v2_item,
 )
 from stock_content.domain.knowledge_enums import support_rank
 from stock_content.ports.knowledge_bundle_repository import KnowledgeBundleAuthority, KnowledgeBundleRepository
@@ -40,13 +49,17 @@ class KnowledgeBundleService:
         authority: KnowledgeBundleAuthority,
         repository: KnowledgeBundleRepository,
         producer: BundleProducerMetadata,
+        v2_contract_checksum: str | None = None,
     ) -> None:
         self._authority, self._repository, self._producer = authority, repository, producer
+        self._v2_contract_checksum = v2_contract_checksum
 
     def create(self, request: KnowledgeBundleRequest | Mapping[str, Any]) -> dict[str, Any]:
         request = (
             request if isinstance(request, KnowledgeBundleRequest) else KnowledgeBundleRequest.from_mapping(request)
         )
+        if request.contract_version == V2_CONTRACT:
+            return self._create_v2(request)
         source = self._authority.read_bundle_source(request)
         if source is None:
             raise ValueError("SNAPSHOT_NOT_FOUND")
@@ -102,6 +115,83 @@ class KnowledgeBundleService:
         digest = sha256(payload)
         bundle = {"bundle_id": "ckb_" + digest.removeprefix("sha256:"), "bundle_hash": digest, **payload}
         return self._repository.insert(bundle)
+
+    def _create_v2(self, request: KnowledgeBundleRequest) -> dict[str, Any]:
+        """Build v2 without changing the locked v1 identity or validation path."""
+        if not self._v2_contract_checksum:
+            raise ValueError("KNOWLEDGE_BUNDLE_PRODUCER_NOT_CONFIGURED")
+        source = self._authority.read_bundle_source(request)
+        if source is None:
+            raise ValueError("SNAPSHOT_NOT_FOUND")
+        if not source.get("snapshot_available"):
+            raise ValueError("SNAPSHOT_NOT_AVAILABLE")
+        if source.get("source_available_from") and _is_after(
+            source["source_available_from"], request.availability_as_of, "source_available_from"
+        ):
+            raise ValueError("SOURCE_NOT_AVAILABLE")
+        candidates: list[dict[str, Any]] = []
+        for raw in list(source.get("items") or []):
+            if raw.get("known_from") and _is_after(raw["known_from"], request.knowledge_as_of, "known_from"):
+                raise ValueError("KNOWLEDGE_AS_OF_EXCEEDED")
+            if raw.get("available_from") and _is_after(
+                raw["available_from"], request.availability_as_of, "available_from"
+            ):
+                raise ValueError("AVAILABILITY_AS_OF_EXCEEDED")
+            candidates.append(validate_v2_item(raw, minimum_support_status=request.minimum_support_status))
+        published = [
+            self._public_v2_item(item)
+            for item in candidates
+            if public_strict_eligible(item, request.minimum_support_status)
+        ]
+        published = sort_v2_items(published)[: request.max_items]
+        public_source = self._public_source(dict(source.get("source") or {}))
+        producer = {**self._producer.__dict__, "contract_checksum": self._v2_contract_checksum}
+        payload = json.loads(canonical_json({
+            "contract": V2_CONTRACT,
+            "schema_version": V2_SCHEMA_VERSION,
+            "canonicalization_version": V2_CANONICALIZATION_VERSION,
+            "request": request.canonical_request(),
+            "request_hash": request.request_hash,
+            "content_snapshot_id": request.content_snapshot_id,
+            "query": request.query,
+            "scope": {
+                "subject_scope": request.canonical_request()["subject_scope"],
+                "requested_subject": None if request.symbol.upper() == "UNSPECIFIED" else request.symbol,
+            },
+            "source": public_source,
+            "business_as_of": request.business_as_of,
+            "knowledge_as_of": request.knowledge_as_of,
+            "availability_as_of": request.availability_as_of,
+            "items": published,
+            "quality": {
+                **conservative_quality(
+                    candidates,
+                    published,
+                    list(source.get("warnings") or []),
+                    minimum_support_status=request.minimum_support_status,
+                ),
+                "transcript_coverage": source.get("transcript_coverage"),
+            },
+            "producer": producer,
+        }))
+        digest = sha256(payload)
+        bundle = {"bundle_id": "ckb_" + digest.removeprefix("sha256:"), "bundle_hash": digest, **payload}
+        return self._repository.insert(bundle)
+
+    @staticmethod
+    def _public_v2_item(item: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep only documented v2 fields; SQL-only audit columns stay internal."""
+        return {
+            key: item[key]
+            for key in (
+                "knowledge_id", "claim_id", "occurrence_id", "statement", "subject", "predicate", "object",
+                "condition", "invalidation", "primary_domain", "claim_nature", "attribution", "detail",
+                "source_grade", "temporal", "evidence", "occurrence_review", "support_status", "lifecycle_status",
+                "confidence", "verification", "contradiction_group_id", "grounding_status",
+                "external_truth_status",
+            )
+            if key in item
+        }
 
     def get(self, bundle_id: str) -> dict[str, Any] | None:
         return self._repository.get(bundle_id)

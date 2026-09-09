@@ -37,6 +37,7 @@ class ClaimOccurrence(BaseModel):
     semantic_segment_id: str
     assertion_locator_hash: str = ""
     evidence_refs: list[str] = Field(default_factory=list)
+    secondary_evidence_refs: list[str] = Field(default_factory=list)
     condition_evidence_refs: list[str] = Field(default_factory=list)
     invalidation_evidence_refs: list[str] = Field(default_factory=list)
     temporal_evidence_refs: list[str] = Field(default_factory=list)
@@ -61,7 +62,10 @@ class ClaimOccurrence(BaseModel):
                 raise ValueError("grounded occurrence requires primary evidence, quote, and normalized statement")
             if self.legacy_grounding_incomplete:
                 raise ValueError("grounded occurrence cannot be marked legacy incomplete")
-        all_refs = self.evidence_refs + self.condition_evidence_refs + self.invalidation_evidence_refs
+        all_refs = (
+            self.evidence_refs + self.secondary_evidence_refs + self.condition_evidence_refs
+            + self.invalidation_evidence_refs
+        )
         locator = self.assertion_locator_hash or assertion_locator_hash_of(
             self.source_artifact_id,
             self.transcript_artifact_id,
