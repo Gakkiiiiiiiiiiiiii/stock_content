@@ -3009,7 +3009,10 @@ def _occurrence_review(occurrence: ClaimOccurrence) -> dict[str, Any]:
     distinction prevents an extraction conflict from masquerading as either
     approval or rejection.
     """
-    provenance = dict(occurrence.provenance or {})
+    # Historical projections and compatibility callers may supply the
+    # pre-provenance occurrence shape.  Missing review provenance is
+    # equivalent to an explicit empty envelope, never an inferred approval.
+    provenance = dict(getattr(occurrence, "provenance", None) or {})
     envelope = dict(provenance.get("bundle_v2") or {})
     review = dict(envelope.get("occurrence_review") or {})
     reasons = sorted({str(item) for item in review.get("reason_codes") or [] if str(item)})

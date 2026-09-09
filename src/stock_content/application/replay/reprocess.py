@@ -177,7 +177,10 @@ class ReplayReprocessMixin:
                         request_hash=request_identity,
                     )
                 created_task = self._tasks.create(ContentTask(**task_values))
-                if created_task.task_id != task_id:
+                # Narrow legacy/in-memory task fakes predate the repository
+                # return value.  Only an explicit persisted task with a
+                # different identity is an idempotency reuse response.
+                if created_task is not None and getattr(created_task, "task_id", task_id) != task_id:
                     return self._reuse_replay_task(created_task, snapshot, mode)
             context = PipelineContext(task_id=task_id,
                                       source={"type": snapshot.source_type, "ref": snapshot.source_ref},
