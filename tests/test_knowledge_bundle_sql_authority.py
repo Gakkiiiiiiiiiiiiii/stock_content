@@ -4,34 +4,50 @@ import hashlib
 import json
 import subprocess
 import sys
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.models import (
     ClaimArtifactMemberRow,
     ClaimOccurrenceEvidenceRow,
     ClaimOccurrenceRow,
+    ContentArtifactEdgeRow,
     ContentArtifactRow,
     ContentSnapshotArtifactRow,
     ContentSnapshotRow,
     FinancialClaimRow,
-    SourceArtifactMetadataRow,
 )
+from stock_content.adapters.postgres.repositories.artifact_repository import _put_artifact_in_session
 from stock_content.adapters.postgres.repositories.claim_event_repository import ClaimStateEventRepository
 from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
     PostgresKnowledgeBundleAuthority,
     PostgresKnowledgeBundleRepository,
     _v2_semantics,
 )
+from stock_content.adapters.postgres.repositories.snapshot_repository import SnapshotIntegrityError
 from stock_content.application.knowledge_bundle_service import BundleProducerMetadata, KnowledgeBundleService
-from stock_content.domain.artifacts import EvidenceItem
+from stock_content.domain.artifacts import (
+    ClaimArtifact,
+    EvidenceArtifact,
+    EvidenceItem,
+    FrameArtifact,
+    OCRArtifact,
+    SemanticSegmentArtifact,
+    SourceArtifact,
+    TranscriptArtifact,
+    TranscriptVisualCrosscheckArtifact,
+    TranscriptVisualCrosscheckRecord,
+    VisionArtifact,
+)
 from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.knowledge_bundle import KnowledgeBundleRequest, canonical_json
+from stock_content.domain.lineage import build_content_snapshot
 
 
 def _at(day: int) -> datetime:
@@ -55,45 +71,14 @@ def _authority_with_snapshot(tmp_path, *, events: bool = True):
     database = Database(f"sqlite:///{tmp_path / 'bundle-authority.db'}")
     database.create_schema()
     with database.session_factory.begin() as session:
+        _put_fixture_artifacts(session)
+        _seal_snapshot(
+            session,
+            {"source": "source-1", "transcript": "transcript-1", "evidence": "evidence-1",
+             "claims": "claims-1", "semantic_segments": "semantic-1"},
+        )
         session.add_all(
             [
-                ContentArtifactRow(
-                    artifact_id="transcript-1", artifact_type="transcript", content_hash="t" * 64, payload={},
-                ),
-                ContentArtifactRow(
-                    artifact_id="source-1", artifact_type="source", content_hash="a" * 64,
-                    payload={
-                        "canonical_url": "https://example.test/video",
-                        "source_identity_hash": "source-identity",
-                        "source_version_id": "source-version-1",
-                    },
-                ),
-                SourceArtifactMetadataRow(
-                    artifact_id="source-1", source_policy_version="source-policy.v1", retention_class="raw_media",
-                    access_classification="PUBLIC", source_content_hash="d" * 64, content_size=1,
-                    mime_type="video/mp4", canonical_url="https://example.test/video", source_type="bilibili",
-                    source_id="fixture-video", source_identity_hash="source-identity",
-                    source_version_id="source-version-1",
-                    source_available_from=_at(1), pipeline_version="pipeline-test",
-                ),
-                ContentArtifactRow(
-                    artifact_id="claims-1", artifact_type="claims", content_hash="b" * 64, payload={},
-                ),
-                ContentArtifactRow(
-                    artifact_id="evidence-1", artifact_type="evidence", content_hash="c" * 64,
-                    # Persist the real EvidenceItem shape: it deliberately
-                    # has no per-item content_hash.  The SQL Bundle adapter
-                    # must hash the canonical public quote instead.
-                    payload={"evidences": [asdict(EvidenceItem(
-                        evidence_id="evidence-1", source_type="transcript", source_artifact_id="transcript-1",
-                        start_ms=1, end_ms=2, locator={"segment_id": "segment-1"}, normalized_text="收入增长",
-                    ))]},
-                ),
-                ContentSnapshotRow(
-                    content_snapshot_id="snapshot-1", source_type="bilibili", source_ref="BV1fixture",
-                    source_content_hash="d" * 64, artifact_ids={"claims": "claims-1", "evidence": "evidence-1"},
-                    source_artifact_id="source-1", created_at=_at(1),
-                ),
                 FinancialClaimRow(
                     claim_id="claim-1", claim_type="FACT", fact_category="FACT", subject_type="EQUITY",
                     subject_id="600000", predicate="revenue_growth", value=20, unit="percent",
@@ -147,6 +132,74 @@ def _snapshot_member(snapshot_id: str, slot: str, artifact_id: str) -> ContentSn
     )
 
 
+def _put_fixture_artifacts(session) -> None:
+    source = SourceArtifact(
+        artifact_id="source-1", artifact_type="source", source_type="bilibili", source_ref="BV1fixture",
+        source_content_hash="d" * 64, raw_content_hash="d" * 64, raw_content_length=1,
+        source_identity_hash="a" * 64, source_version_id="source-version-1",
+        source_metadata={
+            "source_policy_version": "source-policy.v1", "access_classification": "PUBLIC",
+            "mime_type": "video/mp4", "canonical_url": "https://www.bilibili.com/video/BV1fixture",
+            "source_id": "fixture-video", "source_available_from": _at(1).isoformat(),
+            "pipeline_version": "pipeline-test",
+        },
+    )
+    transcript = TranscriptArtifact(artifact_id="transcript-1", artifact_type="transcript")
+    evidence = EvidenceArtifact(
+        artifact_id="evidence-1", artifact_type="evidence", parent_artifact_ids=("transcript-1",),
+        transcript_artifact_id="transcript-1", evidences=[EvidenceItem(
+            evidence_id="evidence-1", source_type="transcript", source_artifact_id="transcript-1",
+            start_ms=1, end_ms=2, locator={"segment_id": "segment-1"}, normalized_text="收入增长",
+        )],
+    )
+    claims = ClaimArtifact(
+        artifact_id="claims-1", artifact_type="claims", parent_artifact_ids=("evidence-1",),
+        evidence_artifact_id="evidence-1",
+    )
+    semantic = SemanticSegmentArtifact(
+        artifact_id="semantic-1", artifact_type="semantic_segments", parent_artifact_ids=("transcript-1",),
+        transcript_artifact_id="transcript-1", model_id="fixture", prompt_version="fixture",
+    )
+    for artifact in (source, transcript, evidence, claims, semantic):
+        _put_artifact_in_session(session, artifact)
+
+
+def _seal_snapshot(session, artifact_ids: dict[str, str]) -> None:
+    """Persist a fully identity-bound v2 fixture snapshot and member ledger."""
+    snapshot = build_content_snapshot(
+        source_type="bilibili", source_ref="BV1fixture", source_content_hash="d" * 64,
+        source_artifact_id="source-1", artifact_ids=artifact_ids, code_sha="fixture-sha",
+        pipeline_version="pipeline-test", created_at=_at(1),
+    )
+    identity = snapshot.to_dict()
+    identity["content_snapshot_id"] = "snapshot-1"
+    identity["created_at"] = _at(1).isoformat()
+    row = session.get(ContentSnapshotRow, "snapshot-1")
+    values = {
+        "source_type": snapshot.source_type, "source_ref": snapshot.source_ref,
+        "source_content_hash": snapshot.source_content_hash, "artifact_ids": dict(artifact_ids),
+        "source_artifact_id": snapshot.source_artifact_id, "artifact_root_hash": snapshot.artifact_root_hash,
+        "pipeline_version": snapshot.pipeline_version, "schema_version": snapshot.schema_version,
+        "code_sha": snapshot.code_sha, "config_hash": snapshot.config_hash,
+        "snapshot_kind": snapshot.snapshot_kind, "parent_snapshot_id": snapshot.parent_snapshot_id,
+        "supersedes_snapshot_id": snapshot.supersedes_snapshot_id,
+        "producer_manifest": snapshot.producer_manifest, "identity": identity, "created_at": _at(1),
+    }
+    if row is None:
+        session.add(ContentSnapshotRow(content_snapshot_id="snapshot-1", **values))
+    else:
+        for key, value in values.items():
+            setattr(row, key, value)
+    for member in session.scalars(
+        select(ContentSnapshotArtifactRow).where(
+            ContentSnapshotArtifactRow.content_snapshot_id == "snapshot-1"
+        )
+    ):
+        session.delete(member)
+    session.flush()
+    session.add_all(_snapshot_member("snapshot-1", slot, artifact_id) for slot, artifact_id in artifact_ids.items())
+
+
 def _add_sealed_displayed_secondary_artifacts(session) -> None:
     """Attach one fully sealed displayed-secondary visual graph to fixture data."""
     snapshot = session.get(ContentSnapshotRow, "snapshot-1")
@@ -169,55 +222,41 @@ def _add_sealed_displayed_secondary_artifacts(session) -> None:
             "external_truth_status": "NOT_CHECKED",
         }
     }
-    session.add_all(
-        [
-            ContentArtifactRow(
-                artifact_id="frame-page", artifact_type="frame", content_hash="f" * 64,
-                payload={"frame_id": "frame-page", "timestamp_ms": 2},
-            ),
-            ContentArtifactRow(
-                artifact_id="vision-page", artifact_type="vision", content_hash="v" * 64,
-                parent_artifact_ids=["frame-page"],
-                payload={
-                    "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
-                    "semantic_segment_ids": ["segment-1"], "labels": ["secondary-news-page"],
-                    "label": "displayed secondary page", "model_name": "terra", "model_version": "1",
-                },
-            ),
-            ContentArtifactRow(
-                artifact_id="ocr-page", artifact_type="ocr", content_hash="o" * 64,
-                parent_artifact_ids=["frame-page"],
-                payload={
-                    "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
-                    "text": "2030年目标9800 EFLOPS", "bbox": [0, 0, 1, 1],
-                    "engine": "paddleocr", "engine_version": "3.7.0",
-                },
-            ),
-            ContentArtifactRow(
-                artifact_id="crosscheck-page", artifact_type="transcript_visual_crosscheck", content_hash="c" * 64,
-                parent_artifact_ids=["transcript-1", "frame-page", "vision-page", "ocr-page"],
-                payload={"relations": [{
-                    "frame_id": "frame-page", "frame_artifact_id": "frame-page", "timestamp_ms": 2,
-                    "semantic_segment_ids": ["segment-1"], "relation": "SUPPORTS_DISPLAYED_SECONDARY",
-                }]},
-            ),
-        ]
+    frame = FrameArtifact(
+        artifact_id="frame-page", artifact_type="frame", frame_id="frame-page", timestamp_ms=2,
+        image_hash="f" * 64, semantic_segment_ids=("segment-1",),
     )
-    snapshot.artifact_ids = {
+    vision = VisionArtifact(
+        artifact_id="vision-page", artifact_type="vision", parent_artifact_ids=("frame-page",),
+        frame_artifact_id="frame-page", frame_id="frame-page", timestamp_ms=2, image_hash="f" * 64,
+        semantic_segment_ids=("segment-1",), labels=["secondary-news-page"],
+        label="displayed secondary page", model_name="terra", model_version="1",
+    )
+    ocr = OCRArtifact(
+        artifact_id="ocr-page", artifact_type="ocr", parent_artifact_ids=("frame-page",),
+        frame_artifact_id="frame-page", frame_id="frame-page", timestamp_ms=2, image_hash="f" * 64,
+        semantic_segment_ids=("segment-1",), text="2030年目标9800 EFLOPS", bbox=[0, 0, 1, 1],
+        engine="paddleocr", engine_version="3.7.0",
+    )
+    crosscheck = TranscriptVisualCrosscheckArtifact(
+        artifact_id="crosscheck-page", artifact_type="transcript_visual_crosscheck",
+        parent_artifact_ids=("transcript-1", "semantic-1", "frame-page", "vision-page", "ocr-page"),
+        transcript_artifact_id="transcript-1", semantic_segment_artifact_id="semantic-1",
+        crosscheck_version="fixture", relations=(TranscriptVisualCrosscheckRecord(
+            frame_id="frame-page", frame_artifact_id="frame-page", timestamp_ms=2,
+            semantic_segment_ids=("segment-1",), relation="SUPPORTS_DISPLAYED_SECONDARY",
+        ),),
+    )
+    for artifact in (frame, vision, ocr, crosscheck):
+        _put_artifact_in_session(session, artifact)
+    artifact_ids = {
         **snapshot.artifact_ids,
         "frames:0": "frame-page",
         "ocr:0": "ocr-page",
         "vision:0": "vision-page",
         "transcript_visual_crosscheck": "crosscheck-page",
     }
-    session.add_all(
-        [
-            _snapshot_member("snapshot-1", "frames:0", "frame-page"),
-            _snapshot_member("snapshot-1", "ocr:0", "ocr-page"),
-            _snapshot_member("snapshot-1", "vision:0", "vision-page"),
-            _snapshot_member("snapshot-1", "transcript_visual_crosscheck", "crosscheck-page"),
-        ]
-    )
+    _seal_snapshot(session, artifact_ids)
 
 
 def test_sql_bundle_authority_uses_historical_status_not_current_rows(tmp_path):
@@ -382,10 +421,14 @@ def test_v2_sql_projection_adds_only_owned_displayed_secondary_page_evidence(
     with database.session_factory.begin() as session:
         _add_sealed_displayed_secondary_artifacts(session)
         claim = session.get(FinancialClaimRow, "claim-1")
-        claim.payload["bundle_v2"].update({
-            "claim_nature": claim_nature,
-            "attribution": {"attributed": True, "source_label": source_label},
-        })
+        claim.payload = {
+            **claim.payload,
+            "bundle_v2": {
+                **claim.payload["bundle_v2"],
+                "claim_nature": claim_nature,
+                "attribution": {"attributed": True, "source_label": source_label},
+            },
+        }
     request = replace(_request(), contract_version="content-knowledge-bundle.v2")
     item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(request)["items"][0]
     modalities = [entry["modality"] for entry in item["evidence"]]
@@ -407,10 +450,10 @@ def test_v2_compat_projection_rejects_visuals_without_sealed_crosscheck_membersh
             if key != "transcript_visual_crosscheck"
         }
 
-    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
-        replace(_request(), contract_version="content-knowledge-bundle.v2")
-    )["items"][0]
-    assert {entry["modality"] for entry in item["evidence"]} == {"transcript"}
+    with pytest.raises(SnapshotIntegrityError, match="artifact_ids"):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+            replace(_request(), contract_version="content-knowledge-bundle.v2")
+        )
 
 
 def test_v2_compat_projection_rejects_unrelated_crosscheck_relation(tmp_path):
@@ -425,10 +468,10 @@ def test_v2_compat_projection_rejects_unrelated_crosscheck_relation(tmp_path):
             }]
         }
 
-    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
-        replace(_request(), contract_version="content-knowledge-bundle.v2")
-    )["items"][0]
-    assert {entry["modality"] for entry in item["evidence"]} == {"transcript"}
+    with pytest.raises(SnapshotIntegrityError, match="invalid artifact"):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+            replace(_request(), contract_version="content-knowledge-bundle.v2")
+        )
 
 
 def test_v2_compat_projection_does_not_admit_ocr_without_sealed_snapshot_membership(tmp_path):
@@ -438,11 +481,10 @@ def test_v2_compat_projection_does_not_admit_ocr_without_sealed_snapshot_members
         snapshot = session.get(ContentSnapshotRow, "snapshot-1")
         snapshot.artifact_ids = {key: value for key, value in snapshot.artifact_ids.items() if key != "ocr:0"}
 
-    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
-        replace(_request(), contract_version="content-knowledge-bundle.v2")
-    )["items"][0]
-    assert {entry["modality"] for entry in item["evidence"]} == {"transcript", "frame", "vision"}
-    assert "ocr-page" not in {entry["artifact_id"] for entry in item["evidence"]}
+    with pytest.raises(SnapshotIntegrityError, match="artifact_ids"):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+            replace(_request(), contract_version="content-knowledge-bundle.v2")
+        )
 
 
 def test_v2_compat_projection_rejects_ocr_inserted_after_snapshot_seal(tmp_path):
@@ -466,3 +508,74 @@ def test_v2_compat_projection_rejects_ocr_inserted_after_snapshot_seal(tmp_path)
     )["items"][0]
     assert "ocr-page" in {entry["artifact_id"] for entry in item["evidence"]}
     assert "ocr-late" not in {entry["artifact_id"] for entry in item["evidence"]}
+
+
+@pytest.mark.parametrize("field", ("artifact_root_hash", "identity"))
+def test_bundle_authority_rejects_tampered_snapshot_root_or_identity(tmp_path, field):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        if field == "artifact_root_hash":
+            snapshot.artifact_root_hash = "0" * 64
+        else:
+            snapshot.identity = {**snapshot.identity, "source_ref": "tampered"}
+
+    with pytest.raises(SnapshotIntegrityError):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(_request())
+
+
+@pytest.mark.parametrize("tamper", ("hash", "payload", "edge"))
+def test_bundle_authority_rejects_tampered_canonical_artifact_or_edge(tmp_path, tamper):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        artifact = session.get(ContentArtifactRow, "evidence-1")
+        if tamper == "hash":
+            artifact.content_hash = "0" * 64
+        elif tamper == "payload":
+            artifact.payload = {**artifact.payload, "content_hash": "0" * 64}
+        else:
+            edge = session.scalar(
+                select(ContentArtifactEdgeRow).where(ContentArtifactEdgeRow.artifact_id == "evidence-1")
+            )
+            edge.relation = "TAMPERED"
+
+    with pytest.raises(SnapshotIntegrityError, match="invalid artifact|parent edges"):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(_request())
+
+
+def test_bundle_authority_rejects_missing_transcript_snapshot_member(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        member = session.get(
+            ContentSnapshotArtifactRow,
+            hashlib.sha256(b"snapshot-1:transcript:transcript-1").hexdigest(),
+        )
+        session.delete(member)
+
+    with pytest.raises(SnapshotIntegrityError, match="membership"):
+        PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(_request())
+
+
+@pytest.mark.parametrize("field", ("transcript_artifact_id", "semantic_segment_artifact_id"))
+def test_displayed_secondary_requires_crosscheck_payload_to_match_sealed_transcript_and_semantic(tmp_path, field):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        _add_sealed_displayed_secondary_artifacts(session)
+        mismatch = TranscriptVisualCrosscheckArtifact(
+            artifact_id=f"crosscheck-mismatch-{field}", artifact_type="transcript_visual_crosscheck",
+            parent_artifact_ids=("transcript-1", "semantic-1", "frame-page", "vision-page", "ocr-page"),
+            transcript_artifact_id="wrong-transcript" if field == "transcript_artifact_id" else "transcript-1",
+            semantic_segment_artifact_id="wrong-semantic" if field == "semantic_segment_artifact_id" else "semantic-1",
+            crosscheck_version="fixture", relations=(TranscriptVisualCrosscheckRecord(
+                frame_id="frame-page", frame_artifact_id="frame-page", timestamp_ms=2,
+                semantic_segment_ids=("segment-1",), relation="SUPPORTS_DISPLAYED_SECONDARY",
+            ),),
+        )
+        _put_artifact_in_session(session, mismatch)
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        _seal_snapshot(session, {**snapshot.artifact_ids, "transcript_visual_crosscheck": mismatch.artifact_id})
+
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+        replace(_request(), contract_version="content-knowledge-bundle.v2")
+    )["items"][0]
+    assert {entry["modality"] for entry in item["evidence"]} == {"transcript"}

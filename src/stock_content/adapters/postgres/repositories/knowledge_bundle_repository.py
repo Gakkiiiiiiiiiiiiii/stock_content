@@ -26,6 +26,9 @@ from stock_content.adapters.postgres.models import (
     FinancialClaimRow,
     SourceArtifactMetadataRow,
 )
+from stock_content.adapters.postgres.repositories.snapshot_repository import (
+    _validate_snapshot_row,
+)
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.knowledge_bundle import V2_CONTRACT, KnowledgeBundleRequest, sha256
@@ -191,6 +194,13 @@ class PostgresKnowledgeBundleAuthority:
             snapshot = session.get(ContentSnapshotRow, request.content_snapshot_id)
             if snapshot is None:
                 return None
+            # Bundle construction is an authority boundary, not merely a
+            # projection over convenient SQL rows.  Validate the immutable
+            # snapshot identity, normalized member ledger, canonical artifact
+            # rows and parent-edge closure before any row can contribute to a
+            # Bundle (including the legacy displayed-secondary compatibility
+            # reader below).
+            _validate_snapshot_row(session, snapshot)
             snapshot_available = _utc(snapshot.created_at) <= request.availability_as_of
             source_artifact = session.get(
                 ContentArtifactRow, snapshot.source_artifact_id or (snapshot.artifact_ids or {}).get("source")
@@ -701,16 +711,24 @@ def _displayed_secondary_snapshot_evidence(
     # be in its own transcript authority interval, not merely the chapter.
     interval_start, interval_end = min(starts), max(ends)
     members = _sealed_snapshot_members(session, snapshot)
+    transcript_id = members.get("transcript")
+    semantic_artifact_id = members.get("semantic_segments")
     crosscheck_id = members.get("transcript_visual_crosscheck")
     frame_ids = [value for key, value in members.items() if key.startswith("frames:")]
     vision_ids = [value for key, value in members.items() if key.startswith("vision:")]
     ocr_ids = [value for key, value in members.items() if key.startswith("ocr:")]
-    if not crosscheck_id or not frame_ids or not vision_ids:
+    if not transcript_id or not semantic_artifact_id or not crosscheck_id or not frame_ids or not vision_ids:
         return []
     crosscheck = session.get(ContentArtifactRow, crosscheck_id)
     if crosscheck is None or crosscheck.artifact_type != "transcript_visual_crosscheck":
         return []
     crosscheck_payload = dict(crosscheck.payload or {})
+    if (
+        str(crosscheck_payload.get("transcript_artifact_id") or "") != transcript_id
+        or str(crosscheck_payload.get("semantic_segment_artifact_id") or "") != semantic_artifact_id
+        or str(occurrence.transcript_artifact_id or "") != transcript_id
+    ):
+        return []
     relations = crosscheck_payload.get("relations")
     if not isinstance(relations, list):
         return []
@@ -720,7 +738,7 @@ def _displayed_secondary_snapshot_evidence(
     }
     # The relation must remain attached to the transcript authority that
     # selected this occurrence, rather than merely mention its frame.
-    if not primary_artifact_ids.intersection(crosscheck_parents):
+    if primary_artifact_ids != {transcript_id} or transcript_id not in crosscheck_parents:
         return []
     frames = {
         row.artifact_id: row
