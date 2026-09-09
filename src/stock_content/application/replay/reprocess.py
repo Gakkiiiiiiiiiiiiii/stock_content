@@ -9,6 +9,7 @@ from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay.errors import ReplayIntegrityError
 from stock_content.application.replay.identity import (
     canonical_migration_pipeline_version,
+    forbidden_runtime_override_keys,
     migration_derivation_namespace,
     migration_replay_idempotency_key,
     migration_replay_request_identity,
@@ -33,6 +34,19 @@ class ReplayReprocessMixin:
 
     def _reprocess(self, snapshot: Any, mode: str, pipeline_version: str | None,
                    overrides: dict[str, Any] | None) -> dict[str, Any]:
+        supplied_overrides = dict(overrides or {})
+        forbidden_keys = forbidden_runtime_override_keys(
+            supplied_overrides, runtime_option_keys=self._RUNTIME_OPTIONS
+        )
+        if forbidden_keys:
+            # Reject before loading mutable worker inputs or reserving a task
+            # idempotency row.  The response exposes only key names, never
+            # their caller-supplied values.
+            raise ReplayIntegrityError(
+                "REPLAY_OVERRIDE_FORBIDDEN",
+                "replay overrides cannot set runtime options",
+                forbidden_keys=list(forbidden_keys),
+            )
         if self._pipeline is None or self._artifacts is None:
             return {"error": "REPLAY_UNAVAILABLE", "mode": mode,
                     "source_snapshot_id": snapshot.content_snapshot_id}
@@ -62,7 +76,7 @@ class ReplayReprocessMixin:
                 raise ReplayIntegrityError("REPLAY_INPUT_UNAVAILABLE",
                                            "immutable task options are unavailable for this snapshot")
             options = {key: value for key, value in options.items() if key not in self._RUNTIME_OPTIONS}
-            options.update(dict(overrides or {}))
+            options.update(supplied_overrides)
             # These values are replay-worker capabilities, not caller input.
             # They are repopulated below only from the source artifact which
             # already passed snapshot lineage validation.
@@ -168,7 +182,7 @@ class ReplayReprocessMixin:
                     request_identity = migration_replay_request_identity(
                         snapshot.content_snapshot_id,
                         pipeline_version,
-                        overrides,
+                        supplied_overrides,
                         runtime_option_keys=self._RUNTIME_OPTIONS,
                     )
                     task_values.update(

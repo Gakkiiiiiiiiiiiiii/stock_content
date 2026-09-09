@@ -415,6 +415,7 @@ def create_app(
                 "SNAPSHOT_NOT_FOUND": 404,
                 "INVALID_REPLAY_MODE": 422,
                 "INVALID_REPLAY_REQUEST": 422,
+                "REPLAY_OVERRIDE_FORBIDDEN": 422,
                 "REPLAY_ARTIFACT_MISSING": 409,
                 "REPLAY_ARTIFACT_HASH_MISMATCH": 409,
                 "REPLAY_LINEAGE_CYCLE": 409,

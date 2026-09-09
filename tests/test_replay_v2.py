@@ -414,7 +414,7 @@ def test_migration_replay_rejects_unsealed_or_invalid_raw_media(tmp_path, monkey
     assert result["error"] == "REPLAY_INPUT_UNAVAILABLE"
 
 
-def test_replay_ignores_request_override_of_a_sealed_media_path(tmp_path, monkeypatch):
+def test_replay_rejects_request_override_of_a_sealed_media_path(tmp_path, monkeypatch):
     replay, snapshot, _source, media, adapter, pipeline = _sealed_media_replay(tmp_path, monkeypatch)
     attacker_path = tmp_path / "attacker.mp4"
     attacker_path.write_bytes(b"attacker-bytes")
@@ -426,9 +426,10 @@ def test_replay_ignores_request_override_of_a_sealed_media_path(tmp_path, monkey
         overrides={"replay_raw_storage_uri": str(attacker_path), "replay_expected_raw_hash": "0" * 64},
     )
 
-    assert "error" not in result
+    assert result["error"] == "REPLAY_OVERRIDE_FORBIDDEN"
+    assert result["forbidden_keys"] == ["replay_expected_raw_hash", "replay_raw_storage_uri"]
     assert adapter.resolve_calls == 0
-    assert pipeline.context.runtime.video_path == media.resolve()
+    assert pipeline.context is None
 
 
 def test_migration_replay_uses_a_stable_pipeline_specific_derivation_namespace(tmp_path, monkeypatch):

@@ -7,10 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
-from stock_content.adapters.postgres.models import ClaimStateEventRow
+from stock_content.adapters.postgres.models import ClaimStateEventRow, ContentTaskRow
 from stock_content.api.dependencies import build_application
 from stock_content.api.main import create_app
 from stock_content.api.security import ServiceAuthorizer
+from stock_content.application.replay.identity import migration_replay_request_identity
+from stock_content.application.replay_service import ReplayService
 
 
 class _AuthenticatedClient:
@@ -389,6 +391,74 @@ def test_migration_replay_request_identity_does_not_reuse_a_failed_other_pipelin
     )
     assert changed_override.status_code == 200
     assert changed_override.json()["replay_id"] != successful.json()["replay_id"]
+
+
+@pytest.mark.parametrize("forbidden_key", sorted(ReplayService._RUNTIME_OPTIONS))
+def test_replay_rejects_each_reserved_runtime_override_before_creating_a_task(tmp_path, forbidden_key):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = _client(application, tmp_path)
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1reserved", "options": _ingest_options()}
+    )
+    application.process_next("replay-reserved-override")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    with application._tasks._sessions() as session:  # noqa: SLF001
+        before = list(session.scalars(select(ContentTaskRow)))
+
+    response = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={
+            "mode": "MIGRATION_REPLAY",
+            "pipeline_version": "pipeline.v4.reserved",
+            "overrides": {forbidden_key: "do-not-disclose-runtime-value"},
+        },
+    )
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "REPLAY_OVERRIDE_FORBIDDEN"
+    assert error["details"]["forbidden_keys"] == [forbidden_key]
+    assert "do-not-disclose-runtime-value" not in response.text
+    with application._tasks._sessions() as session:  # noqa: SLF001
+        after = list(session.scalars(select(ContentTaskRow)))
+    assert [row.task_id for row in after] == [row.task_id for row in before]
+    assert not any(row.idempotency_key and row.idempotency_key.startswith("replay-migration-") for row in after)
+
+
+def test_invalid_runtime_override_cannot_poison_later_clean_migration_identity(tmp_path):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = _client(application, tmp_path)
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1cleanidentity", "options": _ingest_options()}
+    )
+    application.process_next("replay-clean-identity")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    request = {"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.clean-identity"}
+
+    invalid = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={**request, "overrides": {"temporal_reference_provider": "caller-controlled"}},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "REPLAY_OVERRIDE_FORBIDDEN"
+
+    clean = client.post(f"/api/v1/content-snapshots/{snapshot_id}/replay", json=request)
+    assert clean.status_code == 200, clean.text
+    replay_id = clean.json()["replay_id"]
+    with application._tasks._sessions() as session:  # noqa: SLF001
+        rows = list(session.scalars(select(ContentTaskRow)))
+    assert [row.task_id for row in rows].count(replay_id) == 1
+    assert len(rows) == 2
+
+
+def test_migration_replay_identity_rejects_runtime_override_instead_of_omitting_it():
+    with pytest.raises(ValueError, match="runtime overrides"):
+        migration_replay_request_identity(
+            "cs-identity-guard",
+            "pipeline.v4.identity-guard",
+            {"replay_lifecycle_timestamp": "caller-clock"},
+            runtime_option_keys=ReplayService._RUNTIME_OPTIONS,
+        )
 
 
 def test_migration_replay_reuses_sealed_source_clock_and_artifact_hashes(tmp_path):
