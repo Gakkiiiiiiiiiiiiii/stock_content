@@ -17,6 +17,7 @@ from stock_content.adapters.postgres.models import (
     ClaimOccurrenceEvidenceRow,
     ClaimOccurrenceRow,
     ContentArtifactRow,
+    ContentSnapshotArtifactRow,
     ContentSnapshotRow,
     FinancialClaimRow,
     SourceArtifactMetadataRow,
@@ -135,6 +136,88 @@ def _authority_with_snapshot(tmp_path, *, events: bool = True):
         ledger.append(active)
         return database, active
     return database, None
+
+
+def _snapshot_member(snapshot_id: str, slot: str, artifact_id: str) -> ContentSnapshotArtifactRow:
+    return ContentSnapshotArtifactRow(
+        member_id=hashlib.sha256(f"{snapshot_id}:{slot}:{artifact_id}".encode()).hexdigest(),
+        content_snapshot_id=snapshot_id,
+        artifact_id=artifact_id,
+        slot=slot,
+    )
+
+
+def _add_sealed_displayed_secondary_artifacts(session) -> None:
+    """Attach one fully sealed displayed-secondary visual graph to fixture data."""
+    snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+    claim = session.get(FinancialClaimRow, "claim-1")
+    occurrence = session.get(ClaimOccurrenceRow, "occurrence-1")
+    occurrence.semantic_segment_id = "segment-1"
+    claim.normalized_statement = "2030年目标9800 EFLOPS"
+    claim.payload = {
+        "bundle_v2": {
+            "claim_nature": "ATTRIBUTED_SECONDARY_POLICY_REPORT",
+            "primary_domain": "INFORMATION_INFRASTRUCTURE_POLICY",
+            "attribution": {"attributed": True, "source_label": "displayed secondary policy page"},
+            "source_grade": "SECONDARY",
+            "detail": {"explanation": "展示页面写有2030和9800。"},
+            "temporal": {
+                "kind": "FORECAST_TARGET", "start": "2030", "end": None,
+                "as_of": None, "rule": None, "label": "2030", "precision": "YEAR",
+                "explicitly_unknown": False,
+            },
+            "external_truth_status": "NOT_CHECKED",
+        }
+    }
+    session.add_all(
+        [
+            ContentArtifactRow(
+                artifact_id="frame-page", artifact_type="frame", content_hash="f" * 64,
+                payload={"frame_id": "frame-page", "timestamp_ms": 2},
+            ),
+            ContentArtifactRow(
+                artifact_id="vision-page", artifact_type="vision", content_hash="v" * 64,
+                parent_artifact_ids=["frame-page"],
+                payload={
+                    "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
+                    "semantic_segment_ids": ["segment-1"], "labels": ["secondary-news-page"],
+                    "label": "displayed secondary page", "model_name": "terra", "model_version": "1",
+                },
+            ),
+            ContentArtifactRow(
+                artifact_id="ocr-page", artifact_type="ocr", content_hash="o" * 64,
+                parent_artifact_ids=["frame-page"],
+                payload={
+                    "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
+                    "text": "2030年目标9800 EFLOPS", "bbox": [0, 0, 1, 1],
+                    "engine": "paddleocr", "engine_version": "3.7.0",
+                },
+            ),
+            ContentArtifactRow(
+                artifact_id="crosscheck-page", artifact_type="transcript_visual_crosscheck", content_hash="c" * 64,
+                parent_artifact_ids=["transcript-1", "frame-page", "vision-page", "ocr-page"],
+                payload={"relations": [{
+                    "frame_id": "frame-page", "frame_artifact_id": "frame-page", "timestamp_ms": 2,
+                    "semantic_segment_ids": ["segment-1"], "relation": "SUPPORTS_DISPLAYED_SECONDARY",
+                }]},
+            ),
+        ]
+    )
+    snapshot.artifact_ids = {
+        **snapshot.artifact_ids,
+        "frames:0": "frame-page",
+        "ocr:0": "ocr-page",
+        "vision:0": "vision-page",
+        "transcript_visual_crosscheck": "crosscheck-page",
+    }
+    session.add_all(
+        [
+            _snapshot_member("snapshot-1", "frames:0", "frame-page"),
+            _snapshot_member("snapshot-1", "ocr:0", "ocr-page"),
+            _snapshot_member("snapshot-1", "vision:0", "vision-page"),
+            _snapshot_member("snapshot-1", "transcript_visual_crosscheck", "crosscheck-page"),
+        ]
+    )
 
 
 def test_sql_bundle_authority_uses_historical_status_not_current_rows(tmp_path):
@@ -297,55 +380,12 @@ def test_v2_sql_projection_adds_only_owned_displayed_secondary_page_evidence(
 ):
     database, _ = _authority_with_snapshot(tmp_path)
     with database.session_factory.begin() as session:
-        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        _add_sealed_displayed_secondary_artifacts(session)
         claim = session.get(FinancialClaimRow, "claim-1")
-        occurrence = session.get(ClaimOccurrenceRow, "occurrence-1")
-        occurrence.semantic_segment_id = "segment-1"
-        claim.normalized_statement = "2030年目标9800 EFLOPS"
-        claim.payload = {
-            "bundle_v2": {
-                "claim_nature": claim_nature,
-                "primary_domain": "INFORMATION_INFRASTRUCTURE_POLICY",
-                "attribution": {"attributed": True, "source_label": source_label},
-                "source_grade": "SECONDARY",
-                "detail": {"explanation": "展示页面写有2030和9800。"},
-                "temporal": {
-                    "kind": "FORECAST_TARGET", "start": "2030", "end": None,
-                    "as_of": None, "rule": None, "label": "2030", "precision": "YEAR",
-                    "explicitly_unknown": False,
-                },
-                "external_truth_status": "NOT_CHECKED",
-            }
-        }
-        session.add_all(
-            [
-                ContentArtifactRow(
-                    artifact_id="frame-page", artifact_type="frame", content_hash="f" * 64,
-                    payload={"frame_id": "frame-page", "timestamp_ms": 2},
-                ),
-                ContentArtifactRow(
-                    artifact_id="vision-page", artifact_type="vision", content_hash="v" * 64,
-                    payload={
-                        "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
-                        "semantic_segment_ids": ["segment-1"], "labels": ["secondary-news-page"],
-                        "label": "displayed secondary page", "model_name": "terra", "model_version": "1",
-                    },
-                ),
-                ContentArtifactRow(
-                    artifact_id="ocr-page", artifact_type="ocr", content_hash="o" * 64,
-                    payload={
-                        "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
-                        "text": "2030年目标9800 EFLOPS", "bbox": [0, 0, 1, 1],
-                        "engine": "paddleocr", "engine_version": "3.7.0",
-                    },
-                ),
-            ]
-        )
-        snapshot.artifact_ids = {
-            **snapshot.artifact_ids,
-            "frames:0": "frame-page",
-            "vision:0": "vision-page",
-        }
+        claim.payload["bundle_v2"].update({
+            "claim_nature": claim_nature,
+            "attribution": {"attributed": True, "source_label": source_label},
+        })
     request = replace(_request(), contract_version="content-knowledge-bundle.v2")
     item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(request)["items"][0]
     modalities = [entry["modality"] for entry in item["evidence"]]
@@ -354,3 +394,75 @@ def test_v2_sql_projection_adds_only_owned_displayed_secondary_page_evidence(
     assert ("vision" in modalities) is expected_visual
     assert item["source_grade"] == "SECONDARY"
     assert item["external_truth_status"] == "NOT_CHECKED"
+
+
+def test_v2_compat_projection_rejects_visuals_without_sealed_crosscheck_membership(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        _add_sealed_displayed_secondary_artifacts(session)
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        snapshot.artifact_ids = {
+            key: value
+            for key, value in snapshot.artifact_ids.items()
+            if key != "transcript_visual_crosscheck"
+        }
+
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+        replace(_request(), contract_version="content-knowledge-bundle.v2")
+    )["items"][0]
+    assert {entry["modality"] for entry in item["evidence"]} == {"transcript"}
+
+
+def test_v2_compat_projection_rejects_unrelated_crosscheck_relation(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        _add_sealed_displayed_secondary_artifacts(session)
+        crosscheck = session.get(ContentArtifactRow, "crosscheck-page")
+        crosscheck.payload = {
+            "relations": [{
+                **crosscheck.payload["relations"][0],
+                "relation": "UNRELATED",
+            }]
+        }
+
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+        replace(_request(), contract_version="content-knowledge-bundle.v2")
+    )["items"][0]
+    assert {entry["modality"] for entry in item["evidence"]} == {"transcript"}
+
+
+def test_v2_compat_projection_does_not_admit_ocr_without_sealed_snapshot_membership(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        _add_sealed_displayed_secondary_artifacts(session)
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        snapshot.artifact_ids = {key: value for key, value in snapshot.artifact_ids.items() if key != "ocr:0"}
+
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+        replace(_request(), contract_version="content-knowledge-bundle.v2")
+    )["items"][0]
+    assert {entry["modality"] for entry in item["evidence"]} == {"transcript", "frame", "vision"}
+    assert "ocr-page" not in {entry["artifact_id"] for entry in item["evidence"]}
+
+
+def test_v2_compat_projection_rejects_ocr_inserted_after_snapshot_seal(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        _add_sealed_displayed_secondary_artifacts(session)
+        session.add(
+            ContentArtifactRow(
+                artifact_id="ocr-late", artifact_type="ocr", content_hash="l" * 64,
+                parent_artifact_ids=["frame-page"],
+                payload={
+                    "frame_artifact_id": "frame-page", "frame_id": "frame-page", "timestamp_ms": 2,
+                    "text": "2030年目标9800 EFLOPS", "bbox": [0, 0, 1, 1],
+                    "engine": "paddleocr", "engine_version": "3.7.0",
+                },
+            )
+        )
+
+    item = PostgresKnowledgeBundleAuthority(database.session_factory).read_bundle_source(
+        replace(_request(), contract_version="content-knowledge-bundle.v2")
+    )["items"][0]
+    assert "ocr-page" in {entry["artifact_id"] for entry in item["evidence"]}
+    assert "ocr-late" not in {entry["artifact_id"] for entry in item["evidence"]}

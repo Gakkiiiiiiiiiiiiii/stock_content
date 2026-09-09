@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, date, datetime, time
 from typing import Any
@@ -20,6 +21,7 @@ from stock_content.adapters.postgres.models import (
     ContentArtifactRow,
     ContentKnowledgeBundleIdempotencyRow,
     ContentKnowledgeBundleRow,
+    ContentSnapshotArtifactRow,
     ContentSnapshotRow,
     FinancialClaimRow,
     SourceArtifactMetadataRow,
@@ -638,6 +640,32 @@ _DISPLAYED_SECONDARY_NATURES = frozenset(
 _NUMBER_TOKEN = re.compile(r"\d+(?:[.,]\d+)?")
 
 
+def _sealed_snapshot_members(session, snapshot: ContentSnapshotRow) -> dict[str, str]:
+    """Return only normalized, hash-bound membership for this snapshot.
+
+    ``artifact_ids`` is part of the snapshot identity, while
+    ``content_snapshot_artifact`` is the normalized membership ledger.  The
+    compatibility reader needs both: accepting only an ID from either one
+    would let a later artifact (or a tampered projection row) bleed into an
+    already sealed snapshot.
+    """
+    declared = {str(slot): str(artifact_id) for slot, artifact_id in dict(snapshot.artifact_ids or {}).items()}
+    members = session.scalars(
+        select(ContentSnapshotArtifactRow).where(
+            ContentSnapshotArtifactRow.content_snapshot_id == snapshot.content_snapshot_id
+        )
+    ).all()
+    result: dict[str, str] = {}
+    for member in members:
+        slot, artifact_id = str(member.slot), str(member.artifact_id)
+        expected_member_id = hashlib.sha256(
+            f"{snapshot.content_snapshot_id}:{slot}:{artifact_id}".encode()
+        ).hexdigest()
+        if declared.get(slot) == artifact_id and member.member_id == expected_member_id:
+            result[slot] = artifact_id
+    return result
+
+
 def _displayed_secondary_snapshot_evidence(
     *,
     session,
@@ -672,10 +700,27 @@ def _displayed_secondary_snapshot_evidence(
     # An occurrence may cite separated ASR fragments.  The frame must still
     # be in its own transcript authority interval, not merely the chapter.
     interval_start, interval_end = min(starts), max(ends)
-    artifact_ids = dict(snapshot.artifact_ids or {})
-    frame_ids = [value for key, value in artifact_ids.items() if str(key).startswith("frames:")]
-    vision_ids = [value for key, value in artifact_ids.items() if str(key).startswith("vision:")]
-    if not frame_ids or not vision_ids:
+    members = _sealed_snapshot_members(session, snapshot)
+    crosscheck_id = members.get("transcript_visual_crosscheck")
+    frame_ids = [value for key, value in members.items() if key.startswith("frames:")]
+    vision_ids = [value for key, value in members.items() if key.startswith("vision:")]
+    ocr_ids = [value for key, value in members.items() if key.startswith("ocr:")]
+    if not crosscheck_id or not frame_ids or not vision_ids:
+        return []
+    crosscheck = session.get(ContentArtifactRow, crosscheck_id)
+    if crosscheck is None or crosscheck.artifact_type != "transcript_visual_crosscheck":
+        return []
+    crosscheck_payload = dict(crosscheck.payload or {})
+    relations = crosscheck_payload.get("relations")
+    if not isinstance(relations, list):
+        return []
+    crosscheck_parents = {str(item) for item in (crosscheck.parent_artifact_ids or ()) if str(item)}
+    primary_artifact_ids = {
+        str(item.get("source_artifact_id") or "") for item in primary_evidence if item.get("source_artifact_id")
+    }
+    # The relation must remain attached to the transcript authority that
+    # selected this occurrence, rather than merely mention its frame.
+    if not primary_artifact_ids.intersection(crosscheck_parents):
         return []
     frames = {
         row.artifact_id: row
@@ -694,11 +739,30 @@ def _displayed_secondary_snapshot_evidence(
         labels = set(str(item) for item in (payload.get("labels") or ()))
         timestamp = int(payload.get("timestamp_ms") or 0)
         semantic_ids = set(str(item) for item in (payload.get("semantic_segment_ids") or ()))
+        frame_id = str(payload.get("frame_id") or "")
+        relation_matches = any(
+            isinstance(relation, dict)
+            and relation.get("relation") == "SUPPORTS_DISPLAYED_SECONDARY"
+            and str(relation.get("frame_id") or "") == frame_id
+            and str(relation.get("frame_artifact_id") or "") == frame_artifact_id
+            and int(relation.get("timestamp_ms") or 0) == timestamp
+            and str(occurrence.semantic_segment_id)
+            in {str(item) for item in (relation.get("semantic_segment_ids") or ())}
+            for relation in relations
+        )
         if (
             frame is not None
+            and frame.artifact_type == "frame"
+            and vision.artifact_type == "vision"
+            and str((frame.payload or {}).get("frame_id") or "") == frame_id
+            and int((frame.payload or {}).get("timestamp_ms") or 0) == timestamp
             and "secondary-news-page" in labels
             and str(occurrence.semantic_segment_id) in semantic_ids
             and interval_start <= timestamp <= interval_end
+            and frame_artifact_id in crosscheck_parents
+            and vision.artifact_id in crosscheck_parents
+            and frame_artifact_id in {str(item) for item in (vision.parent_artifact_ids or ())}
+            and relation_matches
         ):
             candidates.append((frame, vision))
     if not candidates:
@@ -742,15 +806,24 @@ def _displayed_secondary_snapshot_evidence(
     ]
     detail_text = " ".join(str(value) for value in dict(semantic.get("detail") or {}).values() if value)
     terms = set(_NUMBER_TOKEN.findall(f"{detail_text} {occurrence.normalized_statement or ''}"))
-    ocr_rows = session.scalars(
-        select(ContentArtifactRow).where(
-            ContentArtifactRow.artifact_type == "ocr",
-            ContentArtifactRow.payload["frame_artifact_id"].as_string() == frame.artifact_id,
-        )
-    ).all()
+    ocr_rows = (
+        session.scalars(
+            select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(sorted(set(ocr_ids))))
+        ).all()
+        if ocr_ids
+        else []
+    )
     scored = []
     for ocr in ocr_rows:
         payload = dict(ocr.payload or {})
+        if (
+            ocr.artifact_type != "ocr"
+            or str(payload.get("frame_artifact_id") or "") != frame.artifact_id
+            or str(payload.get("frame_id") or "") != frame_id
+            or frame.artifact_id not in {str(item) for item in (ocr.parent_artifact_ids or ())}
+            or ocr.artifact_id not in crosscheck_parents
+        ):
+            continue
         content = str(payload.get("text") or "").strip()
         if not content:
             continue
