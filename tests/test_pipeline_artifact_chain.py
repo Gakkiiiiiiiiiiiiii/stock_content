@@ -504,6 +504,57 @@ def test_cross_application_resume_does_not_rerun_expensive_prefix(tmp_path):
     assert resumed["summary"] == clean_result["summary"]
 
 
+def test_cross_application_resume_rebuilds_asr_candidate_before_failed_selection(tmp_path):
+    """A takeover at selection must consume the sealed ASR candidate, not re-run ASR."""
+    database_url = f"sqlite:///{tmp_path / 'asr-selection-resume.db'}"
+    first = build_application(database_url, enable_qdrant=False)
+    task = first.enqueue(
+        "bilibili",
+        "BV-asr-selection-resume",
+        {
+            "metadata": {"title": "ASR resume"},
+            "transcript": "沪深300的风险预算应结合止损宽度计算。",
+            "offline_fixture": True,
+        },
+    )
+    selection_runner = next(
+        runner for runner in first._pipeline._stages if runner.name == "transcript_selection"  # noqa: SLF001
+    )
+
+    def fail_after_asr(_context):
+        raise RuntimeError("selection failed after durable ASR")
+
+    selection_runner._stage.execute = fail_after_asr  # noqa: SLF001
+    failed = first.process_next("worker-one")
+    assert failed["status"] == "FAILED"
+    assert failed["stage"] == "transcript_selection"
+
+    second = build_application(database_url, enable_qdrant=False)
+    restored_task = second._tasks.get(task["task_id"])  # noqa: SLF001
+    restored_context = PipelineContext(
+        task_id=task["task_id"],
+        source={"type": restored_task.source_type, "ref": restored_task.source_ref},
+        options=restored_task.options,
+    )
+    assert second._restore_resume_context(restored_context, restored_task)  # noqa: SLF001
+    asr_candidates = restored_context.state.transcript_candidates
+    assert len(asr_candidates) == 1
+    assert asr_candidates[0].source.value == "ASR"
+    assert asr_candidates[0].language == "zh"
+    assert all(segment.source.value == "ASR" for segment in asr_candidates[0].segments)
+    assert all(segment.alignment_status.value == "ALIGNED" for segment in asr_candidates[0].segments)
+    assert all(segment.source_artifact_id for segment in asr_candidates[0].segments)
+
+    asr_runner = next(runner for runner in second._pipeline._stages if runner.name == "asr")  # noqa: SLF001
+
+    def must_not_rerun_asr(_context):
+        raise AssertionError("resumed ASR stage must use its sealed artifact")
+
+    asr_runner._stage.execute = must_not_rerun_asr  # noqa: SLF001
+    resumed = second.process_next("worker-two")
+    assert resumed["status"] == "SUCCEEDED", resumed
+
+
 def test_resume_checkpoint_integrity_rejects_tamper_missing_and_version_drift(tmp_path):
     from stock_content.adapters.postgres.repositories.artifact_repository import ArtifactIntegrityError
 

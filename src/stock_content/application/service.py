@@ -33,7 +33,12 @@ from stock_content.domain.models import ContentTask, TranscriptSegment
 from stock_content.domain.security_redaction import contains_sensitive_value, redact_text
 from stock_content.domain.source_materialization import ContentIngestionCommand
 from stock_content.domain.source_policy import allow_source, policy_for_source
-from stock_content.domain.transcript_candidate import AlignmentStatus, TranscriptCandidateSegment, TranscriptSource
+from stock_content.domain.transcript_candidate import (
+    AlignmentStatus,
+    TranscriptCandidate,
+    TranscriptCandidateSegment,
+    TranscriptSource,
+)
 from stock_content.domain.worker_capability import TaskKind
 from stock_content.ports.repositories import (
     ChapterRepository,
@@ -201,6 +206,58 @@ def _restored_transcript_quality(context: PipelineContext, transcript) -> Any:
         tuple(segments),
         duration_ms=round(float(duration_ms)),
         language=str(transcript.language or context.options.get("language") or "zh"),
+    )
+
+
+def _restored_asr_candidate(context: PipelineContext, transcript) -> TranscriptCandidate:
+    """Restore the ASR candidate required by a retry at transcript selection.
+
+    ASR emits its immutable candidate ``TranscriptArtifact`` before
+    ``TranscriptSelectionStage`` consumes the in-memory candidate. A worker
+    takeover between those two stages has no runtime state to carry over, so
+    reconstruct the exact candidate projection from the sealed artifact.
+    Subtitle artifacts deliberately do not enter this path: their candidates
+    are materializer-local and are restored only when their stage is rerun.
+    """
+    source_ids: set[str] = set()
+    segments: list[TranscriptCandidateSegment] = []
+    for item in transcript.segments:
+        try:
+            source = TranscriptSource(str(item.source or TranscriptSource.ASR).upper())
+        except ValueError as exc:
+            raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: ASR transcript source invalid") from exc
+        if source is not TranscriptSource.ASR:
+            raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: ASR transcript contains non-ASR segment")
+        try:
+            alignment = AlignmentStatus(str(item.alignment_status or AlignmentStatus.ALIGNED).upper())
+        except ValueError as exc:
+            raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: ASR transcript alignment invalid") from exc
+        source_id = str(item.source_artifact_id or transcript.artifact_id)
+        source_ids.add(source_id)
+        segments.append(
+            TranscriptCandidateSegment(
+                source=source,
+                source_artifact_id=source_id,
+                start_ms=round(float(item.start_seconds) * 1000),
+                end_ms=round(float(item.end_seconds) * 1000),
+                raw_text=str(item.raw_text or item.text),
+                normalized_text=str(item.normalized_text or item.text),
+                confidence=float(item.confidence or 0.0),
+                alignment_status=alignment,
+            )
+        )
+    if not segments or len(source_ids) != 1:
+        raise RuntimeError("ARTIFACT_INTEGRITY_ERROR: ASR transcript candidate identity invalid")
+    source_id = next(iter(source_ids))
+    return TranscriptCandidate(
+        # This is the exact identifier originally emitted by ``_asr_candidate``
+        # for new artifacts. Legacy artifacts fall back to their immutable
+        # artifact id as the only trustworthy source handle.
+        candidate_id="asr-" + source_id,
+        source=TranscriptSource.ASR,
+        language=str(transcript.language or context.options.get("language") or "zh"),
+        source_artifact_id=source_id,
+        segments=tuple(segments),
     )
 
 
@@ -723,6 +780,11 @@ class ContentApplication:
             ]
             context.state.transcript = " ".join(item.text for item in context.state.segments)
             context.state.transcript_quality_report = _restored_transcript_quality(context, transcript)
+            if transcript.producer_stage == "asr":
+                # A failed transcript-selection checkpoint is retried with a
+                # fresh PipelineContext. Its preceding ASR candidate is
+                # durable only as this artifact, not as PipelineState.
+                context.state.transcript_candidates = [_restored_asr_candidate(context, transcript)]
             # These stages produce state-only compatibility projections.  The
             # checkpointed crosscheck depends on their deterministic values,
             # so rebuild them without creating a second durable effect.
