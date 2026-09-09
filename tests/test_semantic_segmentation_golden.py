@@ -215,6 +215,24 @@ def test_stage1_repair_is_single_attempt_and_invalid_coordinates_fail_closed():
         SemanticSegmenter(permanently_bad).segment(_transcript(["one", "two"], "golden-fail"))
 
 
+def test_stage1_block_prompt_and_repair_state_dynamic_legal_coordinate_range():
+    items = list(_transcript([f"segment-{index}" for index in range(8)]).segments)
+    # In the nonzero block [3:7], index 6 is the final supplied segment.  It
+    # is intentionally invalid even though it is globally a valid transcript
+    # coordinate; the repair request must repeat the same local constraint.
+    gateway = BoundaryOnlyGateway([_response([_boundary(6)]), _response([])])
+    segmenter = SemanticSegmenter(gateway)
+
+    boundaries, repairs = segmenter._call_with_repair(items, 3, 7)
+
+    assert boundaries == []
+    assert repairs == 1
+    assert len(gateway.calls) == 2
+    expected_constraint = "inclusive range [3, 5]. Never emit 6"
+    assert expected_constraint in gateway.calls[0]["prompt"]
+    assert expected_constraint in gateway.calls[1]["prompt"]
+
+
 def test_stage1_rejects_claims_timestamps_and_other_non_boundary_output():
     invalid = {
         "content": json.dumps(

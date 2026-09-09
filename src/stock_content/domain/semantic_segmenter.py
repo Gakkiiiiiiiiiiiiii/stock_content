@@ -262,7 +262,12 @@ class SemanticSegmenter:
         try:
             return self._parse(response, start, end), 0
         except (TypeError, ValueError, json.JSONDecodeError):
-            repair = self._complete(prompt + "\n上一次输出无效。仅修复 JSON schema，仍不得输出 claim 或 timestamp。")
+            repair = self._complete(
+                prompt
+                + "\n上一次输出无效。仅修复 JSON schema，仍不得输出 claim 或 timestamp。"
+                + "\n"
+                + self._boundary_coordinate_instruction(start, end)
+            )
             try:
                 return self._parse(repair, start, end), 1
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -302,7 +307,25 @@ class SemanticSegmenter:
             "strongest local evidence and confidence. Return exactly "
             '{"boundaries":[{"after_segment_index":int,"boundary_type":str,"next_topic":str|null,'
             '"next_subject":str|null,"confidence":number|null}]} and no prose.\n'
+            + self._boundary_coordinate_instruction(start, end)
+            + "\n"
             + json.dumps(lines, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    @staticmethod
+    def _boundary_coordinate_instruction(block_start: int, block_end: int) -> str:
+        """Describe the block-local boundary coordinates without weakening validation."""
+        final_provided_segment = block_end - 1
+        last_legal_boundary = block_end - 2
+        if last_legal_boundary < block_start:
+            return (
+                "This block has no legal after_segment_index: return an empty boundaries list. "
+                f"Never emit {final_provided_segment}, the final provided segment."
+            )
+        return (
+            "The only legal after_segment_index values for this block are integers in the inclusive range "
+            f"[{block_start}, {last_legal_boundary}]. Never emit {final_provided_segment}: it is the final "
+            "provided segment and cannot be a boundary."
         )
 
     def _parse(self, response: Any, block_start: int, block_end: int) -> list[SemanticBoundary]:
