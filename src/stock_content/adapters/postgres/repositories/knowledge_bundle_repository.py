@@ -258,9 +258,17 @@ class PostgresKnowledgeBundleAuthority:
                 if not isinstance(lifecycle, dict):
                     raise ValueError("HISTORICAL_LIFECYCLE_AUTHORITY_MISSING")
                 if lifecycle.get("status") != "ACTIVE":
-                    # A retraction/supersession visible at the requested clocks
-                    # excludes the occurrence; it must not be relabelled ACTIVE.
-                    continue
+                    # V2 keeps review-blocked EXTRACTED occurrences in the
+                    # internal candidate set so conservative quality metrics
+                    # can disclose conflicts and exclusions.  They are still
+                    # removed by PUBLIC_STRICT eligibility and never appear in
+                    # Bundle items.  Retracted/superseded occurrences remain
+                    # absent rather than being relabelled as candidates.
+                    if not (
+                        request.contract_version == V2_CONTRACT
+                        and lifecycle.get("status") == "EXTRACTED"
+                    ):
+                        continue
                 support_status = projection.get("support_status")
                 verification_status = projection.get("verification_status")
                 if not isinstance(support_status, str) or not support_status:

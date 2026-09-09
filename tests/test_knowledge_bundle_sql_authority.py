@@ -160,6 +160,46 @@ def test_sql_bundle_authority_uses_historical_status_not_current_rows(tmp_path):
     assert authority.read_bundle_source(_request(4))["items"] == []
 
 
+def test_v2_sql_authority_keeps_review_blocked_extracted_row_for_quality_only(tmp_path):
+    database, active = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        claim = session.get(FinancialClaimRow, "claim-1")
+        claim.payload = {
+            "bundle_v2": {
+                "claim_nature": "PRESCRIPTIVE_RISK_LIMIT",
+                "primary_domain": "PORTFOLIO_RISK_MANAGEMENT",
+                "attribution": {"attributed": True, "source_label": "slide; ASR differs materially"},
+                "source_grade": "SOURCE_ASSERTION",
+                "detail": {"explanation": "ASR and OCR contain materially different numeric limits."},
+                "temporal": {
+                    "kind": "UNKNOWN", "start": None, "end": None, "as_of": None,
+                    "rule": None, "label": None, "precision": "UNKNOWN", "explicitly_unknown": True,
+                },
+                "occurrence_review": {
+                    "status": "HUMAN_REVIEW_REQUIRED",
+                    "reason_codes": ["ASR_OCR_NUMERIC_CONFLICT"],
+                },
+                "external_truth_status": "NOT_CHECKED",
+            }
+        }
+    extracted = ClaimStateEvent(
+        claim_id="claim-1", event_type="LIFECYCLE",
+        payload={"status": "EXTRACTED", "artifact_id": "life-review-blocked"},
+        known_from=_at(4), business_valid_from=_at(1), source_available_from=_at(4),
+        previous_event_hash=active.event_hash,
+    )
+    ClaimStateEventRepository(database.session_factory).append(extracted)
+    authority = PostgresKnowledgeBundleAuthority(database.session_factory)
+
+    v1 = authority.read_bundle_source(_request(4))
+    v2 = authority.read_bundle_source(replace(_request(4), contract_version="content-knowledge-bundle.v2"))
+
+    assert v1["items"] == []
+    assert len(v2["items"]) == 1
+    assert v2["items"][0]["lifecycle_status"] == "EXTRACTED"
+    assert v2["items"][0]["occurrence_review"]["status"] == "HUMAN_REVIEW_REQUIRED"
+
+
 def test_sql_bundle_authority_fails_closed_without_claim_history(tmp_path):
     database, _ = _authority_with_snapshot(tmp_path, events=False)
     with pytest.raises(ValueError, match="HISTORICAL_CLAIM_AUTHORITY_MISSING"):
