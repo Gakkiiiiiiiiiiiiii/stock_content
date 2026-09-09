@@ -2871,19 +2871,40 @@ class LifecycleProjectionStage:
             timestamp = _stage_timestamp(context)
         claims = list(context.state.get("claims") or ())
         occurrences = list(context.state.get("occurrences") or ())
+        # A transcript/OCR contradiction is occurrence-local and does not
+        # mean that the original evidence should be discarded.  It does mean
+        # that publishing the projection as ACTIVE would overstate what the
+        # pipeline knows before a person has reviewed it.  Keep the complete
+        # evidence and semantic envelope, but make both the occurrence ledger
+        # and its knowledge projection explicitly pre-publication.
+        review_by_occurrence = {
+            item.occurrence_id: _occurrence_review(item)
+            for item in occurrences
+        }
+        review_required_ids = {
+            occurrence_id
+            for occurrence_id, review in review_by_occurrence.items()
+            if review["status"] == "HUMAN_REVIEW_REQUIRED"
+        }
+        review_required_claim_ids = {
+            item.claim_id for item in occurrences if item.occurrence_id in review_required_ids
+        }
         events = []
-        for target_type, target_id in [
-            *(("CLAIM", item.claim_id) for item in claims),
-            *(("OCCURRENCE", item.occurrence_id) for item in occurrences),
+        for target_type, target_id, review_required in [
+            *(("CLAIM", item.claim_id, item.claim_id in review_required_claim_ids) for item in claims),
+            *(("OCCURRENCE", item.occurrence_id, item.occurrence_id in review_required_ids) for item in occurrences),
         ]:
             events.append(
                 KnowledgeLifecycleEvent(
                     target_type=target_type,
                     target_id=target_id,
-                    to_status="ACTIVE",
+                    to_status="EXTRACTED" if review_required else "ACTIVE",
                     effective_at=timestamp,
                     recorded_at=timestamp,
-                    reason_code="INITIAL_EXTRACTION",
+                    reason_code=(
+                        "INITIAL_EXTRACTION_HUMAN_REVIEW_REQUIRED"
+                        if review_required else "INITIAL_EXTRACTION"
+                    ),
                     policy_version="lifecycle.v1",
                 )
             )
@@ -2913,7 +2934,23 @@ class LifecycleProjectionStage:
         lifecycle_id = context.artifacts.lifecycle.artifact_id
         for unit in context.state.get("knowledge") or ():
             attributes = dict(unit.attributes or {})
-            attributes["lifecycle_status"] = "ACTIVE"
+            occurrence_id = str(attributes.get("occurrence_id") or "")
+            review = review_by_occurrence.get(occurrence_id)
+            review_required = occurrence_id in review_required_ids
+            lifecycle_status = "EXTRACTED" if review_required else "ACTIVE"
+            # ReviewStatus has no "required" member: UNREVIEWED is the
+            # truthful Axis-3 core value until a human decision is recorded.
+            # A contradictory item remains source-located, rather than being
+            # represented as source-supported before that review.
+            if review_required:
+                unit.support_status = "SOURCE_LOCATED"
+                unit.review_status = "UNREVIEWED"
+            unit.lifecycle_status = lifecycle_status
+            attributes["lifecycle_status"] = lifecycle_status
+            attributes["support_status"] = unit.support_status
+            attributes["review_status"] = unit.review_status
+            if review is not None:
+                attributes["occurrence_review"] = review
             attributes["lifecycle_artifact_id"] = lifecycle_id
             unit.attributes = attributes
         if context.artifacts.knowledge is not None:
@@ -2939,6 +2976,25 @@ class LifecycleProjectionStage:
         context.runtime.metrics["correction_count"] = correction_count
         context.runtime.metrics["lifecycle_correction_count"] = correction_count
         return _stage_result(context, "lifecycle", "knowledge")
+
+
+def _occurrence_review(occurrence: ClaimOccurrence) -> dict[str, Any]:
+    """Read the immutable occurrence-scoped manual-review boundary.
+
+    The review envelope is intentionally not promoted to ``ReviewStatus``:
+    ``HUMAN_REVIEW_REQUIRED`` is a request for a future decision, whereas
+    ``ReviewStatus`` records a completed human decision.  Keeping that
+    distinction prevents an extraction conflict from masquerading as either
+    approval or rejection.
+    """
+    provenance = dict(occurrence.provenance or {})
+    envelope = dict(provenance.get("bundle_v2") or {})
+    review = dict(envelope.get("occurrence_review") or {})
+    reasons = sorted({str(item) for item in review.get("reason_codes") or [] if str(item)})
+    return {
+        "status": "HUMAN_REVIEW_REQUIRED" if review.get("status") == "HUMAN_REVIEW_REQUIRED" else "NOT_REQUIRED",
+        "reason_codes": reasons,
+    }
 
 
 class KnowledgeExtractionStage:
@@ -4597,6 +4653,15 @@ def _claim_state_payload(
         "SUPPORTED": "SOURCE_SUPPORTED",
         "PARTIALLY_SUPPORTED": "SOURCE_LOCATED",
     }.get(support_status, support_status)
+    occurrence_review = _occurrence_review(occurrence) if occurrence is not None else {
+        "status": "NOT_REQUIRED", "reason_codes": []
+    }
+    # The immutable state event must agree with the write-model projection:
+    # unresolved multimodal conflicts are source-located audit material, not
+    # source-supported public evidence.
+    if occurrence_review["status"] == "HUMAN_REVIEW_REQUIRED":
+        public_support_status = "SOURCE_LOCATED"
+        support_count = min(support_count, 1)
     asserted_at = getattr(times, "asserted_at", None)
     source_quality = getattr(times, "source_availability_quality", "UNKNOWN")
     return {
@@ -4613,6 +4678,7 @@ def _claim_state_payload(
         "symbol": str(getattr(claim, "subject_id", "") or ""),
         "support_status": public_support_status,
         "support_count": support_count,
+        "occurrence_review": occurrence_review,
         "producer_commit": str(producer_commit),
         "signal_policy_version": "signal-policy.v1",
         "verification_status": str(getattr(getattr(entry, "result", None), "status", "") or ""),
