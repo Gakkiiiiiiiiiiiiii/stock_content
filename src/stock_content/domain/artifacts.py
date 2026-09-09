@@ -582,6 +582,22 @@ class SemanticSegmentArtifact(ArtifactBase):
     prompt_version: str = ""
     segmentation_schema_version: str = "semantic-segment.v1"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Keep the unnamespaced semantic artifact representation byte-stable.
+
+        ``derivation_namespace`` was added to segment items to give migration
+        replay a distinct immutable identity.  The empty value is the legacy
+        and normal-ingestion case, though, so serializing it would alter the
+        canonical identity of every pre-existing semantic artifact when it is
+        hydrated and checked.  Only a non-empty migration namespace is part
+        of the persisted/artifact identity payload.
+        """
+        payload = super().to_dict()
+        for segment in payload["segments"]:
+            if not segment.get("derivation_namespace"):
+                segment.pop("derivation_namespace", None)
+        return payload
+
 
 ARTIFACT_SLOT_NAMES = (
     "source",

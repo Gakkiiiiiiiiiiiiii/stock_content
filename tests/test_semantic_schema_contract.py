@@ -11,7 +11,16 @@ from stock_content.adapters.postgres.repositories.semantic_segment_repository im
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay.identity import migration_derivation_namespace
 from stock_content.application.stages import SemanticSegmentationStage
-from stock_content.domain.artifacts import EvidenceArtifact, TranscriptArtifact, TranscriptSegmentItem, artifact_id_of
+from stock_content.domain.artifacts import (
+    EvidenceArtifact,
+    TranscriptArtifact,
+    TranscriptSegmentItem,
+    artifact_id_of,
+    canonical_json,
+    content_hash_of,
+    deserialize_artifact,
+    serialize_artifact,
+)
 from stock_content.domain.claim_occurrence import ClaimOccurrence, knowledge_uid_for_occurrence
 from stock_content.domain.models import VideoAsset
 from stock_content.domain.semantic_segment import (
@@ -119,6 +128,80 @@ def test_migration_namespace_is_stable_and_isolates_immutable_derived_rows(tmp_p
     assert knowledge_uid_for_occurrence(old_occurrence.occurrence_id) != knowledge_uid_for_occurrence(
         migrated_occurrence.occurrence_id
     )
+
+
+def test_semantic_artifact_empty_namespace_retains_legacy_canonical_bytes(tmp_path):
+    """A pre-namespace row must survive strict integrity verification unchanged."""
+    legacy_identity = {
+        "artifact_type": "semantic_segments",
+        "schema_version": "artifact.v1",
+        "producer_stage": "semantic_segmentation",
+        "producer_version": "4.043",
+        "parent_artifact_ids": ["transcript-legacy"],
+        "transcript_artifact_id": "transcript-legacy",
+        "segments": [
+            {
+                "semantic_segment_id": "semseg_legacy",
+                "segment_index": 0,
+                "start_segment_index": 0,
+                "end_segment_index": 0,
+                "start_segment_id": "seg-0",
+                "end_segment_id": "seg-0",
+                "start_ms": 0,
+                "end_ms": 1_000,
+                "topic": None,
+                "subject": None,
+                "segment_type": "ANALYSIS",
+                "confidence": None,
+            }
+        ],
+        "model_id": "semantic.fixture",
+        "prompt_version": "v1",
+        "segmentation_schema_version": "semantic-segment.v1",
+    }
+    legacy_payload = {
+        "artifact_id": "semantic_segments-350flegacy",
+        "created_at": datetime(2025, 1, 1, tzinfo=UTC),
+        "content_hash": content_hash_of(legacy_identity),
+        **legacy_identity,
+    }
+
+    restored = deserialize_artifact(legacy_payload)
+    assert restored.segments[0].derivation_namespace == ""
+    assert canonical_json(serialize_artifact(restored)) == canonical_json(legacy_payload)
+    assert restored.content_hash == legacy_payload["content_hash"]
+
+    database = Database(f"sqlite:///{tmp_path / 'legacy-semantic-artifact.db'}")
+    database.create_schema()
+    from stock_content.adapters.postgres.repositories.artifact_repository import SqlArtifactRepository
+
+    repository = SqlArtifactRepository(database.session_factory)
+    repository.put(restored)
+    assert repository.get(restored.artifact_id).content_hash == legacy_payload["content_hash"]
+
+
+def test_nonempty_semantic_namespace_participates_in_artifact_identity():
+    transcript = _transcript()
+    legacy = build_semantic_segment_artifact(transcript, (), model_id="semantic.fixture")
+    reprocess = build_semantic_segment_artifact(
+        transcript,
+        (),
+        model_id="semantic.fixture",
+        identity_seed="",
+    )
+    migration = build_semantic_segment_artifact(
+        transcript,
+        (),
+        model_id="semantic.fixture",
+        identity_seed="migration-namespace",
+    )
+
+    assert "derivation_namespace" not in serialize_artifact(legacy)["segments"][0]
+    assert serialize_artifact(reprocess) == serialize_artifact(legacy)
+    assert reprocess.content_hash == legacy.content_hash
+    assert serialize_artifact(migration)["segments"][0]["derivation_namespace"] == "migration-namespace"
+    assert artifact_id_of(legacy) != artifact_id_of(migration)
+    assert legacy.content_hash != migration.content_hash
 
 
 def test_semantic_domain_and_repository_carry_authoritative_video_id(tmp_path):
