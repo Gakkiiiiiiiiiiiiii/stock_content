@@ -1,11 +1,13 @@
 """Replay task reconstruction and deterministic artifact comparison."""
 from __future__ import annotations
 
+import os
 from typing import Any
 from uuid import uuid4
 
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay.errors import ReplayIntegrityError
+from stock_content.application.sealed_media import SealedMediaValidationError, validate_sealed_media
 from stock_content.domain.artifacts import ArtifactRegistry
 from stock_content.domain.models import ContentTask
 from stock_content.ports.temporal_reference_snapshot import PinnedTemporalReferenceProvider
@@ -36,12 +38,27 @@ class ReplayReprocessMixin:
             if source is None:
                 raise ReplayIntegrityError("REPLAY_ARTIFACT_MISSING", "source artifact is unavailable",
                                            artifact_id=source_id)
+            mapped_source_id = str((snapshot.artifact_ids or {}).get("source") or "")
+            if not mapped_source_id or mapped_source_id != str(getattr(source, "artifact_id", "") or ""):
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "replay source artifact is not the source snapshot member",
+                )
             options = self._task_options(snapshot)
             if options is None:
                 raise ReplayIntegrityError("REPLAY_INPUT_UNAVAILABLE",
                                            "immutable task options are unavailable for this snapshot")
             options = {key: value for key, value in options.items() if key not in self._RUNTIME_OPTIONS}
             options.update(dict(overrides or {}))
+            # These values are replay-worker capabilities, not caller input.
+            # They are repopulated below only from the source artifact which
+            # already passed snapshot lineage validation.
+            for key in (
+                "replay_raw_storage_uri", "replay_expected_raw_hash",
+                "replay_sealed_source_artifact_id", "replay_sealed_snapshot_id",
+                "replay_sealed_source_metadata", "replay_sealed_media_root",
+            ):
+                options.pop(key, None)
             records = self._reference_records(snapshot)
             if records:
                 pins = {
@@ -90,8 +107,24 @@ class ReplayReprocessMixin:
             if source_pipeline_version is not None:
                 options["replay_source_pipeline_version"] = source_pipeline_version
             if uri and not uri.startswith("fixture://"):
+                private_root = os.getenv("CONTENT_RAW_STORAGE_DIR", "").strip()
+                try:
+                    sealed_media = validate_sealed_media(
+                        uri,
+                        private_root=private_root,
+                        expected_hash=str(getattr(source, "raw_content_hash", "") or ""),
+                        expected_length=getattr(source, "raw_content_length", None),
+                    )
+                except SealedMediaValidationError as exc:
+                    raise ReplayIntegrityError(
+                        "REPLAY_INPUT_UNAVAILABLE", "sealed raw media is unavailable"
+                    ) from exc
                 options["replay_raw_storage_uri"] = uri
-                options["replay_expected_raw_hash"] = str(getattr(source, "raw_content_hash", "") or "")
+                options["replay_expected_raw_hash"] = sealed_media.content_hash
+                options["replay_sealed_source_artifact_id"] = mapped_source_id
+                options["replay_sealed_snapshot_id"] = snapshot.content_snapshot_id
+                options["replay_sealed_source_metadata"] = source_metadata
+                options["replay_sealed_media_root"] = private_root
             elif not (options.get("offline_fixture") or "transcript" in options or "segments" in options):
                 raise ReplayIntegrityError("REPLAY_INPUT_UNAVAILABLE", "source raw media is not durably available")
             options["replay_snapshot_kind"] = "MIGRATION" if mode == "MIGRATION_REPLAY" else "REPROCESS"

@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import InMemorySnapshotStore, SnapshotService
+from stock_content.application.stages import DownloadStage, ResolveSourceStage
 from stock_content.domain.artifacts import (
     ArtifactBase,
     ClaimArtifact,
@@ -15,6 +18,7 @@ from stock_content.domain.artifacts import (
     EvidenceItem,
     FrameArtifact,
     OCRArtifact,
+    SourceArtifact,
     TranscriptVisualCrosscheckArtifact,
     TranscriptVisualCrosscheckRecord,
     VerificationArtifact,
@@ -50,6 +54,35 @@ class SignalRows:
 
     def list_for_snapshot(self, snapshot_id):
         return self.rows
+
+
+class ReplayArtifactRepo(ArtifactRepo):
+    def find_task_options_for_snapshot(self, _artifact_ids):
+        return {}
+
+
+class _UnavailableXiaoeResolver:
+    def __init__(self, error: str):
+        self.resolve_calls = 0
+        self.error = error
+
+    def resolve_materialization(self, *_args, **_kwargs):
+        self.resolve_calls += 1
+        raise RuntimeError(self.error)
+
+
+class _SealedMediaPipeline:
+    def __init__(self, adapter, snapshot_id):
+        self._adapter = adapter
+        self._snapshot_id = snapshot_id
+        self.context = None
+
+    def process(self, context):
+        ResolveSourceStage({"xiaoe": self._adapter}).execute(context)
+        DownloadStage({"xiaoe": self._adapter}).execute(context)
+        context.state.content_snapshot_id = self._snapshot_id
+        self.context = context
+        return context
 
 
 def _snapshot(artifact_ids, *, store=None):
@@ -141,6 +174,41 @@ def _cs_8b_multimodal_snapshot(*, visual_source_id="frame-8b", include_visual_so
         artifact_ids["frames:1"] = outside.artifact_id
     snapshots, snapshot = _snapshot(artifact_ids)
     return snapshots, snapshot, ArtifactRepo(artifacts)
+
+
+def _sealed_media_replay(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    uri: Path | None = None,
+    content_hash: str | None = None,
+    resolver_error: str = "SOURCE_SESSION_EXPIRED",
+):
+    root = tmp_path / "private-raw"
+    root.mkdir()
+    media = root / "source.mp4"
+    media.write_bytes(b"sealed-media")
+    source_path = uri or media
+    raw_hash = content_hash or "d82dafc3595aed96bbfaef5899dd166d6888ac6d065e32e53353660ec88e2e60"
+    source = SourceArtifact(
+        artifact_id="source-sealed", artifact_type="source", source_type="xiaoe", source_ref="p_1/v_1",
+        source_content_hash=raw_hash, raw_content_hash=raw_hash, raw_content_length=12,
+        raw_storage_uri=str(source_path), source_metadata={
+            "canonical_url": "https://a.xiaoeknow.com/p/course/video/v_1?product_id=p_1",
+        },
+    )
+    snapshots = SnapshotService()
+    snapshot = snapshots.record_from_artifacts(
+        source_type="xiaoe", source_ref="p_1/v_1", source_content_hash=raw_hash,
+        artifact_ids={"source": source.artifact_id}, source_artifact_id=source.artifact_id, code_sha="test-sha",
+    )
+    monkeypatch.setenv("CONTENT_RAW_STORAGE_DIR", str(root))
+    adapter = _UnavailableXiaoeResolver(resolver_error)
+    pipeline = _SealedMediaPipeline(adapter, snapshot.content_snapshot_id)
+    replay = ReplayService(
+        snapshots, artifact_repository=ReplayArtifactRepo([source]), pipeline=pipeline,
+    )
+    return replay, snapshot, source, media, adapter, pipeline
 
 
 def test_verify_lineage_walks_all_parent_edges_and_detects_cycle():
@@ -258,6 +326,76 @@ def test_cs_8b_shape_keeps_unadmitted_or_unknown_visual_evidence_fail_closed(
     result = ReplayService(snapshots, artifact_repository=artifacts).replay(snapshot.content_snapshot_id)
 
     assert result["error"] == expected
+
+
+@pytest.mark.parametrize("resolver_error", ["SOURCE_PAGE_RESOLVER_DISABLED", "SOURCE_SESSION_EXPIRED"])
+def test_migration_replay_reuses_sealed_media_without_xiaoe_resolution(tmp_path, monkeypatch, resolver_error):
+    replay, snapshot, _source, media, adapter, pipeline = _sealed_media_replay(
+        tmp_path, monkeypatch, resolver_error=resolver_error
+    )
+
+    result = replay.replay(
+        snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v4.043.audit"
+    )
+
+    assert "error" not in result
+    assert adapter.resolve_calls == 0
+    assert pipeline.context is not None
+    assert pipeline.context.runtime.video_path == media.resolve()
+
+
+@pytest.mark.parametrize("failure", ["outside", "hash", "missing"])
+def test_migration_replay_rejects_unsealed_or_invalid_raw_media(tmp_path, monkeypatch, failure):
+    if failure == "outside":
+        outside = tmp_path / "outside.mp4"
+        outside.write_bytes(b"sealed-media")
+        replay, snapshot, *_rest = _sealed_media_replay(tmp_path, monkeypatch, uri=outside)
+    elif failure == "hash":
+        replay, snapshot, *_rest = _sealed_media_replay(
+            tmp_path, monkeypatch, content_hash="0" * 64
+        )
+    else:
+        replay, snapshot, _source, media, *_rest = _sealed_media_replay(tmp_path, monkeypatch)
+        media.unlink()
+    result = replay.replay(
+        snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v4.043.audit"
+    )
+
+    assert result["error"] == "REPLAY_INPUT_UNAVAILABLE"
+
+
+def test_replay_ignores_request_override_of_a_sealed_media_path(tmp_path, monkeypatch):
+    replay, snapshot, _source, media, adapter, pipeline = _sealed_media_replay(tmp_path, monkeypatch)
+    attacker_path = tmp_path / "attacker.mp4"
+    attacker_path.write_bytes(b"attacker-bytes")
+
+    result = replay.replay(
+        snapshot.content_snapshot_id,
+        mode="MIGRATION_REPLAY",
+        pipeline_version="pipeline.v4.043.audit",
+        overrides={"replay_raw_storage_uri": str(attacker_path), "replay_expected_raw_hash": "0" * 64},
+    )
+
+    assert "error" not in result
+    assert adapter.resolve_calls == 0
+    assert pipeline.context.runtime.video_path == media.resolve()
+
+
+def test_normal_source_resolution_still_calls_the_source_adapter():
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def resolve(self, source_ref):
+            self.calls += 1
+            return {"source_ref": source_ref}
+
+    adapter = Adapter()
+    context = PipelineContext(task_id="normal-resolution", source={"type": "xiaoe", "ref": "p_1/v_1"})
+    ResolveSourceStage({"xiaoe": adapter}).execute(context)
+
+    assert adapter.calls == 1
+    assert context.state.metadata == {"source_ref": "p_1/v_1"}
 
 
 def test_identity_mismatch_is_fail_closed_for_reprocess():

@@ -14,6 +14,7 @@ from typing import Any
 from stock_content.adapters.http.model_client import ContentModelClient
 from stock_content.application.fenced_effects import EffectIntent
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.sealed_media import SealedMediaValidationError, validate_sealed_media
 from stock_content.application.snapshot_service import SnapshotService, choose_snapshot_commit_candidate
 from stock_content.application.stage_runner import StageResult
 from stock_content.application.transcript_quality_service import TranscriptQualityService
@@ -175,7 +176,13 @@ class ResolveSourceStage:
     def execute(self, context: PipelineContext) -> PipelineContext:
         fixture = context.options.get("metadata")
         adapter = self._adapters[context.source["type"]]
-        if fixture:
+        sealed_source_id = str(context.options.get("replay_sealed_source_artifact_id") or "")
+        if sealed_source_id:
+            metadata = context.options.get("replay_sealed_source_metadata")
+            if not isinstance(metadata, dict) or not context.options.get("replay_raw_storage_uri"):
+                raise RuntimeError("REPLAY_INPUT_UNAVAILABLE: sealed replay source metadata is unavailable")
+            context.state["metadata"] = dict(metadata)
+        elif fixture:
             context.state["metadata"] = fixture
         elif hasattr(adapter, "resolve_materialization"):
             materialization = self._resolve_materialization(adapter, context)
@@ -369,23 +376,24 @@ class DownloadStage:
                 context.options.setdefault("source_availability_quality", "INGEST_TIME_UPPER_BOUND")
         replay_uri = context.options.get("replay_raw_storage_uri")
         if replay_uri:
+            sealed_source_id = str(context.options.get("replay_sealed_source_artifact_id") or "")
+            if not sealed_source_id or not context.options.get("replay_sealed_snapshot_id"):
+                raise RuntimeError("REPLAY_INPUT_UNAVAILABLE: unsealed replay media is not allowed")
             context.runtime.work_dir = Path(
                 tempfile.mkdtemp(prefix=f"content-{context.task_id[:8]}-", dir=self._work_root)
             )
-            path = Path(str(replay_uri).removeprefix("file://"))
-            if not path.is_file():
-                raise RuntimeError("REPLAY_INPUT_UNAVAILABLE: durable raw media is missing")
+            try:
+                sealed_media = validate_sealed_media(
+                    str(replay_uri),
+                    private_root=str(context.options.get("replay_sealed_media_root") or ""),
+                    expected_hash=str(context.options.get("replay_expected_raw_hash") or ""),
+                    expected_length=None,
+                )
+            except SealedMediaValidationError as exc:
+                raise RuntimeError("REPLAY_INPUT_UNAVAILABLE: sealed raw media is unavailable") from exc
+            path = sealed_media.path
             context.runtime.video_path = path
-            raw = hashlib.sha256()
-            length = 0
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    raw.update(chunk)
-                    length += len(chunk)
-            expected_hash = str(context.options.get("replay_expected_raw_hash") or "")
-            if expected_hash and raw.hexdigest() != expected_hash:
-                raise RuntimeError("REPLAY_INPUT_UNAVAILABLE: durable raw media hash mismatch")
-            _refresh_source_artifact(context, raw.hexdigest(), length, str(path))
+            _refresh_source_artifact(context, sealed_media.content_hash, sealed_media.content_length, str(path))
             source = context.artifacts.source
             if source is not None:
                 media = MediaArtifact(
@@ -393,7 +401,7 @@ class DownloadStage:
                     artifact_type="media",
                     source_artifact_id=source.artifact_id,
                     media_uri=str(path),
-                    video_hash=raw.hexdigest(),
+                    video_hash=sealed_media.content_hash,
                     extractor_version="download.v1",
                     parent_artifact_ids=(source.artifact_id,),
                 )

@@ -23,10 +23,13 @@ class ReplayService(ReplayIntegrityMixin, ReplayHistoricalMixin, ReplayReprocess
     _RUNTIME_OPTIONS = frozenset(
         {
             "idempotency_key", "trace_id", "decision_id", "replay_raw_storage_uri",
+            "replay_expected_raw_hash",
             "replay_snapshot_kind", "replay_parent_snapshot_id", "replay_supersedes_snapshot_id",
             "replay_pipeline_version", "replay_lifecycle_timestamp",
             "replay_source_available_at", "replay_source_business_as_of",
             "replay_source_pipeline_version",
+            "replay_sealed_source_artifact_id", "replay_sealed_snapshot_id",
+            "replay_sealed_source_metadata", "replay_sealed_media_root",
             "temporal_reference_provider",
         }
     )
