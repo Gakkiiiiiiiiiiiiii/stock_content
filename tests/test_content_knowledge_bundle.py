@@ -26,6 +26,7 @@ from stock_content.domain.knowledge_bundle import (
 )
 from stock_content.domain.temporal_normalizer import TemporalNormalizer
 from stock_content.ports.knowledge_bundle_repository import InMemoryKnowledgeBundleRepository
+from stock_content.ports.repositories import IdempotencyConflict
 
 NOW = datetime(2026, 9, 6, tzinfo=UTC)
 CHECKSUM = "sha256:EBFD13B78622C3846890438A4FB3CB858278F571FDAB247CDD72EF18CA211621"
@@ -245,6 +246,28 @@ def test_request_binding_sort_hash_and_immutable_get():
     assert first["bundle_hash"] != service.create(_request())["bundle_hash"]
 
 
+def test_bundle_http_idempotency_binding_is_contract_complete_and_replays_before_authority_read():
+    authority = Authority()
+    service = _service(authority)
+    request = _request()
+    first = service.create(request, idempotency_key="bundle-http-key")
+
+    # Durable retry bindings are checked before SQL/authority projection: a
+    # completed response remains replayable even when the upstream snapshot
+    # is no longer readable by this service instance.
+    authority.read_bundle_source = lambda _request: (_ for _ in ()).throw(AssertionError("must not re-read"))
+    assert service.create(request, idempotency_key="bundle-http-key") == first
+
+    with pytest.raises(IdempotencyConflict):
+        service.create(_request(max_items=19), idempotency_key="bundle-http-key")
+
+    # Contract choice participates in the retry hash independently from the
+    # locked v1 public request hash.
+    assert request.idempotency_request_hash != _request(
+        symbol="UNSPECIFIED", contract_version=V2_CONTRACT
+    ).idempotency_request_hash
+
+
 def test_strict_bundle_accepts_utc_boundaries_from_explicit_chinese_quarter():
     """A normalized DATE period is serialized as an aware Bundle instant, not prose."""
     period = TemporalNormalizer().normalize("2025年第三季度")
@@ -400,6 +423,27 @@ def test_schema_manifest_checksum_and_post_get_adapter():
         )
         assert response.status_code == 200
         assert client.get("/v1/content/knowledge-bundles/" + response.json()["bundle_id"]).json() == response.json()
+
+
+def test_bundle_http_idempotency_header_replays_and_conflicts_without_disclosing_bindings():
+    service = _service()
+    application = type("App", (), {"create_knowledge_bundle": service.create, "get_knowledge_bundle": service.get})()
+    app = FastAPI()
+    app.include_router(create_knowledge_bundles_router(lambda: application))
+    body = {
+        key: value.isoformat().replace("+00:00", "Z") if isinstance(value, datetime) else value
+        for key, value in _request().canonical_request().items()
+    }
+    with TestClient(app) as client:
+        headers = {"Idempotency-Key": "bundle-api-key"}
+        first = client.post("/v1/content/knowledge-bundles", json=body, headers=headers)
+        replay = client.post("/v1/content/knowledge-bundles", json=body, headers=headers)
+        assert first.status_code == replay.status_code == 200
+        assert replay.json() == first.json()
+        conflict_body = {**body, "max_items": 19}
+        conflict = client.post("/v1/content/knowledge-bundles", json=conflict_body, headers=headers)
+        assert conflict.status_code == 409
+        assert conflict.json() == {"detail": {"code": "IDEMPOTENCY_CONFLICT"}}
 
 
 def test_production_application_injects_uppercase_locked_bundle_checksum(tmp_path, monkeypatch):

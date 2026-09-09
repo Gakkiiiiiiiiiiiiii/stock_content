@@ -242,3 +242,20 @@ class KnowledgeBundleRequest:
     @property
     def request_hash(self) -> str:
         return sha256(self.canonical_request())
+
+    @property
+    def idempotency_request_hash(self) -> str:
+        """Bind a client retry key to every Bundle-result-affecting input.
+
+        The v1 ``request_hash`` is an established public identity and must
+        remain byte-for-byte compatible with older callers.  In particular it
+        intentionally omits the implicit v1 contract selector.  HTTP retry
+        identity is a separate concern: it explicitly includes the selected
+        contract so a key cannot be replayed across v1/v2, even if a future
+        canonical request happens to share fields with v1.
+        """
+        return sha256({
+            "endpoint": "content-knowledge-bundle",
+            "contract_version": self.contract_version,
+            "request": self.canonical_request(),
+        })

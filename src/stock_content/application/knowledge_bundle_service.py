@@ -54,12 +54,26 @@ class KnowledgeBundleService:
         self._authority, self._repository, self._producer = authority, repository, producer
         self._v2_contract_checksum = v2_contract_checksum
 
-    def create(self, request: KnowledgeBundleRequest | Mapping[str, Any]) -> dict[str, Any]:
+    def create(
+        self,
+        request: KnowledgeBundleRequest | Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         request = (
             request if isinstance(request, KnowledgeBundleRequest) else KnowledgeBundleRequest.from_mapping(request)
         )
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 128:
+                raise ValueError("INVALID_IDEMPOTENCY_KEY")
+            existing = self._repository.get_idempotent(
+                idempotency_key=idempotency_key,
+                idempotency_request_hash=request.idempotency_request_hash,
+            )
+            if existing is not None:
+                return existing
         if request.contract_version == V2_CONTRACT:
-            return self._create_v2(request)
+            return self._create_v2(request, idempotency_key=idempotency_key)
         source = self._authority.read_bundle_source(request)
         if source is None:
             raise ValueError("SNAPSHOT_NOT_FOUND")
@@ -114,9 +128,13 @@ class KnowledgeBundleService:
         }))
         digest = sha256(payload)
         bundle = {"bundle_id": "ckb_" + digest.removeprefix("sha256:"), "bundle_hash": digest, **payload}
-        return self._repository.insert(bundle)
+        return self._repository.insert(
+            bundle,
+            idempotency_key=idempotency_key,
+            idempotency_request_hash=request.idempotency_request_hash if idempotency_key is not None else None,
+        )
 
-    def _create_v2(self, request: KnowledgeBundleRequest) -> dict[str, Any]:
+    def _create_v2(self, request: KnowledgeBundleRequest, *, idempotency_key: str | None = None) -> dict[str, Any]:
         """Build v2 without changing the locked v1 identity or validation path."""
         if not self._v2_contract_checksum:
             raise ValueError("KNOWLEDGE_BUNDLE_PRODUCER_NOT_CONFIGURED")
@@ -176,7 +194,11 @@ class KnowledgeBundleService:
         }))
         digest = sha256(payload)
         bundle = {"bundle_id": "ckb_" + digest.removeprefix("sha256:"), "bundle_hash": digest, **payload}
-        return self._repository.insert(bundle)
+        return self._repository.insert(
+            bundle,
+            idempotency_key=idempotency_key,
+            idempotency_request_hash=request.idempotency_request_hash if idempotency_key is not None else None,
+        )
 
     @staticmethod
     def _public_v2_item(item: Mapping[str, Any]) -> dict[str, Any]:

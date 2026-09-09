@@ -596,6 +596,24 @@ class ContentKnowledgeBundleRow(Base):
     pipeline_version: Mapped[str] = mapped_column(String(80))
 
 
+class ContentKnowledgeBundleIdempotencyRow(Base):
+    """Durable HTTP retry binding for immutable knowledge Bundles.
+
+    The client key is never stored directly.  A domain-separated canonical
+    digest prevents the retry table from becoming another source of request
+    secrets while retaining a stable cross-process uniqueness boundary.
+    """
+
+    __tablename__ = "content_knowledge_bundle_idempotency"
+
+    idempotency_key_hash: Mapped[str] = mapped_column(String(80), primary_key=True)
+    idempotency_request_hash: Mapped[str] = mapped_column(String(80), nullable=False)
+    bundle_id: Mapped[str] = mapped_column(
+        ForeignKey("content_knowledge_bundle.bundle_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ContentArtifactRow(Base):
     __tablename__ = "content_artifact"
     __table_args__ = (

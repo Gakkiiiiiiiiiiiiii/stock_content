@@ -382,10 +382,10 @@ class ContentApplication:
         self._conflict_service = ConflictService()
         self._claims_registry: dict[str, FinancialClaim] = {}
 
-    def create_knowledge_bundle(self, request: Any) -> dict:
+    def create_knowledge_bundle(self, request: Any, *, idempotency_key: str | None = None) -> dict:
         if self._knowledge_bundle_service is None:
             raise ValueError("KNOWLEDGE_BUNDLE_PRODUCER_NOT_CONFIGURED")
-        return self._knowledge_bundle_service.create(request)
+        return self._knowledge_bundle_service.create(request, idempotency_key=idempotency_key)
 
     def get_knowledge_bundle(self, bundle_id: str) -> dict | None:
         return None if self._knowledge_bundle_service is None else self._knowledge_bundle_service.get(bundle_id)

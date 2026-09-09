@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from stock_content.domain.knowledge_bundle import KnowledgeBundleRequest
+from stock_content.ports.repositories import IdempotencyConflict
 
 
 class BundleRequestBody(BaseModel):
@@ -30,9 +31,20 @@ def create_knowledge_bundles_router(application):
     router = APIRouter(prefix="/v1/content/knowledge-bundles", tags=["knowledge-bundles"])
 
     @router.post("")
-    def create(body: BundleRequestBody) -> dict:
+    def create(
+        body: BundleRequestBody,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
+    ) -> dict:
         try:
-            return application().create_knowledge_bundle(KnowledgeBundleRequest(**body.model_dump()))
+            request = KnowledgeBundleRequest(**body.model_dump())
+            if idempotency_key is None:
+                # Preserve the old no-key application seam and its immutable
+                # Bundle identity semantics for existing callers.
+                return application().create_knowledge_bundle(request)
+            return application().create_knowledge_bundle(request, idempotency_key=idempotency_key)
+        except IdempotencyConflict as exc:
+            # Do not surface key material or the prior request binding.
+            raise HTTPException(status_code=409, detail={"code": "IDEMPOTENCY_CONFLICT"}) from exc
         except ValueError as exc:
             code = str(exc).split(":", 1)[0]
             if code == "KNOWLEDGE_BUNDLE_PRODUCER_NOT_CONFIGURED":

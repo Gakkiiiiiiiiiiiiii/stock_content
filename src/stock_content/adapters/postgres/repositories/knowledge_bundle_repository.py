@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -17,6 +17,7 @@ from stock_content.adapters.postgres.models import (
     ClaimOccurrenceRow,
     ClaimStateEventRow,
     ContentArtifactRow,
+    ContentKnowledgeBundleIdempotencyRow,
     ContentKnowledgeBundleRow,
     ContentSnapshotRow,
     FinancialClaimRow,
@@ -25,33 +26,105 @@ from stock_content.adapters.postgres.models import (
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.knowledge_bundle import V2_CONTRACT, KnowledgeBundleRequest, sha256
+from stock_content.ports.repositories import IdempotencyConflict
 
 
 class PostgresKnowledgeBundleRepository:
     def __init__(self, session_factory: sessionmaker) -> None:
         self._sessions = session_factory
 
-    def insert(self, bundle: dict[str, Any]) -> dict[str, Any]:
+    def insert(
+        self,
+        bundle: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        idempotency_request_hash: str | None = None,
+    ) -> dict[str, Any]:
+        if idempotency_key is not None:
+            if not idempotency_request_hash:
+                raise ValueError("idempotency request hash is required")
+            return self._insert_idempotent(bundle, idempotency_key, idempotency_request_hash)
         with self._sessions.begin() as session:
-            inserted = self._insert_ignore_conflict(session, bundle)
-            if inserted:
-                return dict(bundle)
-            row = session.scalar(
-                select(ContentKnowledgeBundleRow).where(
-                    or_(
-                        ContentKnowledgeBundleRow.bundle_id == bundle["bundle_id"],
-                        ContentKnowledgeBundleRow.bundle_hash == bundle["bundle_hash"],
-                    )
+            return self._insert_or_get_immutable(session, bundle)
+
+    @staticmethod
+    def _idempotency_key_hash(key: str) -> str:
+        return sha256({"endpoint": "content-knowledge-bundle", "idempotency_key": key})
+
+    def _insert_idempotent(
+        self, bundle: dict[str, Any], idempotency_key: str, idempotency_request_hash: str
+    ) -> dict[str, Any]:
+        key_hash = self._idempotency_key_hash(idempotency_key)
+        with self._sessions.begin() as session:
+            # The key-scoped PostgreSQL advisory lock makes the check, Bundle
+            # insert and retry binding one serializable critical section. It
+            # prevents a losing different-request race from materializing an
+            # otherwise unreachable immutable Bundle. SQLite's unique mapping
+            # remains a correct development fallback; production requires PG.
+            if session.bind.dialect.name == "postgresql":
+                session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key_hash})
+            existing = session.get(ContentKnowledgeBundleIdempotencyRow, key_hash)
+            if existing is not None:
+                return self._resolve_idempotent(session, existing, idempotency_request_hash)
+
+            result = self._insert_or_get_immutable(session, bundle)
+            mapping = ContentKnowledgeBundleIdempotencyRow(
+                idempotency_key_hash=key_hash,
+                idempotency_request_hash=idempotency_request_hash,
+                bundle_id=result["bundle_id"],
+            )
+            try:
+                with session.begin_nested():
+                    session.add(mapping)
+                    session.flush()
+            except IntegrityError:
+                # SQLite and non-PostgreSQL dialects do not have the advisory
+                # lock. Their unique durable mapping still determines the only
+                # permitted result after a concurrent insert race.
+                existing = session.get(ContentKnowledgeBundleIdempotencyRow, key_hash)
+                if existing is None:
+                    raise
+                return self._resolve_idempotent(session, existing, idempotency_request_hash)
+            return result
+
+    def get_idempotent(self, *, idempotency_key: str, idempotency_request_hash: str) -> dict[str, Any] | None:
+        key_hash = self._idempotency_key_hash(idempotency_key)
+        with self._sessions() as session:
+            existing = session.get(ContentKnowledgeBundleIdempotencyRow, key_hash)
+            if existing is None:
+                return None
+            return self._resolve_idempotent(session, existing, idempotency_request_hash)
+
+    @staticmethod
+    def _resolve_idempotent(session, mapping, expected_request_hash: str) -> dict[str, Any]:
+        if mapping.idempotency_request_hash != expected_request_hash:
+            raise IdempotencyConflict()
+        row = session.get(ContentKnowledgeBundleRow, mapping.bundle_id)
+        if row is None:
+            # The FK should make this impossible. Do not report a successful
+            # retry when durable state has been tampered with.
+            raise ValueError("idempotency mapping references missing bundle")
+        return dict(row.payload)
+
+    def _insert_or_get_immutable(self, session, bundle: dict[str, Any]) -> dict[str, Any]:
+        inserted = self._insert_ignore_conflict(session, bundle)
+        if inserted:
+            return dict(bundle)
+        row = session.scalar(
+            select(ContentKnowledgeBundleRow).where(
+                or_(
+                    ContentKnowledgeBundleRow.bundle_id == bundle["bundle_id"],
+                    ContentKnowledgeBundleRow.bundle_hash == bundle["bundle_hash"],
                 )
             )
-            if row is None:
-                # The conflict was not one of our immutable keys.  Do not
-                # convert an unrelated database failure into idempotency.
-                raise ValueError("bundle insert conflict without immutable row")
-            if row.bundle_hash != bundle["bundle_hash"] or dict(row.payload) != bundle:
-                raise ValueError("immutable bundle id collision")
-            return dict(row.payload)
-        return dict(bundle)
+        )
+        if row is None:
+            # The conflict was not one of our immutable keys.  Do not convert
+            # an unrelated database failure into idempotency.
+            raise ValueError("bundle insert conflict without immutable row")
+        if row.bundle_hash != bundle["bundle_hash"] or dict(row.payload) != bundle:
+            raise ValueError("immutable bundle id collision")
+        return dict(row.payload)
 
     @staticmethod
     def _values(bundle: dict[str, Any]) -> dict[str, Any]:
