@@ -335,6 +335,60 @@ def test_migration_replay_creates_child_snapshot(tmp_path):
     )
     assert repeated.status_code == 200
     assert repeated.json()["candidate_snapshot_id"] == replay.json()["candidate_snapshot_id"]
+    assert repeated.json()["replay_id"] == replay.json()["replay_id"]
+
+
+def test_migration_replay_request_identity_does_not_reuse_a_failed_other_pipeline(tmp_path, monkeypatch):
+    application = build_application(f"sqlite:///{tmp_path / 'content.db'}", enable_qdrant=False)
+    client = _client(application, tmp_path)
+    enqueue = client.post(
+        "/api/v1/videos/bilibili/ingest", json={"bv_id": "BV1migrationrequest", "options": _ingest_options()}
+    )
+    application.process_next("replay-migration-request")
+    snapshot_id = client.get(f"/api/v1/tasks/{enqueue.json()['task_id']}").json()["result"]["content_snapshot_id"]
+    original_process = application._pipeline.process  # noqa: SLF001
+
+    def fail_one_pipeline(context):
+        if context.options.get("replay_pipeline_version") == "pipeline.v4.failed":
+            raise RuntimeError("pipeline.v4.failed fixture failure")
+        return original_process(context)
+
+    monkeypatch.setattr(application._pipeline, "process", fail_one_pipeline)  # noqa: SLF001
+    failed = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.failed"},
+    )
+    assert failed.status_code == 500
+    failed_replay_id = failed.json()["error"]["details"]["replay_id"]
+    failed_retry = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.failed"},
+    )
+    assert failed_retry.status_code == 500
+    assert failed_retry.json()["error"]["details"]["replay_id"] == failed_replay_id
+
+    successful = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4.043.audit.2"},
+    )
+    assert successful.status_code == 200
+    assert successful.json()["replay_id"] != failed_replay_id
+    normalized_retry = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": " pipeline.v4.043.audit.2 "},
+    )
+    assert normalized_retry.status_code == 200
+    assert normalized_retry.json()["replay_id"] == successful.json()["replay_id"]
+    changed_override = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={
+            "mode": "MIGRATION_REPLAY",
+            "pipeline_version": "pipeline.v4.043.audit.2",
+            "overrides": {"transcript": "A result-changing migration override."},
+        },
+    )
+    assert changed_override.status_code == 200
+    assert changed_override.json()["replay_id"] != successful.json()["replay_id"]
 
 
 def test_migration_replay_reuses_sealed_source_clock_and_artifact_hashes(tmp_path):

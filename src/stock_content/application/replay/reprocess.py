@@ -7,7 +7,12 @@ from uuid import uuid4
 
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay.errors import ReplayIntegrityError
-from stock_content.application.replay.identity import migration_derivation_namespace
+from stock_content.application.replay.identity import (
+    canonical_migration_pipeline_version,
+    migration_derivation_namespace,
+    migration_replay_idempotency_key,
+    migration_replay_request_identity,
+)
 from stock_content.application.sealed_media import SealedMediaValidationError, validate_sealed_media
 from stock_content.domain.artifacts import ArtifactRegistry
 from stock_content.domain.models import ContentTask
@@ -33,6 +38,13 @@ class ReplayReprocessMixin:
                     "source_snapshot_id": snapshot.content_snapshot_id}
         task_id: str | None = None
         try:
+            if mode == "MIGRATION_REPLAY":
+                try:
+                    pipeline_version = canonical_migration_pipeline_version(pipeline_version)
+                except ValueError as exc:
+                    raise ReplayIntegrityError(
+                        "INVALID_REPLAY_REQUEST", "MIGRATION_REPLAY requires pipeline_version"
+                    ) from exc
             self._load_and_verify_artifacts(snapshot)
             source_id = snapshot.source_artifact_id or (snapshot.artifact_ids or {}).get("source")
             source = self._artifacts.get(source_id) if source_id else None
@@ -129,8 +141,6 @@ class ReplayReprocessMixin:
                 options["replay_sealed_media_root"] = private_root
             elif not (options.get("offline_fixture") or "transcript" in options or "segments" in options):
                 raise ReplayIntegrityError("REPLAY_INPUT_UNAVAILABLE", "source raw media is not durably available")
-            if mode == "MIGRATION_REPLAY" and not pipeline_version:
-                raise ReplayIntegrityError("INVALID_REPLAY_REQUEST", "MIGRATION_REPLAY requires pipeline_version")
             options["replay_snapshot_kind"] = "MIGRATION" if mode == "MIGRATION_REPLAY" else "REPROCESS"
             options["replay_parent_snapshot_id"] = snapshot.content_snapshot_id
             options["replay_supersedes_snapshot_id"] = snapshot.content_snapshot_id
@@ -138,16 +148,37 @@ class ReplayReprocessMixin:
                 options["replay_pipeline_version"] = pipeline_version
             if mode == "MIGRATION_REPLAY":
                 options["replay_derived_identity_seed"] = migration_derivation_namespace(
-                    snapshot.content_snapshot_id, str(pipeline_version)
+                    snapshot.content_snapshot_id, pipeline_version
                 )
             task_id = f"replay-{uuid4().hex}"
             if self._tasks is not None and hasattr(self._tasks, "create"):
                 persisted_options = {
                     key: value for key, value in options.items() if key not in self._RUNTIME_OPTIONS
                 }
-                self._tasks.create(ContentTask(task_id=task_id, source_type=snapshot.source_type,
-                                               source_ref=snapshot.source_ref, options=persisted_options,
-                                               status="RUNNING", max_retries=1, task_kind="replay"))
+                task_values: dict[str, Any] = {
+                    "task_id": task_id,
+                    "source_type": snapshot.source_type,
+                    "source_ref": snapshot.source_ref,
+                    "options": persisted_options,
+                    "status": "RUNNING",
+                    "max_retries": 1,
+                    "task_kind": "replay",
+                }
+                if mode == "MIGRATION_REPLAY":
+                    request_identity = migration_replay_request_identity(
+                        snapshot.content_snapshot_id,
+                        pipeline_version,
+                        overrides,
+                        runtime_option_keys=self._RUNTIME_OPTIONS,
+                    )
+                    task_values.update(
+                        input_hash=request_identity,
+                        idempotency_key=migration_replay_idempotency_key(request_identity),
+                        request_hash=request_identity,
+                    )
+                created_task = self._tasks.create(ContentTask(**task_values))
+                if created_task.task_id != task_id:
+                    return self._reuse_replay_task(created_task, snapshot, mode)
             context = PipelineContext(task_id=task_id,
                                       source={"type": snapshot.source_type, "ref": snapshot.source_ref},
                                       options=options)
@@ -186,6 +217,31 @@ class ReplayReprocessMixin:
             if task_id is not None and self._tasks is not None and hasattr(self._tasks, "fail"):
                 self._finish_replay_failure(task_id, f"{code}: {message}")
             raise ReplayIntegrityError(code, message, replay_id=task_id) from exc
+
+    @staticmethod
+    def _reuse_replay_task(task: ContentTask, snapshot: Any, mode: str) -> dict[str, Any]:
+        result = dict(task.result or {})
+        replay = result.get("replay")
+        if isinstance(replay, dict):
+            return dict(replay)
+        if task.status == "FAILED":
+            error = str(task.error or "migration replay previously failed")
+            code = error.split(":", 1)[0] if error.startswith("REPLAY_") else "REPLAY_FAILED"
+            return {
+                "error": code,
+                "detail": error,
+                "replay_id": task.task_id,
+                "mode": mode,
+                "source_snapshot_id": snapshot.content_snapshot_id,
+                "reused": True,
+            }
+        return {
+            "replay_id": task.task_id,
+            "mode": mode,
+            "source_snapshot_id": snapshot.content_snapshot_id,
+            "status": task.status,
+            "reused": True,
+        }
 
     def _finish_replay_success(self, task_id: str, result: dict[str, Any]) -> None:
         finish = getattr(self._tasks, "succeed_unleased", None)
