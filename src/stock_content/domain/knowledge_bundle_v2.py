@@ -51,6 +51,8 @@ def is_numeric_claim(item: Mapping[str, Any]) -> bool:
 
 
 def public_strict_eligible(item: Mapping[str, Any], minimum_support_status: str) -> bool:
+    if item.get("lifecycle_status") != "ACTIVE":
+        return False
     review = item.get("occurrence_review") or {}
     if review.get("status") == REVIEW_REQUIRED:
         return False
@@ -96,7 +98,7 @@ def validate_v2_item(raw: Mapping[str, Any], *, minimum_support_status: str) -> 
         raise ValueError("INCOMPLETE_SQL_AUTHORITY_ROW")
     if item.get("claim_schema_version") != "claim.atomic.v1" or item.get("legacy_grounding_incomplete"):
         raise ValueError("LEGACY_OR_UNGROUNDED_CLAIM")
-    if item.get("lifecycle_status") != "ACTIVE":
+    if item.get("lifecycle_status") not in {"ACTIVE", "EXTRACTED"}:
         raise ValueError("LIFECYCLE_NOT_ACTIVE")
     item["statement"] = atomic_statement(item["statement"])
     if item["primary_domain"] not in PRIMARY_DOMAINS:
@@ -159,6 +161,10 @@ def validate_v2_item(raw: Mapping[str, Any], *, minimum_support_status: str) -> 
         raise ValueError("INVALID_OCCURRENCE_REVIEW")
     if review["status"] == REVIEW_REQUIRED and not review["reason_codes"]:
         raise ValueError("REVIEW_REASON_REQUIRED")
+    if item.get("lifecycle_status") == "EXTRACTED" and review["status"] != REVIEW_REQUIRED:
+        # EXTRACTED is admitted only as review-blocked audit material for
+        # conservative quality accounting; it can never become a public item.
+        raise ValueError("LIFECYCLE_NOT_ACTIVE")
     evidence = item["evidence"]
     if not isinstance(evidence, list) or not evidence:
         raise ValueError("PRIMARY_EVIDENCE_REQUIRED")

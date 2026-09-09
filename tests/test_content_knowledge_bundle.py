@@ -468,6 +468,7 @@ def test_immutable_migration_declares_update_rejection():
 
 def test_v2_bundle_keeps_v1_replay_locked_and_exposes_reviewed_multitopic_semantics():
     first, conflict = _v2_item("co_1"), _v2_item("co_2", review=True)
+    conflict["lifecycle_status"] = "EXTRACTED"
     authority = Authority([first, conflict])
     request = _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT)
     bundle = _v2_service(authority).create(request)
