@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from stock_content.application.pipeline import PipelineContext
 from stock_content.application.replay.errors import ReplayIntegrityError
+from stock_content.application.replay.identity import migration_derivation_namespace
 from stock_content.application.sealed_media import SealedMediaValidationError, validate_sealed_media
 from stock_content.domain.artifacts import ArtifactRegistry
 from stock_content.domain.models import ContentTask
@@ -55,6 +56,7 @@ class ReplayReprocessMixin:
             # already passed snapshot lineage validation.
             for key in (
                 "replay_raw_storage_uri", "replay_expected_raw_hash",
+                "replay_derived_identity_seed",
                 "replay_sealed_source_artifact_id", "replay_sealed_snapshot_id",
                 "replay_sealed_source_metadata", "replay_sealed_media_root",
             ):
@@ -127,13 +129,17 @@ class ReplayReprocessMixin:
                 options["replay_sealed_media_root"] = private_root
             elif not (options.get("offline_fixture") or "transcript" in options or "segments" in options):
                 raise ReplayIntegrityError("REPLAY_INPUT_UNAVAILABLE", "source raw media is not durably available")
+            if mode == "MIGRATION_REPLAY" and not pipeline_version:
+                raise ReplayIntegrityError("INVALID_REPLAY_REQUEST", "MIGRATION_REPLAY requires pipeline_version")
             options["replay_snapshot_kind"] = "MIGRATION" if mode == "MIGRATION_REPLAY" else "REPROCESS"
             options["replay_parent_snapshot_id"] = snapshot.content_snapshot_id
             options["replay_supersedes_snapshot_id"] = snapshot.content_snapshot_id
             if pipeline_version:
                 options["replay_pipeline_version"] = pipeline_version
-            elif mode == "MIGRATION_REPLAY":
-                raise ReplayIntegrityError("INVALID_REPLAY_REQUEST", "MIGRATION_REPLAY requires pipeline_version")
+            if mode == "MIGRATION_REPLAY":
+                options["replay_derived_identity_seed"] = migration_derivation_namespace(
+                    snapshot.content_snapshot_id, str(pipeline_version)
+                )
             task_id = f"replay-{uuid4().hex}"
             if self._tasks is not None and hasattr(self._tasks, "create"):
                 persisted_options = {
@@ -154,7 +160,7 @@ class ReplayReprocessMixin:
                        "source_snapshot_id": snapshot.content_snapshot_id,
                        "candidate_snapshot_id": candidate_id, "comparison": comparison,
                        "differences": differences}
-            if differences:
+            if differences and mode != "MIGRATION_REPLAY":
                 payload.update({"error": "REPLAY_NONDETERMINISTIC",
                                 "detail": "reprocessed artifact hashes differ from the source snapshot"})
                 if self._tasks is not None and hasattr(self._tasks, "fail"):

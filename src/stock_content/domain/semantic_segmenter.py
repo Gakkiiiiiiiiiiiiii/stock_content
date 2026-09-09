@@ -65,13 +65,13 @@ class SemanticSegmenter:
         self.last_metrics: dict[str, float] = {}
 
     def segment(
-        self, transcript: TranscriptArtifact, *, offline_fixture: bool = False
+        self, transcript: TranscriptArtifact, *, offline_fixture: bool = False, identity_seed: str = ""
     ) -> SemanticSegmentationResult:
         items = list(transcript.segments)
         if not items:
             artifact = build_semantic_segment_artifact(
                 transcript, (), model_id=self.model_id, prompt_version=self.prompt_version,
-                schema_version=self.schema_version,
+                schema_version=self.schema_version, identity_seed=identity_seed,
             )
             artifact = replace(artifact, parent_artifact_ids=(transcript.artifact_id,), artifact_id="", content_hash="")
             artifact = replace(artifact, artifact_id=artifact_id_of(artifact))
@@ -107,6 +107,7 @@ class SemanticSegmenter:
             model_id=self.model_id,
             prompt_version=self.prompt_version,
             schema_version=self.schema_version,
+            identity_seed=identity_seed,
         )
         validate_full_coverage(segments, len(items))
         artifact = build_semantic_segment_artifact(
@@ -115,6 +116,7 @@ class SemanticSegmenter:
             model_id=self.model_id,
             prompt_version=self.prompt_version,
             schema_version=self.schema_version,
+            identity_seed=identity_seed,
         )
         # Artifact parent linkage is part of the authoritative chain.
         artifact = replace(artifact, parent_artifact_ids=(transcript.artifact_id,), artifact_id="", content_hash="")

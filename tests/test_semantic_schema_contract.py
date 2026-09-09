@@ -1,3 +1,5 @@
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -7,14 +9,17 @@ from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.models import ClaimOccurrenceRow, SemanticSegmentRow
 from stock_content.adapters.postgres.repositories.semantic_segment_repository import SemanticSegmentRepository
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.replay.identity import migration_derivation_namespace
 from stock_content.application.stages import SemanticSegmentationStage
-from stock_content.domain.artifacts import TranscriptArtifact, TranscriptSegmentItem
+from stock_content.domain.artifacts import EvidenceArtifact, TranscriptArtifact, TranscriptSegmentItem, artifact_id_of
+from stock_content.domain.claim_occurrence import ClaimOccurrence, knowledge_uid_for_occurrence
 from stock_content.domain.models import VideoAsset
 from stock_content.domain.semantic_segment import (
     build_semantic_segment_artifact,
     materialize_semantic_segments,
     semantic_segment_id,
 )
+from stock_content.domain.temporal_semantics import OccurrenceTimes
 
 
 def _transcript() -> TranscriptArtifact:
@@ -52,6 +57,68 @@ def test_semantic_segment_id_is_stable_content_identity_within_schema_limit():
         semantic_segment_id("transcript", "start", "end-2"),
         semantic_segment_id("transcript", "start", "end", "semantic-segment.v2"),
     }) == 5
+
+
+def test_migration_namespace_is_stable_and_isolates_immutable_derived_rows(tmp_path):
+    transcript = _transcript()
+    v4_namespace = migration_derivation_namespace("cs-parent", "pipeline.v4")
+    assert v4_namespace == migration_derivation_namespace("cs-parent", "pipeline.v4")
+    assert v4_namespace != migration_derivation_namespace("cs-parent", "pipeline.v5")
+
+    legacy = build_semantic_segment_artifact(transcript, (), model_id="legacy")
+    unnamespaced_v4 = build_semantic_segment_artifact(transcript, (), model_id="pipeline.v4")
+    v4 = build_semantic_segment_artifact(transcript, (), model_id="pipeline.v4", identity_seed=v4_namespace)
+    v4_repeat = build_semantic_segment_artifact(
+        transcript, (), model_id="pipeline.v4", identity_seed=v4_namespace
+    )
+    v5 = build_semantic_segment_artifact(
+        transcript,
+        (),
+        model_id="pipeline.v5",
+        identity_seed=migration_derivation_namespace("cs-parent", "pipeline.v5"),
+    )
+    legacy, unnamespaced_v4, v4, v4_repeat, v5 = (
+        replace(item, artifact_id=artifact_id_of(item))
+        for item in (legacy, unnamespaced_v4, v4, v4_repeat, v5)
+    )
+    assert legacy.segments[0].semantic_segment_id == unnamespaced_v4.segments[0].semantic_segment_id
+    assert v4.segments[0].semantic_segment_id == v4_repeat.segments[0].semantic_segment_id
+    assert len({legacy.segments[0].semantic_segment_id, v4.segments[0].semantic_segment_id,
+                v5.segments[0].semantic_segment_id}) == 3
+
+    database = Database(f"sqlite:///{tmp_path / 'migration-namespace.db'}")
+    database.create_schema()
+    repository = SemanticSegmentRepository(database.session_factory)
+    repository.save(legacy, video_id="video-contract")
+    with pytest.raises(ValueError, match="already stores different payload"):
+        repository.save(unnamespaced_v4, video_id="video-contract")
+    repository.save(v4, video_id="video-contract")
+    repository.save(v4_repeat, video_id="video-contract")
+    repository.save(v5, video_id="video-contract")
+
+    old_evidence = EvidenceArtifact(
+        artifact_id="evidence-pending", artifact_type="evidence", parent_artifact_ids=(legacy.artifact_id,)
+    )
+    migrated_evidence = EvidenceArtifact(
+        artifact_id="evidence-pending", artifact_type="evidence", parent_artifact_ids=(v4.artifact_id,)
+    )
+    assert artifact_id_of(old_evidence) != artifact_id_of(migrated_evidence)
+    clock = datetime(2025, 1, 1, tzinfo=UTC)
+    times = OccurrenceTimes(
+        ingested_at=clock, extraction_completed_at=clock, snapshot_committed_at=clock, available_from=clock
+    )
+    old_occurrence = ClaimOccurrence(
+        claim_id="claim-shared", source_artifact_id="source", transcript_artifact_id=transcript.artifact_id,
+        semantic_segment_id=legacy.segments[0].semantic_segment_id, evidence_refs=["evidence-shared"], times=times,
+    )
+    migrated_occurrence = ClaimOccurrence(
+        claim_id="claim-shared", source_artifact_id="source", transcript_artifact_id=transcript.artifact_id,
+        semantic_segment_id=v4.segments[0].semantic_segment_id, evidence_refs=["evidence-shared"], times=times,
+    )
+    assert old_occurrence.occurrence_id != migrated_occurrence.occurrence_id
+    assert knowledge_uid_for_occurrence(old_occurrence.occurrence_id) != knowledge_uid_for_occurrence(
+        migrated_occurrence.occurrence_id
+    )
 
 
 def test_semantic_domain_and_repository_carry_authoritative_video_id(tmp_path):
@@ -103,6 +170,21 @@ def test_semantic_stage_passes_current_video_identity_and_fails_closed_without_i
     SemanticSegmentationStage(repository=repository).execute(context)
     assert repository.video_ids == ["authoritative-video"]
 
+    migration = PipelineContext(
+        task_id="semantic-migration",
+        source={"type": "fixture", "ref": "semantic-migration"},
+        options={"offline_fixture": True, "replay_derived_identity_seed": "migration-test"},
+    )
+    migration.artifacts.transcript = _transcript()
+    migration.state.video = VideoAsset(
+        video_id="authoritative-video", source_type="fixture", source_ref="semantic-migration", title="fixture"
+    )
+    SemanticSegmentationStage(repository=repository).execute(migration)
+    assert (
+        migration.state.semantic_segments[0].semantic_segment_id
+        != context.state.semantic_segments[0].semantic_segment_id
+    )
+
     missing_video = PipelineContext(
         task_id="semantic-video-missing",
         source={"type": "fixture", "ref": "semantic-video-missing"},
@@ -118,6 +200,7 @@ def test_semantic_orm_and_migrations_match_final_contract():
     database.create_schema()
     columns = {item["name"]: item for item in inspect(database.engine).get_columns("semantic_segment")}
     assert columns["semantic_segment_id"]["type"].length == 64
+    assert columns["derivation_namespace"]["type"].length == 48
     assert columns["video_id"]["type"].length == 64
     assert columns["video_id"]["nullable"] is False
     assert columns["subject"]["type"].length == 255
@@ -149,3 +232,6 @@ def test_semantic_orm_and_migrations_match_final_contract():
     assert "prompt_version varchar(80)" in semantic_sql
     assert "semantic_segment_id varchar(64) NOT NULL" in occurrence_sql
     assert "CHECK (available_from >= ingested_at)" in occurrence_sql
+    migration_sql = (migration_root / "039_migration_replay_derivation_namespace.sql").read_text(encoding="utf-8")
+    assert "derivation_namespace varchar(48) NOT NULL DEFAULT ''" in migration_sql
+    assert "transcript_artifact_id, derivation_namespace, segment_index" in migration_sql

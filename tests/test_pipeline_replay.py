@@ -329,6 +329,12 @@ def test_migration_replay_creates_child_snapshot(tmp_path):
     assert candidate["parent_snapshot_id"] == snapshot_id
     assert candidate["supersedes_snapshot_id"] == snapshot_id
     assert candidate["pipeline_version"] == "pipeline.v4"
+    repeated = client.post(
+        f"/api/v1/content-snapshots/{snapshot_id}/replay",
+        json={"mode": "MIGRATION_REPLAY", "pipeline_version": "pipeline.v4"},
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["candidate_snapshot_id"] == replay.json()["candidate_snapshot_id"]
 
 
 def test_migration_replay_reuses_sealed_source_clock_and_artifact_hashes(tmp_path):
@@ -359,7 +365,10 @@ def test_migration_replay_reuses_sealed_source_clock_and_artifact_hashes(tmp_pat
     candidate = application._snapshots.get(candidate_id)  # noqa: SLF001
     assert candidate.content_snapshot_id != source.content_snapshot_id
     assert candidate.pipeline_version == "pipeline.v4"
-    assert candidate.artifact_ids == source.artifact_ids
+    assert candidate.artifact_ids["source"] == source.artifact_ids["source"]
+    assert candidate.artifact_ids["transcript"] == source.artifact_ids["transcript"]
+    assert candidate.artifact_ids["semantic_segments"] != source.artifact_ids["semantic_segments"]
+    assert candidate.artifact_ids["evidence"] != source.artifact_ids["evidence"]
 
 
 def test_task_specific_options_do_not_change_snapshot_identity(tmp_path):

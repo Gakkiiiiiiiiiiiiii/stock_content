@@ -16,6 +16,7 @@ def semantic_segment_id(
     start_segment_id: str,
     end_segment_id: str,
     schema_version: str = SEMANTIC_SEGMENT_SCHEMA_VERSION,
+    identity_seed: str = "",
 ) -> str:
     if not transcript_artifact_id or not start_segment_id or not end_segment_id:
         raise ValueError("transcript and boundary segment ids are required")
@@ -25,6 +26,8 @@ def semantic_segment_id(
         "end_segment_id": end_segment_id,
         "schema_version": schema_version,
     }
+    if identity_seed:
+        payload["identity_seed"] = identity_seed
     # The database contract allocates 64 characters. Preserve the frozen
     # ``semseg_`` identity prefix and retain 228 bits of the content hash.
     return "semseg_" + hashlib.sha256(canonical_json(payload).encode()).hexdigest()[:57]
@@ -56,6 +59,7 @@ class SemanticSegment:
     model_id: str = ""
     prompt_version: str = ""
     confidence: float | None = None
+    derivation_namespace: str = ""
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,7 @@ class SemanticSegmentItem:
     subject: str | None = None
     segment_type: str = "ANALYSIS"
     confidence: float | None = None
+    derivation_namespace: str = ""
 
 
 def materialize_semantic_segments(
@@ -81,6 +86,7 @@ def materialize_semantic_segments(
     model_id: str = "",
     prompt_version: str = "",
     schema_version: str = SEMANTIC_SEGMENT_SCHEMA_VERSION,
+    identity_seed: str = "",
 ) -> list[SemanticSegment]:
     """Turn validated boundary points into contiguous, gap-free segments."""
     from .semantic_boundary_validator import validate_boundaries
@@ -100,7 +106,7 @@ def materialize_semantic_segments(
         output.append(
             SemanticSegment(
                 semantic_segment_id=semantic_segment_id(
-                    transcript.artifact_id, first.segment_id, last.segment_id, schema_version
+                    transcript.artifact_id, first.segment_id, last.segment_id, schema_version, identity_seed
                 ),
                 transcript_artifact_id=transcript.artifact_id,
                 segment_index=index,
@@ -116,6 +122,7 @@ def materialize_semantic_segments(
                 topic=(boundary_items[index - 1].next_topic if index > 0 else None),
                 subject=(boundary_items[index - 1].next_subject if index > 0 else None),
                 confidence=(boundary_items[index - 1].confidence if index > 0 else None),
+                derivation_namespace=identity_seed,
             )
         )
     return output
@@ -129,6 +136,7 @@ def build_semantic_segment_artifact(
     model_id: str = "",
     prompt_version: str = "",
     schema_version: str = SEMANTIC_SEGMENT_SCHEMA_VERSION,
+    identity_seed: str = "",
 ) -> SemanticSegmentArtifact:
     segments = materialize_semantic_segments(
         transcript,
@@ -136,6 +144,7 @@ def build_semantic_segment_artifact(
         model_id=model_id,
         prompt_version=prompt_version,
         schema_version=schema_version,
+        identity_seed=identity_seed,
     )
     return SemanticSegmentArtifact(
         artifact_id=artifact_id,
@@ -155,6 +164,7 @@ def build_semantic_segment_artifact(
                 subject=item.subject,
                 segment_type=item.segment_type,
                 confidence=item.confidence,
+                derivation_namespace=item.derivation_namespace,
             )
             for item in segments
         ],

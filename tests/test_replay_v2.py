@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.replay.identity import migration_derivation_namespace
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import InMemorySnapshotStore, SnapshotService
 from stock_content.application.stages import DownloadStage, ResolveSourceStage
@@ -379,6 +380,18 @@ def test_replay_ignores_request_override_of_a_sealed_media_path(tmp_path, monkey
     assert "error" not in result
     assert adapter.resolve_calls == 0
     assert pipeline.context.runtime.video_path == media.resolve()
+
+
+def test_migration_replay_uses_a_stable_pipeline_specific_derivation_namespace(tmp_path, monkeypatch):
+    replay, snapshot, _source, _media, _adapter, pipeline = _sealed_media_replay(tmp_path, monkeypatch)
+
+    replay.replay(snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v4")
+    v4_seed = pipeline.context.options["replay_derived_identity_seed"]
+    replay.replay(snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v4")
+    assert pipeline.context.options["replay_derived_identity_seed"] == v4_seed
+    replay.replay(snapshot.content_snapshot_id, mode="MIGRATION_REPLAY", pipeline_version="pipeline.v5")
+    assert v4_seed == migration_derivation_namespace(snapshot.content_snapshot_id, "pipeline.v4")
+    assert pipeline.context.options["replay_derived_identity_seed"] != v4_seed
 
 
 def test_normal_source_resolution_still_calls_the_source_adapter():

@@ -85,6 +85,7 @@ def _row_payload(row: SemanticSegmentRow) -> dict:
     return {
         "semantic_segment_id": row.semantic_segment_id,
         "transcript_artifact_id": row.transcript_artifact_id,
+        "derivation_namespace": row.derivation_namespace,
         "segment_index": row.segment_index,
         "start_segment_index": row.start_segment_index,
         "end_segment_index": row.end_segment_index,

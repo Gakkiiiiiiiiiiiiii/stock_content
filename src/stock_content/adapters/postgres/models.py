@@ -393,12 +393,13 @@ class LifecycleEventLedgerRow(Base):
 class SemanticSegmentRow(Base):
     __tablename__ = "semantic_segment"
     __table_args__ = (
-        UniqueConstraint("transcript_artifact_id", "segment_index"),
+        UniqueConstraint("transcript_artifact_id", "derivation_namespace", "segment_index"),
         CheckConstraint("start_segment_index <= end_segment_index"),
         CheckConstraint("start_ms <= end_ms"),
     )
     semantic_segment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     transcript_artifact_id: Mapped[str] = mapped_column(String(128), index=True)
+    derivation_namespace: Mapped[str] = mapped_column(String(48), default="")
     video_id: Mapped[str] = mapped_column(String(64), index=True)
     segment_index: Mapped[int] = mapped_column(Integer)
     start_segment_id: Mapped[str] = mapped_column(String(128))

@@ -1658,6 +1658,7 @@ class SemanticSegmentationStage:
                     or "transcript" in context.options
                     or "segments" in context.options
                 ),
+                identity_seed=str(context.options.get("replay_derived_identity_seed") or ""),
             )
         except Exception:
             # Keep the metric fail-closed while preserving the stage error.
