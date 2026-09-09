@@ -6,7 +6,11 @@ import pytest
 from stock_content.adapters.media.frame import FfmpegFrameExtractor
 from stock_content.api.dependencies import build_application
 from stock_content.application.pipeline import PipelineContext, RuntimeWorkspace
-from stock_content.application.stages import ClaimVisualBindingStage, KnowledgeDirectedFrameExtractionStage
+from stock_content.application.stages import (
+    ClaimVisualBindingStage,
+    KnowledgeDirectedFrameExtractionStage,
+    _occurrence_visual_evidence,
+)
 from stock_content.domain.artifacts import (
     FrameArtifact,
     MediaArtifact,
@@ -15,7 +19,7 @@ from stock_content.domain.artifacts import (
     TranscriptSegmentItem,
     VisionArtifact,
 )
-from stock_content.domain.claim_draft import ClaimOccurrenceDraft
+from stock_content.domain.claim_draft import ClaimOccurrenceDraft, VisualEvidenceAnchor
 from stock_content.domain.semantic_segment import materialize_semantic_segments
 
 
@@ -273,6 +277,49 @@ def test_displayed_secondary_page_binding_excludes_speaker_thesis_and_forecast(
     ClaimVisualBindingStage().execute(context)
 
     assert bool(context.state.claim_drafts[0].visual_anchors) is expected
+
+
+def test_displayed_secondary_report_anchor_materializes_direct_frame_and_ocr_evidence(tmp_path):
+    context = _context(tmp_path)
+    context.state.transcript_visual_crosschecks = [
+        {"frame_id": "secondary-frame", "relation": "SUPPORTS_DISPLAYED_SECONDARY"}
+    ]
+    frame = FrameArtifact(
+        artifact_id="secondary-frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
+        frame_id="secondary-frame", timestamp_ms=3_000, image_hash="image", storage_ref="fixture",
+        evidence_window_ids=("owned-window",),
+    )
+    context.artifacts.add("frames", frame)
+    context.artifacts.add(
+        "ocr",
+        OCRArtifact(
+            artifact_id="secondary-ocr", artifact_type="ocr", frame_artifact_id=frame.artifact_id,
+            frame_id=frame.frame_id, timestamp_ms=3_000, image_hash="image", evidence_window_ids=("owned-window",),
+            text="2030年目标9800 EFLOPS", bbox=[0, 0, 1, 1], confidence_score=0.9,
+            engine="paddleocr", engine_version="3.7.0",
+        ),
+    )
+    draft = ClaimOccurrenceDraft(
+        semantic_segment_id=context.state.semantic_segments[0].semantic_segment_id,
+        knowledge_kind="CLAIM",
+        claim_type="OPINION",
+        bundle_v2={
+            "claim_nature": "ATTRIBUTED_SECONDARY_POLICY_REPORT",
+            "source_grade": "SECONDARY",
+            "attribution": {"attributed": True, "source_label": "displayed secondary policy page"},
+        },
+        visual_anchors=[
+            VisualEvidenceAnchor(
+                frame_id=frame.frame_id, timestamp_ms=frame.timestamp_ms, bbox=(0.0, 0.0, 1.0, 1.0),
+                ocr_text="2030年目标9800 EFLOPS", model_id="paddleocr", model_version="3.7.0",
+                confidence=0.9, support_type="OCR",
+            )
+        ],
+    )
+
+    evidence = _occurrence_visual_evidence(context, draft)
+
+    assert {item.source_type for item in evidence} == {"FRAME", "OCR"}
 
 
 def test_targeted_stage_fails_closed_for_live_media_without_semantic_windows(tmp_path):

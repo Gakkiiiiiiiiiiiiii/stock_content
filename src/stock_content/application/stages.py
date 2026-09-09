@@ -2293,6 +2293,19 @@ def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrence
     if not draft.visual_anchors:
         return []
     eligible = _eligible_visual_ids(context)
+    if _is_attributed_displayed_secondary_report(draft):
+        # Displayed secondary pages are deliberately excluded from the normal
+        # SUPPORTS/CONTRADICTS admission set because they do not independently
+        # verify an investment fact.  They are nevertheless valid direct
+        # evidence for the narrower proposition "the displayed page reports
+        # X" (for example KU11/KU12).  ClaimVisualBindingStage already limits
+        # these anchors to that attributed-report claim shape; mirror the same
+        # rule here so persistence cannot reject its own admitted anchors.
+        eligible.update(
+            str(item.get("frame_id") or "")
+            for item in context.state.get("transcript_visual_crosschecks") or ()
+            if item.get("relation") == "SUPPORTS_DISPLAYED_SECONDARY"
+        )
     frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in eligible}
     ocr_by_frame: dict[str, list[Any]] = {}
     vision_by_frame: dict[str, list[Any]] = {}
