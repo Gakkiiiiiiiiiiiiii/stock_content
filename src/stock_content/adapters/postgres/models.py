@@ -226,7 +226,9 @@ class OcrEvidenceRow(Base):
     frame_id: Mapped[str] = mapped_column(ForeignKey("video_frame.frame_id", ondelete="CASCADE"), index=True)
     timestamp_ms: Mapped[int] = mapped_column(Integer, index=True)
     text: Mapped[str] = mapped_column(Text)
-    bbox: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # PaddleOCR emits both rectangular arrays and four-point polygons.  JSON
+    # evidence must retain that geometry verbatim; it is not a key/value map.
+    bbox: Mapped[dict[str, Any] | list[Any]] = mapped_column(JSON, default=dict)
     confidence: Mapped[float | None] = mapped_column(Float)
     ocr_engine: Mapped[str] = mapped_column(String(80))
     engine_version: Mapped[str | None] = mapped_column(String(80))

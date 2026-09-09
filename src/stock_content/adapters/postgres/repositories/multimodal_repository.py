@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
@@ -40,6 +41,11 @@ class PostgresMultimodalRepository:
                         storage_ref=str(frame.get("image_path") or frame.get("storage_ref") or ""),
                     )
                 )
+            # VideoFrameRow and OcrEvidenceRow are linked by a scalar FK but
+            # intentionally have no ORM relationship.  Flush the parent rows
+            # before adding children so PostgreSQL cannot order two pending
+            # INSERTs arbitrarily when a later repository operation autoflushes.
+            session.flush()
             for item in ocr:
                 frame_id = str(item.get("frame_id") or "")
                 if frame_id:
@@ -48,7 +54,7 @@ class PostgresMultimodalRepository:
                             frame_id=frame_id,
                             timestamp_ms=int(item.get("timestamp_ms") or 0),
                             text=str(item.get("evidence_text") or item.get("text") or ""),
-                            bbox=dict(item.get("bbox") or {}),
+                            bbox=_bbox_json(item.get("bbox")),
                             confidence=item.get("confidence_score") or item.get("confidence"),
                             ocr_engine=str(item.get("ocr_engine") or "unknown"),
                             engine_version=item.get("ocr_engine_version"),
@@ -113,7 +119,6 @@ class PostgresMultimodalRepository:
                     select(OcrEvidenceRow).join(VideoFrameRow).where(VideoFrameRow.video_id == video_id)
                 )
             ]
-
     def list_vision(self, video_id: str) -> list[dict]:
         with self._sessions() as session:
             return [
@@ -138,3 +143,19 @@ class PostgresMultimodalRepository:
                     .order_by(TemporalWindowRow.start_ms)
                 )
             ]
+
+
+def _bbox_json(value: object) -> dict[str, Any] | list[Any]:
+    """Preserve OCR geometry in the JSON shape emitted by its engine.
+
+    PaddleOCR commonly returns a four-point polygon (a nested list), while
+    older adapters may use a named mapping.  The former must not be coerced
+    through ``dict(...)``: that both rejects ordinary polygons and would lose
+    their ordered geometry.  Unknown shapes are represented as an empty
+    object, matching the historical missing-bbox projection.
+    """
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return {}
