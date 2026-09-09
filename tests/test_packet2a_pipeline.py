@@ -92,6 +92,24 @@ def test_semantic_segmenter_short_call_and_repair_fail_closed():
         SemanticSegmenter(bad).segment(_transcript())
 
 
+def test_semantic_segmenter_prompt_requires_unit_interval_confidence_and_rejects_percentage():
+    invalid_percentage = '{"boundaries":[{"after_segment_index":0,"boundary_type":"TOPIC",' \
+        '"next_topic":null,"next_subject":null,"confidence":100}]}'
+    gateway = _Gateway([{"content": invalid_percentage}, {"content": '{"boundaries":[]}'}])
+
+    result = SemanticSegmenter(gateway).segment(_transcript())
+
+    assert result.segments
+    assert len(gateway.calls) == 2
+    for call in gateway.calls:
+        assert "confidence 必须为 null 或 [0,1]（含端点）内的有限 JSON number" in call["prompt"]
+        assert "百分制（例如 100）" in call["prompt"]
+
+    unrepaired = _Gateway([{"content": invalid_percentage}, {"content": invalid_percentage}])
+    with pytest.raises(ValueError, match="after one repair"):
+        SemanticSegmenter(unrepaired).segment(_transcript())
+
+
 def test_build_video_preserves_authoritative_resolved_metadata_and_times():
     context = PipelineContext(
         task_id="resolved-metadata",

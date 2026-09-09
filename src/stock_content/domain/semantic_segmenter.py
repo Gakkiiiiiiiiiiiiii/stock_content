@@ -265,6 +265,7 @@ class SemanticSegmenter:
             repair = self._complete(
                 prompt
                 + "\n上一次输出无效。仅修复 JSON schema，仍不得输出 claim 或 timestamp。"
+                + " confidence 必须为 null 或 [0,1]（含端点）内的有限 JSON number；不得使用百分制（例如 100）。"
                 + "\n"
                 + self._boundary_coordinate_instruction(start, end)
             )
@@ -306,7 +307,8 @@ class SemanticSegmenter:
             "segments and no gaps are allowed; long blocks may overlap, so adjudicate a shared boundary using the "
             "strongest local evidence and confidence. Return exactly "
             '{"boundaries":[{"after_segment_index":int,"boundary_type":str,"next_topic":str|null,'
-            '"next_subject":str|null,"confidence":number|null}]} and no prose.\n'
+            '"next_subject":str|null,"confidence":number|null}]} and no prose. '
+            "confidence 必须为 null 或 [0,1]（含端点）内的有限 JSON number；不得使用百分制（例如 100）。\n"
             + self._boundary_coordinate_instruction(start, end)
             + "\n"
             + json.dumps(lines, ensure_ascii=False, separators=(",", ":"))
