@@ -73,6 +73,11 @@ _ADDITIVE_IDENTITY_FIELDS = frozenset(
 )
 _V1_SCHEMA_VERSION = "content.snapshot.v1"
 _V2_SCHEMA_VERSION = "content.snapshot.v2"
+# Keep each ``IN`` predicate below SQLite's conservative 999-parameter
+# ceiling.  PostgreSQL accepts larger lists, but using the same bounded query
+# shape keeps snapshot validation portable and prevents a large OCR snapshot
+# from becoming one query per artifact.
+_SNAPSHOT_ARTIFACT_VALIDATION_BATCH_SIZE = 500
 _CORE_IDENTITY_FIELDS = frozenset(
     {
         "content_snapshot_id",
@@ -265,66 +270,94 @@ def _validate_snapshot_artifacts(
     error into the snapshot integrity error used by all snapshot entrypoints.
     """
     legacy = schema_version == _V1_SCHEMA_VERSION
+    pending = list(dict.fromkeys(str(artifact_id) for artifact_id in artifact_ids.values()))
+    queued = set(pending)
+    parents_by_artifact: dict[str, tuple[str, ...]] = {}
+
+    # Load each closure frontier in bounded batches.  The validation below
+    # intentionally remains per artifact: it is the integrity boundary for
+    # canonical payload/hash/type checks and normalized parent-edge checks.
+    # Only transport to the database is batched.
+    while pending:
+        batch = pending[:_SNAPSHOT_ARTIFACT_VALIDATION_BATCH_SIZE]
+        del pending[:_SNAPSHOT_ARTIFACT_VALIDATION_BATCH_SIZE]
+        rows_by_id = {
+            row.artifact_id: row
+            for row in session.scalars(
+                select(ContentArtifactRow).where(ContentArtifactRow.artifact_id.in_(batch))
+            ).all()
+        }
+        edges_by_artifact: dict[str, list[ContentArtifactEdgeRow]] = {}
+        for edge in session.scalars(
+            select(ContentArtifactEdgeRow).where(ContentArtifactEdgeRow.artifact_id.in_(batch))
+        ).all():
+            edges_by_artifact.setdefault(str(edge.artifact_id), []).append(edge)
+
+        for artifact_id in batch:
+            row = rows_by_id.get(artifact_id)
+            if row is None:
+                if legacy:
+                    continue
+                cause = ArtifactIntegrityError(f"missing artifact {artifact_id}")
+                raise SnapshotIntegrityError(
+                    f"snapshot {snapshot_id} references missing artifact {artifact_id}"
+                ) from cause
+            payload = dict(row.payload or {})
+            try:
+                artifact = deserialize_artifact(payload)
+                _validate_row_payload(row, payload, artifact)
+            except Exception as exc:  # noqa: BLE001 - stable snapshot integrity boundary
+                raise SnapshotIntegrityError(
+                    f"snapshot {snapshot_id} references invalid artifact {artifact_id}"
+                ) from exc
+            parent_ids = tuple(str(parent_id) for parent_id in (row.parent_artifact_ids or ()))
+            expected_edges = {
+                (
+                    hashlib.sha256(f"{artifact_id}:{parent_id}".encode()).hexdigest(),
+                    artifact_id,
+                    parent_id,
+                    "PARENT",
+                )
+                for parent_id in parent_ids
+            }
+            edges = edges_by_artifact.get(artifact_id, [])
+            actual_edges = {
+                (edge.edge_id, edge.artifact_id, str(edge.parent_artifact_id), str(edge.relation))
+                for edge in edges
+            }
+            if edges and actual_edges != expected_edges:
+                raise SnapshotIntegrityError(
+                    f"snapshot {snapshot_id} artifact parent edges are inconsistent for {artifact_id}"
+                )
+            if not edges and not legacy and expected_edges:
+                raise SnapshotIntegrityError(
+                    f"snapshot {snapshot_id} artifact parent edges are missing for {artifact_id}"
+                )
+            parents_by_artifact[artifact_id] = parent_ids
+            for parent_id in parent_ids:
+                if parent_id not in queued:
+                    pending.append(parent_id)
+                    queued.add(parent_id)
+
     visiting: set[str] = set()
     validated: set[str] = set()
 
-    def visit(artifact_id: str) -> None:
-        artifact_id = str(artifact_id)
-        if artifact_id in validated:
+    def validate_closure(artifact_id: str) -> None:
+        if artifact_id in validated or artifact_id not in parents_by_artifact:
+            # A missing legacy parent remains readable, exactly as before.
             return
         if artifact_id in visiting:
             raise SnapshotIntegrityError(
                 f"snapshot {snapshot_id} artifact parent cycle includes {artifact_id}"
             )
         visiting.add(artifact_id)
-        row = session.get(ContentArtifactRow, artifact_id)
-        if row is None:
-            visiting.remove(artifact_id)
-            if legacy:
-                return
-            cause = ArtifactIntegrityError(f"missing artifact {artifact_id}")
-            raise SnapshotIntegrityError(
-                f"snapshot {snapshot_id} references missing artifact {artifact_id}"
-            ) from cause
-        payload = dict(row.payload or {})
-        try:
-            artifact = deserialize_artifact(payload)
-            _validate_row_payload(row, payload, artifact)
-        except Exception as exc:  # noqa: BLE001 - stable snapshot integrity boundary
-            raise SnapshotIntegrityError(
-                f"snapshot {snapshot_id} references invalid artifact {artifact_id}"
-            ) from exc
-        expected_edges = {
-            (
-                hashlib.sha256(f"{artifact_id}:{parent_id}".encode()).hexdigest(),
-                artifact_id,
-                str(parent_id),
-                "PARENT",
-            )
-            for parent_id in (row.parent_artifact_ids or ())
-        }
-        edges = session.scalars(
-            select(ContentArtifactEdgeRow).where(ContentArtifactEdgeRow.artifact_id == artifact_id)
-        ).all()
-        actual_edges = {
-            (edge.edge_id, edge.artifact_id, str(edge.parent_artifact_id), str(edge.relation))
-            for edge in edges
-        }
-        if edges and actual_edges != expected_edges:
-            raise SnapshotIntegrityError(
-                f"snapshot {snapshot_id} artifact parent edges are inconsistent for {artifact_id}"
-            )
-        if not edges and not legacy and expected_edges:
-            raise SnapshotIntegrityError(
-                f"snapshot {snapshot_id} artifact parent edges are missing for {artifact_id}"
-            )
-        for parent_id in row.parent_artifact_ids or ():
-            visit(str(parent_id))
+        for parent_id in parents_by_artifact[artifact_id]:
+            validate_closure(parent_id)
         visiting.remove(artifact_id)
         validated.add(artifact_id)
 
     for artifact_id in artifact_ids.values():
-        visit(str(artifact_id))
+        validate_closure(str(artifact_id))
 
 
 def _validate_snapshot_row(session, row: ContentSnapshotRow) -> None:

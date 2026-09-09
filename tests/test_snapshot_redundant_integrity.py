@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import replace
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, event
 
 from stock_content.adapters.postgres.database import Database
 from stock_content.adapters.postgres.models import (
@@ -325,3 +325,65 @@ def test_legacy_v1_identity_without_additive_keys_remains_readable(tmp_path):
     assert [item.content_snapshot_id for item in store.list_for_source(
         snapshot.source_type, snapshot.source_ref
     )] == [snapshot.content_snapshot_id]
+
+
+def test_snapshot_artifact_validation_batches_large_recursive_closure_queries(tmp_path):
+    """A large OCR-like member set must not turn validation into N+1 SQL."""
+    database = Database(f"sqlite:///{tmp_path / 'snapshot-large-closure.db'}")
+    database.create_schema()
+    store = SqlSnapshotStore(database.session_factory)
+    artifacts = SqlArtifactRepository(database.session_factory)
+    root = SourceArtifact(
+        artifact_id="large-source",
+        artifact_type="source",
+        source_type="fixture",
+        source_ref="large-recursive-closure",
+        source_content_hash="large-content",
+    )
+    artifact_ids = {"source": root.artifact_id}
+    with database.session_factory.begin() as session:
+        artifacts.put_in_session(session, root)
+        for index in range(1_001):
+            artifact_id = f"large-claim-{index}"
+            artifacts.put_in_session(
+                session,
+                ClaimArtifact(
+                    artifact_id=artifact_id,
+                    artifact_type="claims",
+                    parent_artifact_ids=(root.artifact_id,),
+                    evidence_artifact_id=root.artifact_id,
+                    claims=[{"claim_id": f"large-claim-{index}"}],
+                ),
+            )
+            artifact_ids[f"claims:{index}"] = artifact_id
+    snapshot = build_content_snapshot(
+        source_type="fixture",
+        source_ref="large-recursive-closure",
+        source_content_hash="large-content",
+        source_artifact_id=root.artifact_id,
+        artifact_ids=artifact_ids,
+        code_sha="release-sha",
+        config_hash="config-hash",
+        producer_manifest={"code_sha": "release-sha"},
+    )
+    store.save(snapshot)
+
+    statements: list[str] = []
+
+    def record_select(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(database.engine, "before_cursor_execute", record_select)
+    try:
+        fetched = store.get(snapshot.content_snapshot_id)
+    finally:
+        event.remove(database.engine, "before_cursor_execute", record_select)
+
+    assert fetched is not None
+    assert fetched.artifact_ids == artifact_ids
+
+    # 1,002 direct members exceed SQLite's conventional 999 parameter limit.
+    # Reads comprise one snapshot row, one membership ledger, and three
+    # bounded artifact/edge query pairs, rather than one pair per member.
+    assert len(statements) <= 8
