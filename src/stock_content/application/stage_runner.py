@@ -214,6 +214,26 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
     }
     public_hash = hashlib.sha256(canonical_json(public_materialization).encode("utf-8")).hexdigest()
     config = dict(context.options.get("pipeline_config") or {})
+    # Semantic-context planning is deliberately text-first.  Its checkpoint
+    # is made before targeted frame extraction, so it must not become coupled
+    # to a future OCR/Vision runtime merely because the application happens to
+    # have those adapters configured.  A post-visual semantic context (if a
+    # graph explicitly introduces one) has visual artifacts in its inputs and
+    # retains the full visual identity below.
+    text_only_semantic_context = (
+        context.current_stage == "semantic_context"
+        and not (context.artifacts.frames or context.artifacts.ocr or context.artifacts.vision)
+    )
+    visual_model_keys = {
+        "knowledge_evidence_window_planner",
+        "knowledge_frame_planner",
+        "transcript_visual_crosscheck",
+        "ocr_engine",
+        "ocr_engine_version",
+        "ocr_requested_device",
+        "vision",
+        "vision_version",
+    }
     model_identity = {
         key: str(value)
         for key, value in {
@@ -230,14 +250,15 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "vision": config.get("vision_model") or context.options.get("vision_model") or "",
             "vision_version": config.get("vision_model_version") or context.options.get("vision_model_version") or "",
         }.items()
-        if value
+        if value and (not text_only_semantic_context or key not in visual_model_keys)
     }
     # Only an OCR stage that actually observed a worker runtime may add this
     # provenance.  Empty metadata must not mutate unrelated stage checkpoints.
     runtime_identity = context.options.get("ocr_runtime_identity")
-    if isinstance(runtime_identity, dict) and runtime_identity:
+    if not text_only_semantic_context and isinstance(runtime_identity, dict) and runtime_identity:
         model_identity["ocr_actual_device"] = str(runtime_identity.get("actual_device") or "")
         model_identity["ocr_runtime_identity"] = canonical_json(runtime_identity)
+    visual_prompt_keys = {"vision", "vision_adapter"}
     prompt_identity = {
         key: str(value)
         for key, value in {
@@ -250,7 +271,7 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "vision": context.options.get("vision_prompt_version") or config.get("vision_prompt_version"),
             "vision_adapter": config.get("vision_adapter_version"),
         }.items()
-        if value
+        if value and (not text_only_semantic_context or key not in visual_prompt_keys)
     }
     return {
         "public_materialization_hash": public_hash,

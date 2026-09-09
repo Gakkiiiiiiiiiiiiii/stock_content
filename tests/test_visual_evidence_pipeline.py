@@ -108,6 +108,63 @@ def test_malformed_model_visual_data_fails_closed(tmp_path):
         VisionStage(BadVision()).execute(_context(tmp_path / "bad-vision"))
 
 
+def test_paddle_blank_frames_emit_no_ocr_artifacts_across_targeted_batch(tmp_path):
+    """A legal empty recognition is absence of evidence, not fake OCR text.
+
+    The live XiaoE regression contained blank/transition frames in its
+    84-frame claim-directed batch.  Exercise the whole batch to make sure no
+    single blank result aborts a resumed production task or writes a blank
+    OCRArtifact that a later stage could mistake for evidence.
+    """
+
+    context = _context(tmp_path)
+    context.state.frames = [
+        {
+            "frame_id": f"frame-{index}",
+            "timestamp_ms": index * 1_000,
+            "image_path": context.state.frames[0]["image_path"],
+            "image_hash": f"hash-{index}",
+        }
+        for index in range(84)
+    ]
+
+    class BlankPaddle:
+        def recognize(self, _path: str, _image_hash: str = "") -> dict:
+            return {
+                "blocks": [{"text": "   ", "score": 0.0, "bbox": [0, 0, 1, 1]}],
+                "engine": "paddleocr",
+                "engine_version": "3.7.0",
+                "requested_device": "gpu:0",
+                "actual_device": "gpu:0",
+                "runtime_identity": {"actual_device": "gpu:0", "paddle_version": "3.3.0"},
+            }
+
+    OCRStage(BlankPaddle()).execute(context)
+
+    assert context.state.ocr_evidence == []
+    assert context.artifacts.ocr == []
+    assert len(context.state.frame_insights) == 84
+    assert all(
+        item["ocr_text"] == "" and item["ocr_evidence"] == {"blocks": []}
+        for item in context.state.frame_insights
+    )
+
+
+def test_blank_ocr_block_does_not_hide_a_non_string_schema_error(tmp_path):
+    context = _context(tmp_path)
+
+    class BadBlankPaddle:
+        def recognize(self, _path: str, _image_hash: str = "") -> dict:
+            return {
+                "blocks": [{"text": None, "score": 0.0, "bbox": [0, 0, 1, 1]}],
+                "engine": "paddleocr",
+                "engine_version": "3.7.0",
+            }
+
+    with pytest.raises(ValueError, match="OCR text must be a non-empty string"):
+        OCRStage(BadBlankPaddle()).execute(context)
+
+
 def test_http_vision_schema_is_strict_and_model_version_is_configurable(tmp_path, monkeypatch):
     image = tmp_path / "frame.jpg"
     image.write_bytes(b"image")

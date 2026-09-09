@@ -113,12 +113,22 @@ def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineCo
     for record in records:
         # FAILED records are a restart boundary, never reusable provenance.
         # Do not make their necessarily pre-execution identity block a retry.
-        if getattr(record, "status", "SUCCEEDED") != "SUCCEEDED" or str(
-            getattr(record, "stage", "")
-        ) not in _VISUAL_CHECKPOINT_STAGES:
+        stage = str(getattr(record, "stage", ""))
+        if getattr(record, "status", "SUCCEEDED") != "SUCCEEDED" or stage not in _VISUAL_CHECKPOINT_STAGES:
             continue
         actual_models = dict(getattr(record, "model_identity", None) or {})
         actual_prompts = dict(getattr(record, "prompt_identity", None) or {})
+        # The production ``semantic_context`` stage is text-first and occurs
+        # before frame extraction/OCR/Vision.  Its historical checkpoints may
+        # still contain configured visual model labels, but never an observed
+        # OCR runtime.  Do not make that durable text prefix unrecoverable
+        # after an OCR failure.  A post-visual semantic context necessarily
+        # seals an observed runtime, so it continues through the strict visual
+        # checks below.  A new graph that permits post-visual context without
+        # OCR must use a distinct stage version rather than weakening this
+        # boundary.
+        if stage == "semantic_context" and not actual_models.get("ocr_runtime_identity"):
+            continue
         for key in _VISUAL_MODEL_IDENTITY_KEYS:
             if actual_models.get(key) != expected_models.get(key):
                 raise CheckpointValidationError(
@@ -129,7 +139,7 @@ def _validate_visual_checkpoint_identity(records: list[Any], context: PipelineCo
         # under a different (or absent) observed runtime.  Earlier planning
         # stages intentionally have no OCR runtime yet.
         if (
-            str(getattr(record, "stage", "")) in _OCR_RUNTIME_BOUND_STAGES
+            stage in _OCR_RUNTIME_BOUND_STAGES
             and not _is_offline_fixture_options(context.options)
         ):
             for key in _OCR_RUNTIME_IDENTITY_KEYS:

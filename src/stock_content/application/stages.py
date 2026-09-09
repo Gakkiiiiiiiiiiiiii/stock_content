@@ -1145,7 +1145,20 @@ class OCRStage:
                 for raw_block in raw_blocks:
                     if not isinstance(raw_block, dict):
                         raise ValueError("OCR block must be an object")
-                    text = _require_model_text(raw_block.get("text"), "OCR text")
+                    # Paddle may return an otherwise well-formed detection
+                    # with an empty recognition string for a blank/transition
+                    # frame.  That is *absence of evidence*, not an OCR
+                    # artifact with fabricated text.  Keep the frame's
+                    # runtime provenance, but produce zero blocks.  Missing
+                    # or non-string text remains a malformed model response;
+                    # non-empty blocks still pass the full strict schema
+                    # checks below.
+                    raw_text = raw_block.get("text")
+                    if not isinstance(raw_text, str):
+                        raise ValueError("OCR text must be a non-empty string")
+                    text = raw_text.strip()
+                    if not text:
+                        continue
                     block = {
                         **metadata,
                         "source_type": "OCR",

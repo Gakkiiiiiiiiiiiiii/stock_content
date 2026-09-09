@@ -168,6 +168,54 @@ def test_failed_ocr_checkpoint_is_a_retry_boundary_not_runtime_provenance():
     _validate_visual_checkpoint_identity([failed], _ocr_context())
 
 
+def test_text_semantic_checkpoint_retries_before_ocr_without_visual_runtime_binding():
+    """A pre-visual text checkpoint remains a reusable prefix after OCR fails."""
+    from stock_content.application.service import _validate_visual_checkpoint_identity
+    from stock_content.domain.checkpoint import validate_resume
+
+    options = {
+        "pipeline_config": {
+            "ocr_engine": "paddleocr",
+            "ocr_engine_version": "3.7.0",
+            "ocr_device": "gpu:0",
+            "vision_model": "gpt-terra",
+            "vision_model_version": "2026-09-09",
+        }
+    }
+    first_attempt = PipelineContext(
+        task_id="semantic-before-ocr",
+        source={},
+        options=options,
+        current_stage="semantic_context",
+    )
+    semantic = build_checkpoint(stage="semantic_context", **_checkpoint_identity(first_attempt))
+    failed_ocr = build_checkpoint(stage="ocr", status="FAILED", error="blank-frame failure")
+
+    # The completed semantic checkpoint is purely text-derived: it does not
+    # seal either configured visual model labels or a not-yet-observed runtime.
+    assert "vision" not in (semantic.model_identity or {})
+    assert "ocr_runtime_identity" not in (semantic.model_identity or {})
+
+    retry = PipelineContext(task_id="semantic-before-ocr", source={}, options=options)
+    _validate_visual_checkpoint_identity([semantic, failed_ocr], retry)
+    assert validate_resume([semantic, failed_ocr], {}) == ["semantic_context"]
+
+
+def test_post_visual_semantic_checkpoint_still_requires_observed_ocr_runtime():
+    """The pre-visual exception cannot weaken a future post-visual graph."""
+    from stock_content.application.service import _validate_visual_checkpoint_identity
+
+    context = _ocr_context(identity=_IDENTITY)
+    context.current_stage = "semantic_context"
+    context.artifacts.ocr = [OCRArtifact(artifact_id="ocr", artifact_type="ocr", text="evidence")]
+    record = build_checkpoint(stage="semantic_context", **_checkpoint_identity(context))
+    assert "ocr_runtime_identity" in (record.model_identity or {})
+
+    retry = _ocr_context(identity={**_IDENTITY, "cuda_version": "changed"})
+    with pytest.raises(CheckpointValidationError, match="OCR runtime identity incompatible"):
+        _validate_visual_checkpoint_identity([record], retry)
+
+
 def test_gpu_heartbeat_is_the_only_readiness_proof(tmp_path):
     path = tmp_path / "ocr.json"
     path.write_text(
