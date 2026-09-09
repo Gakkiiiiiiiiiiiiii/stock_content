@@ -48,7 +48,7 @@ from stock_content.domain.claim_draft_grounder import ClaimDraftGrounder
 from stock_content.domain.claim_evidence_verifier import ClaimEvidenceVerifier
 from stock_content.domain.claim_occurrence import ClaimOccurrence
 from stock_content.domain.claim_state_event import ClaimStateEvent, event_logical_identity
-from stock_content.domain.claims import FinancialClaim, VerificationResult
+from stock_content.domain.claims import FinancialClaim, VerificationResult, normalized_ticker
 from stock_content.domain.cross_modal_evidence_verifier import CrossModalEvidenceVerifier
 from stock_content.domain.external_fact_verifier import ExternalFactVerifier
 from stock_content.domain.financial_event_extractor import FinancialEventExtractor
@@ -2903,12 +2903,13 @@ class KnowledgeExtractionStage:
             # already produced before persistence. Keep it immutable here so
             # repositories never repeat heuristic resolution on writes.
             entities = list(record.get("entities") or [])
-            if not entities and record.get("ticker"):
+            ticker = normalized_ticker(record.get("ticker"))
+            if not entities and ticker:
                 entities.append(
                     {
-                        "entity_name": record.get("subject_name") or record["ticker"],
-                        "entity_key": record["ticker"],
-                        "ticker": record["ticker"],
+                        "entity_name": record.get("subject_name") or ticker,
+                        "entity_key": ticker,
+                        "ticker": ticker,
                         "entity_type": "EQUITY",
                         "resolution_source": "knowledge_subject",
                     }
@@ -2928,7 +2929,7 @@ class KnowledgeExtractionStage:
                     subject=subject,
                     subject_key=record.get("subject_key"),
                     predicate_key=record.get("predicate_key"),
-                    ticker=record.get("ticker") or record.get("subject_key"),
+                    ticker=ticker,
                     sentiment=str(record.get("sentiment") or "NEUTRAL"),
                     support_status=str(record.get("support_status") or "UNSUPPORTED"),
                     truth_status=str(record.get("truth_status") or "NOT_CHECKED"),
@@ -3209,11 +3210,13 @@ class KnowledgeExtractionStage:
             }:
                 claim_type = "FINANCIAL_METRIC"
             claim_refs = evidence_refs_for(record)
+            ticker = normalized_ticker(record.get("ticker"))
             claims.append(
                 FinancialClaim(
                     claim_type=claim_type,
-                    subject_type="EQUITY" if record.get("ticker") else "CONTENT",
+                    subject_type="EQUITY" if ticker else "CONTENT",
                     subject_id=str(record.get("subject_key") or record.get("knowledge_uid")),
+                    ticker=ticker,
                     predicate=str(record.get("predicate_key") or "statement"),
                     value=(
                         record.get("value") if record.get("value") is not None else str(record.get("statement") or "")

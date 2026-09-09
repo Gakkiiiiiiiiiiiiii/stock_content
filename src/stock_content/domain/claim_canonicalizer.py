@@ -8,7 +8,7 @@ from typing import Any
 
 from .artifacts import canonical_json
 from .claim_draft import ClaimOccurrenceDraft
-from .claims import CLAIM_CATEGORY, FinancialClaim
+from .claims import CLAIM_CATEGORY, FinancialClaim, normalized_ticker
 from .knowledge_semantics import atomic_statement, bundle_v2_semantics
 
 
@@ -96,7 +96,7 @@ class ClaimCanonicalizer:
             fact_category=CLAIM_CATEGORY[draft.claim_type],
             subject_type=draft.subject_type or "UNKNOWN",
             subject_id=draft.subject_key,
-            ticker=draft.subject_key if draft.subject_key else None,
+            ticker=normalized_ticker(draft.subject_key),
             predicate=draft.predicate_key,
             value=draft.value,
             unit=draft.unit,

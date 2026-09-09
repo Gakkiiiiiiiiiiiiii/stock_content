@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -68,6 +69,14 @@ VERIFICATION_STATUSES = (
     "MANUAL_REVIEW",
 )
 SUPPORTED_CLAIM_TYPES: frozenset[str] = frozenset((*CLAIM_TYPES, "INFERENCE"))
+
+_TICKER_PATTERN = re.compile(r"(?:\d{6}(?:\.(?:SH|SZ|BJ))?|\d{4}\.HK|[A-Z][A-Z0-9]{0,9})")
+
+
+def normalized_ticker(value: object) -> str | None:
+    """Return a market-style identifier, never a display subject as a ticker."""
+    candidate = str(value or "").strip().upper()
+    return candidate if _TICKER_PATTERN.fullmatch(candidate) else None
 
 
 class FinancialClaim(BaseModel):
@@ -297,4 +306,5 @@ __all__ = [
     "VerificationArtifactEntry",
     "claim_id_of",
     "is_quant_verifiable",
+    "normalized_ticker",
 ]

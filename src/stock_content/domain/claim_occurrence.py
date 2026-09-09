@@ -8,6 +8,10 @@ from pydantic import BaseModel, Field, model_validator
 from .artifacts import ClaimOccurrenceArtifact, canonical_json
 from .temporal_semantics import AvailabilityQuality, OccurrenceTimes
 
+_OCCURRENCE_ID_PREFIX = "co_"
+_OCCURRENCE_ID_DIGEST_LENGTH = 61
+_OCCURRENCE_ID_MAX_LENGTH = len(_OCCURRENCE_ID_PREFIX) + _OCCURRENCE_ID_DIGEST_LENGTH
+
 
 def assertion_locator_hash_of(
     source_artifact_id: str,
@@ -79,7 +83,7 @@ class ClaimOccurrence(BaseModel):
             object.__setattr__(
                 self,
                 "occurrence_id",
-                "co_"
+                _OCCURRENCE_ID_PREFIX
                 + hashlib.sha256(
                     canonical_json(
                         {
@@ -88,7 +92,7 @@ class ClaimOccurrence(BaseModel):
                             "assertion_locator_hash": locator,
                         }
                     ).encode()
-                ).hexdigest(),
+                ).hexdigest()[:_OCCURRENCE_ID_DIGEST_LENGTH],
             )
         return self
 
@@ -99,7 +103,28 @@ def occurrence_id_of(claim_id: str, source_artifact_id: str, assertion_locator_h
         "source_artifact_id": source_artifact_id,
         "assertion_locator_hash": assertion_locator_hash,
     }
-    return "co_" + hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+    return _OCCURRENCE_ID_PREFIX + hashlib.sha256(
+        canonical_json(payload).encode()
+    ).hexdigest()[:_OCCURRENCE_ID_DIGEST_LENGTH]
+
+
+def knowledge_uid_for_occurrence(occurrence_id: str) -> str:
+    """Return the <=64-character knowledge key for current and legacy occurrences.
+
+    Earlier occurrences used the full 64-character digest after ``co_``.
+    The durable occurrence row keeps that historical identifier, while its
+    knowledge projection compacts the digest exactly as current generation
+    does.  This makes old snapshot replay and new ingestion converge without
+    widening the knowledge-unit primary key.
+    """
+    value = str(occurrence_id or "")
+    if value.startswith(_OCCURRENCE_ID_PREFIX):
+        digest = value[len(_OCCURRENCE_ID_PREFIX):]
+        if len(digest) >= _OCCURRENCE_ID_DIGEST_LENGTH and all(char in "0123456789abcdefABCDEF" for char in digest):
+            return _OCCURRENCE_ID_PREFIX + digest[:_OCCURRENCE_ID_DIGEST_LENGTH].lower()
+    if len(value) <= _OCCURRENCE_ID_MAX_LENGTH:
+        return value
+    return _OCCURRENCE_ID_PREFIX + hashlib.sha256(value.encode("utf-8")).hexdigest()[:_OCCURRENCE_ID_DIGEST_LENGTH]
 
 
 __all__ = [
@@ -108,5 +133,6 @@ __all__ = [
     "OccurrenceTimes",
     "AvailabilityQuality",
     "assertion_locator_hash_of",
+    "knowledge_uid_for_occurrence",
     "occurrence_id_of",
 ]

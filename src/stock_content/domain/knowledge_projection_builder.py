@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .claim_occurrence import ClaimOccurrence
-from .claims import FinancialClaim
+from .claim_occurrence import ClaimOccurrence, knowledge_uid_for_occurrence
+from .claims import FinancialClaim, normalized_ticker
 
 
 class KnowledgeProjectionBuilder:
@@ -18,7 +18,11 @@ class KnowledgeProjectionBuilder:
         # A canonical claim may have multiple source occurrences.  The
         # occurrence-scoped uid keeps those projections independently
         # addressable while preserving claim_id as the stable semantic key.
-        knowledge_uid = occurrence.occurrence_id if occurrence is not None else claim.claim_id
+        knowledge_uid = (
+            knowledge_uid_for_occurrence(occurrence.occurrence_id)
+            if occurrence is not None
+            else claim.claim_id
+        )
         grounded = claim.grounding_status == "GROUNDED"
         if grounded and (occurrence is None or not occurrence.evidence_refs):
             raise ValueError("grounded claim cannot project knowledge without primary evidence")
@@ -30,7 +34,7 @@ class KnowledgeProjectionBuilder:
             "subject": claim.subject_id,
             "subject_key": claim.subject_id,
             "predicate_key": claim.predicate,
-            "ticker": claim.ticker,
+            "ticker": normalized_ticker(claim.ticker),
             "support_status": claim.source_support_status,
             "attributes": {
                 "claim_id": claim.claim_id,
