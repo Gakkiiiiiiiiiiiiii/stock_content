@@ -41,7 +41,7 @@ from stock_content.domain.claim_occurrence import ClaimOccurrence
 from stock_content.domain.claims import FinancialClaim
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
 from stock_content.domain.lifecycle_event import KnowledgeLifecycleEvent, LifecycleTargetType
-from stock_content.domain.models import VideoAsset
+from stock_content.domain.models import VideoAsset, VideoChapter
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
 from stock_content.domain.temporal_semantics import OccurrenceTimes
 
@@ -108,6 +108,33 @@ def test_semantic_segmenter_prompt_requires_unit_interval_confidence_and_rejects
     unrepaired = _Gateway([{"content": invalid_percentage}, {"content": invalid_percentage}])
     with pytest.raises(ValueError, match="after one repair"):
         SemanticSegmenter(unrepaired).segment(_transcript())
+
+
+@pytest.mark.parametrize(("count", "boundary"), [(6, 2), (9, 5)])
+def test_live_semantic_boundaries_replace_fixed_duration_chapters(count, boundary):
+    gateway = _Gateway([{
+        "content": (
+            '{"boundaries":[{"after_segment_index":' + str(boundary)
+            + ',"boundary_type":"TOPIC_CHANGE","next_topic":"设备订单",'
+            '"next_subject":"设备","confidence":0.9}]}'
+        ),
+    }])
+    context = PipelineContext(task_id="semantic-chapters", source={"type": "fixture", "ref": "one"}, options={})
+    context.artifacts.transcript = _transcript(count)
+    context.state["chapters"] = [
+        VideoChapter("fixed-time", 0, "旧时间切片", "旧摘要", 0.0, float(count))
+    ]
+
+    SemanticSegmentationStage(segmenter=SemanticSegmenter(gateway)).execute(context)
+
+    chapters = context.state["chapters"]
+    semantics = context.state["semantic_segments"]
+    assert len(chapters) == len(semantics) == 2
+    assert [chapter.chapter_id for chapter in chapters] == [segment.semantic_segment_id for segment in semantics]
+    assert chapters[0].end_seconds == float(boundary + 1)
+    assert chapters[1].start_seconds == float(boundary + 1)
+    assert chapters[1].title == "设备订单"
+    assert all(chapter.chapter_id != "fixed-time" for chapter in chapters)
 
 
 def test_build_video_preserves_authoritative_resolved_metadata_and_times():
@@ -201,6 +228,24 @@ def test_atomic_extractor_accepts_zero_claims_and_prompt_is_atomic():
     assert drafts == []
     assert "atomic" in gateway.calls[0]["prompt"].lower()
     assert "another temporal model" in gateway.calls[0]["prompt"]
+
+
+def test_atomic_extractor_rejects_unverified_runtime_model():
+    context = {"semantic_segment_id": "seg", "transcript_text": "nothing"}
+    extractor = AtomicClaimExtractor(
+        _Gateway([{"content": '{"claims": []}', "model": "other-model"}]),
+        model_id="gpt-6-sol",
+        require_model_identity=True,
+    )
+    with pytest.raises(RuntimeError, match="runtime model identity mismatch"):
+        extractor.extract(context)
+
+    extractor = AtomicClaimExtractor(
+        _Gateway([{"content": '{"claims": []}', "model": "gpt-6-sol"}]),
+        model_id="gpt-6-sol",
+        require_model_identity=True,
+    )
+    assert extractor.extract(context) == []
 
 
 def test_packet2a_stages_form_empty_artifact_chain(tmp_path):

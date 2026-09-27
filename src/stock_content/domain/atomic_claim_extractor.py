@@ -22,11 +22,13 @@ class AtomicClaimExtractor:
         model_id: str = "",
         prompt_version: str = "atomic-claims.v1",
         allow_offline_fixture: bool = True,
+        require_model_identity: bool = False,
     ):
         self.model_gateway = model_gateway
         self.model_id = model_id
         self.prompt_version = prompt_version
         self.allow_offline_fixture = allow_offline_fixture
+        self.require_model_identity = require_model_identity
         self.last_metrics: dict[str, float] = {}
 
     def extract(
@@ -177,7 +179,9 @@ class AtomicClaimExtractor:
             raise ValueError("claim draft belongs to another semantic segment")
         return draft.model_copy(update={
             "semantic_segment_id": semantic_segment_id,
-            "extraction_model_id": draft.extraction_model_id or self.model_id,
+            "extraction_model_id": (
+                self.model_id if self.require_model_identity else draft.extraction_model_id or self.model_id
+            ),
             "extraction_prompt_version": draft.extraction_prompt_version or self.prompt_version,
             # This extractor is an untrusted boundary.  Only
             # AtomicClaimValidationStage may replace these fail-closed values.
@@ -190,14 +194,14 @@ class AtomicClaimExtractor:
 
     def _complete(self, prompt: str) -> Any:
         try:
-            return self.model_gateway.complete(
+            response = self.model_gateway.complete(
                 prompt=prompt,
                 system="You are an atomic financial claim extractor. Return JSON only.",
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
         except TypeError:
-            return self.model_gateway.complete(
+            response = self.model_gateway.complete(
                 messages=[
                     {"role": "system", "content": "You are an atomic financial claim extractor. Return JSON only."},
                     {"role": "user", "content": prompt},
@@ -205,6 +209,11 @@ class AtomicClaimExtractor:
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
+        if self.require_model_identity and (
+            not isinstance(response, dict) or response.get("model") != self.model_id
+        ):
+            raise RuntimeError("atomic extraction runtime model identity mismatch")
+        return response
 
     def _prompt(self, context: SemanticContext | dict[str, Any], metadata: dict[str, Any]) -> str:
         payload = context.__dict__ if isinstance(context, SemanticContext) else context
@@ -219,7 +228,17 @@ class AtomicClaimExtractor:
             "true. Use visual_anchors only for an OCR/vision item supplied in the context, with its exact frame_id, "
             "timestamp, bbox, model identity and confidence; visual evidence never substitutes transcript evidence. "
             "Empty claims are valid. Return exactly "
-            '{"claims":[...]} and no prose.\n'
+            '{"claims":[{"semantic_segment_id":"<exact context id>","knowledge_kind":"CLAIM",'
+            '"claim_type":"OPINION|FORECAST|FINANCIAL_METRIC|PRICE|VALUATION|CORPORATE_EVENT|INDUSTRY_RELATION|INFERENCE",'
+            '"subject_type":"EQUITY|INDUSTRY|CONTENT|OTHER","subject_key":"<spoken six-digit code or empty>",'
+            '"subject_name":"<spoken name or null>","predicate_key":"<short predicate>",'
+            '"verbatim_quote":"<exact transcript excerpt>","normalized_statement":"<objective proposition>",'
+            '"conclusion":"<objective proposition>","sentiment":"BULLISH|BEARISH|NEUTRAL|UNCERTAIN",'
+            '"evidence_segment_indices":[0],"extraction_confidence":0.0,"bundle_v2":{}}]} '
+            "and no prose. Replace placeholders with actual supported values; do not output pipe-separated choices. "
+            "Every claim must include all required fields above. A six-digit stock code and company name must be "
+            "copied from speech or validated visual evidence, never guessed. Do not use 'statement' in place of "
+            "normalized_statement or conclusion. Use an empty claims array when there is no supported claim.\n"
             + json.dumps(
                 {"metadata": metadata, "context": payload},
                 ensure_ascii=False,

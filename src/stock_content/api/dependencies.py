@@ -13,6 +13,7 @@ from stock_content.adapters.media import (
     PaddleOcrEngine,
     PyannoteDiarizer,
 )
+from stock_content.adapters.media.vision import CodexCliVisionAnalyzer
 from stock_content.adapters.postgres import Database
 from stock_content.adapters.postgres.repositories import (
     ClaimOccurrenceRepository,
@@ -179,22 +180,35 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def pipeline_config_from_env() -> dict[str, object]:
     """Read the semantic pipeline's complete, reproducible configuration."""
+    codex_backend = os.getenv("CONTENT_MODEL_BACKEND", "http").strip().lower() == "codex_cli"
+    default_model = "gpt-6-sol" if codex_backend else ""
+    if codex_backend:
+        for name in (
+            "CONTENT_MODEL_NAME", "CONTENT_SEGMENTATION_MODEL", "CONTENT_EXTRACTION_MODEL", "CONTENT_VISION_MODEL"
+        ):
+            value = os.getenv(name, "").strip()
+            if value and value != default_model:
+                raise ValueError(f"{name} must be gpt-6-sol for the Codex CLI backend")
     config = {
         "semantic_segmentation_enabled": _env_bool("CONTENT_SEMANTIC_SEGMENTATION_ENABLED", True),
-        "segmentation_model": os.getenv("CONTENT_SEGMENTATION_MODEL", ""),
-        "segmentation_prompt_version": os.getenv(
-            "CONTENT_SEGMENTATION_PROMPT_VERSION", "semantic-segmentation.prompt.v1"
+        "segmentation_model": (
+            os.getenv("CONTENT_SEGMENTATION_MODEL") or os.getenv("CONTENT_MODEL_NAME") or default_model
         ),
-        "extraction_model": os.getenv("CONTENT_EXTRACTION_MODEL", ""),
+        "segmentation_prompt_version": os.getenv(
+            "CONTENT_SEGMENTATION_PROMPT_VERSION",
+            "semantic-segmentation.prompt.v4.codex-cli" if codex_backend else "semantic-segmentation.prompt.v1",
+        ),
+        "extraction_model": os.getenv("CONTENT_EXTRACTION_MODEL") or os.getenv("CONTENT_MODEL_NAME") or default_model,
         "extraction_prompt_version": os.getenv(
-            "CONTENT_EXTRACTION_PROMPT_VERSION", "atomic-claim-extraction.prompt.v1"
+            "CONTENT_EXTRACTION_PROMPT_VERSION",
+            "atomic-claim-extraction.prompt.v2.codex-cli" if codex_backend else "atomic-claim-extraction.prompt.v1",
         ),
         "temporal_normalization_version": os.getenv(
             "CONTENT_TEMPORAL_NORMALIZATION_VERSION", "temporal-normalization.final.v1"
         ),
         "semantic_global_max_safe_tokens": int(os.getenv("CONTENT_SEMANTIC_GLOBAL_MAX_SAFE_TOKENS", "3200")),
         "semantic_long_video_block_tokens": int(os.getenv("CONTENT_SEMANTIC_LONG_VIDEO_BLOCK_TOKENS", "3200")),
-        "semantic_block_overlap_segments": int(os.getenv("CONTENT_SEMANTIC_BLOCK_OVERLAP_SEGMENTS", "2")),
+        "semantic_block_overlap_segments": int(os.getenv("CONTENT_SEMANTIC_BLOCK_OVERLAP_SEGMENTS", "12")),
         "legacy_chapter_extraction_enabled": _env_bool("CONTENT_LEGACY_CHAPTER_EXTRACTION_ENABLED", False),
         "public_pit_default_mode": os.getenv("CONTENT_PUBLIC_PIT_DEFAULT_MODE", "PUBLIC_STRICT"),
         # Compatibility aliases retained for callers using the first draft.
@@ -217,11 +231,22 @@ def pipeline_config_from_env() -> dict[str, object]:
         "ocr_engine_version": os.getenv("CONTENT_OCR_ENGINE_VERSION", "3"),
         "ocr_device": os.getenv("CONTENT_OCR_DEVICE", "gpu:0"),
         "ocr_require_gpu": _env_bool("CONTENT_OCR_REQUIRE_GPU", True),
-        "vision_model": os.getenv("CONTENT_VISION_MODEL", ""),
-        "vision_model_version": os.getenv("CONTENT_VISION_MODEL_VERSION", ""),
-        "vision_prompt_version": os.getenv("CONTENT_VISION_PROMPT_VERSION", "vision-context.prompt.v1"),
-        "vision_adapter_version": os.getenv("CONTENT_VISION_ADAPTER_VERSION", "http-vision-adapter.v1"),
+        "vision_model": os.getenv("CONTENT_VISION_MODEL") or default_model,
+        "vision_model_version": os.getenv("CONTENT_VISION_MODEL_VERSION") or (
+            "unreported-by-codex-cli" if codex_backend else ""
+        ),
+        "vision_prompt_version": os.getenv(
+            "CONTENT_VISION_PROMPT_VERSION",
+            "vision-context.prompt.v2.codex-cli" if codex_backend else "vision-context.prompt.v1",
+        ),
+        "vision_adapter_version": os.getenv(
+            "CONTENT_VISION_ADAPTER_VERSION",
+            "codex-cli-vision-adapter.v1" if codex_backend else "http-vision-adapter.v1",
+        ),
     }
+    if codex_backend:
+        config["model_backend"] = "codex_cli"
+        config["model_identity_source"] = "accepted_codex_cli_invocation_not_response_metadata"
     # Keep the disabled/offline configuration byte-for-byte compatible with
     # historical snapshot identities.  Reference settings enter the config
     # hash only when the feature is explicitly configured.
@@ -259,6 +284,7 @@ def build_application(
     # ``unknown`` fallback through the domain policy.
     default_code_sha()
     config = pipeline_config_from_env()
+    codex_backend = os.getenv("CONTENT_MODEL_BACKEND", "http").strip().lower() == "codex_cli"
     # Explicit aliases keep test/application factories compatible with both
     # the short port names and the fully-qualified configuration vocabulary.
     reference_provider = reference_provider or temporal_reference_provider
@@ -463,12 +489,17 @@ def build_application(
         block_tokens=int(config["semantic_long_video_block_tokens"]),
         segment_overlap=int(config["semantic_block_overlap_segments"]),
         allow_offline_fixture=False,
+        require_model_identity=True,
+        require_initial_topic=True,
+        refine_segments=True,
+        verify_brief_topic_labels=True,
     )
     atomic_extractor = AtomicClaimExtractor(
         extraction_client,
         model_id=str(config["extraction_model"]),
         prompt_version=str(config["extraction_prompt_version"]),
         allow_offline_fixture=False,
+        require_model_identity=True,
     )
     semantic_enabled = bool(config["semantic_segmentation_enabled"])
     legacy_enabled = bool(config["legacy_chapter_extraction_enabled"]) or not semantic_enabled
@@ -535,7 +566,7 @@ def build_application(
         # ffmpeg and may not register caller-supplied frames for live media.
         FixtureFrameRegistrationStage(),
         OCRStage(PaddleOcrEngine(device=str(config["ocr_device"]), require_gpu=bool(config["ocr_require_gpu"]))),
-        VisionStage(HttpVisionAnalyzer()),
+        VisionStage(CodexCliVisionAnalyzer() if codex_backend else HttpVisionAnalyzer()),
         TranscriptVisualCrosscheckStage(
             TranscriptVisualCrossChecker(version=str(config["transcript_visual_crosscheck_version"]))
         ),

@@ -72,7 +72,7 @@ from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
 from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
 from stock_content.domain.lifecycle_event import KnowledgeLifecycleEvent
 from stock_content.domain.lineage import default_code_sha
-from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoAsset
+from stock_content.domain.models import KnowledgeUnit, TranscriptSegment, VideoAsset, VideoChapter
 from stock_content.domain.semantic_context_builder import SemanticContextBuilder
 from stock_content.domain.semantic_entailment_judge import SemanticEntailmentJudge
 from stock_content.domain.semantic_segmenter import SemanticSegmenter
@@ -1293,6 +1293,10 @@ def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], resu
         "model_version": model_version,
         "source_type": "VISION",
     }
+    if result.get("model_identity_source"):
+        normalized["model_identity_source"] = _require_model_text(
+            result["model_identity_source"], "vision model_identity_source"
+        )
     # The only test-only adapter supplies these fields.  Keep its non-secret
     # provenance inside the normal vision artifact so C4/C5 replay/audit sees
     # the precise fixture identity without exposing it in Bundle v1.
@@ -1650,14 +1654,15 @@ class SemanticSegmentationStage:
         transcript = context.artifacts.transcript
         if transcript is None:
             raise ValueError("semantic segmentation requires transcript artifact")
+        offline_fixture = bool(
+            context.options.get("offline_fixture")
+            or "transcript" in context.options
+            or "segments" in context.options
+        )
         try:
             result = self._segmenter.segment(
                 transcript,
-                offline_fixture=bool(
-                    context.options.get("offline_fixture")
-                    or "transcript" in context.options
-                    or "segments" in context.options
-                ),
+                offline_fixture=offline_fixture,
                 identity_seed=str(context.options.get("replay_derived_identity_seed") or ""),
             )
         except Exception:
@@ -1665,6 +1670,33 @@ class SemanticSegmentationStage:
             context.runtime.metrics["segmentation_failure_rate"] = 1.0
             raise
         context.state["semantic_segments"] = list(result.segments)
+        model_gateway = self._segmenter.model_gateway
+        model_available = model_gateway is not None and bool(
+            getattr(model_gateway, "available", lambda: True)()
+        )
+        if not offline_fixture and model_available:
+            # The public chapter read model must follow the same semantic
+            # boundaries as downstream knowledge.  Keep the fixed-duration
+            # ChapterStage output only for explicit offline fixtures and
+            # legacy configurations.
+            context.state["chapters"] = [
+                VideoChapter(
+                    chapter_id=segment.semantic_segment_id,
+                    chapter_index=segment.segment_index,
+                    title=(segment.topic or segment.subject or ChapterSegmenter._title(
+                        " ".join(item.text for item in transcript.segments[
+                            segment.start_segment_index:segment.end_segment_index + 1
+                        ]), segment.segment_index
+                    ))[:80],
+                    summary=" ".join(item.text for item in transcript.segments[
+                        segment.start_segment_index:segment.end_segment_index + 1
+                    ])[:240],
+                    start_seconds=segment.start_ms / 1000,
+                    end_seconds=segment.end_ms / 1000,
+                    chapter_type=segment.segment_type,
+                )
+                for segment in result.segments
+            ]
         context.runtime.metrics.update(result.metrics)
         durations = sorted(max(0, item.end_ms - item.start_ms) for item in result.segments)
         count = len(durations)

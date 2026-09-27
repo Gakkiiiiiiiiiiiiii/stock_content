@@ -83,6 +83,8 @@ def materialize_semantic_segments(
     transcript: TranscriptArtifact,
     boundaries: Iterable[SemanticBoundary | dict[str, Any]],
     *,
+    initial_topic: str | None = None,
+    initial_subject: str | None = None,
     model_id: str = "",
     prompt_version: str = "",
     schema_version: str = SEMANTIC_SEGMENT_SCHEMA_VERSION,
@@ -119,8 +121,8 @@ def materialize_semantic_segments(
                 model_id=model_id,
                 prompt_version=prompt_version,
                 # Boundary metadata describes the segment after the boundary.
-                topic=(boundary_items[index - 1].next_topic if index > 0 else None),
-                subject=(boundary_items[index - 1].next_subject if index > 0 else None),
+                topic=(boundary_items[index - 1].next_topic if index > 0 else initial_topic),
+                subject=(boundary_items[index - 1].next_subject if index > 0 else initial_subject),
                 confidence=(boundary_items[index - 1].confidence if index > 0 else None),
                 derivation_namespace=identity_seed,
             )
@@ -132,6 +134,8 @@ def build_semantic_segment_artifact(
     transcript: TranscriptArtifact,
     boundaries: Iterable[SemanticBoundary | dict[str, Any]],
     *,
+    initial_topic: str | None = None,
+    initial_subject: str | None = None,
     artifact_id: str = "semantic-segments-pending",
     model_id: str = "",
     prompt_version: str = "",
@@ -141,6 +145,8 @@ def build_semantic_segment_artifact(
     segments = materialize_semantic_segments(
         transcript,
         boundaries,
+        initial_topic=initial_topic,
+        initial_subject=initial_subject,
         model_id=model_id,
         prompt_version=prompt_version,
         schema_version=schema_version,

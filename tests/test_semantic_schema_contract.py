@@ -16,6 +16,7 @@ from stock_content.domain.artifacts import (
     TranscriptArtifact,
     TranscriptSegmentItem,
     artifact_id_of,
+    artifact_identity_payload,
     canonical_json,
     content_hash_of,
     deserialize_artifact,
@@ -197,7 +198,7 @@ def test_nonempty_semantic_namespace_participates_in_artifact_identity():
     )
 
     assert "derivation_namespace" not in serialize_artifact(legacy)["segments"][0]
-    assert serialize_artifact(reprocess) == serialize_artifact(legacy)
+    assert artifact_identity_payload(reprocess) == artifact_identity_payload(legacy)
     assert reprocess.content_hash == legacy.content_hash
     assert serialize_artifact(migration)["segments"][0]["derivation_namespace"] == "migration-namespace"
     assert artifact_id_of(legacy) != artifact_id_of(migration)

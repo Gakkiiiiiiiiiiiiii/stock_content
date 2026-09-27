@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from stock_content.adapters.codex_cli import CodexCliRunner
+
 
 def _finite_confidence(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
@@ -101,4 +103,33 @@ class HttpVisionAnalyzer:
             "narration_aligned": narration_aligned,
             "model": self._model,
             "model_version": self._model_version,
+        }
+
+
+class CodexCliVisionAnalyzer(HttpVisionAnalyzer):
+    """Account-backed GPT-6 Sol frame review without a vision HTTP endpoint."""
+
+    def __init__(self, runner: CodexCliRunner | None = None) -> None:
+        super().__init__(model="gpt-6-sol", model_version="unreported-by-codex-cli")
+        self._runner = runner or CodexCliRunner()
+
+    def analyze(self, frame_path: str, transcript_context: str) -> dict:
+        response = self._runner.run(
+            system=(
+                "You are a financial-video frame observer. Return JSON only. "
+                "The transcript is context, not visual proof."
+            ),
+            prompt=(
+                "Inspect the attached frame. Return exactly a JSON object with "
+                "visual_summary (non-empty string), labels (non-empty string array), "
+                "themes (string array), symbols (string array), confidence_score (number from 0 to 1), "
+                "and narration_aligned (boolean). Do not invent ticker symbols, chart values, or facts. "
+                "Narration context: " + transcript_context[:3000]
+            ),
+            image_path=frame_path,
+        )
+        result = json.loads(response["content"])
+        return {
+            **self._validate(result),
+            "model_identity_source": response["model_identity_source"],
         }
