@@ -26,6 +26,7 @@ from stock_content.api.ingestions import create_ingestions_router
 from stock_content.api.knowledge_bundles import create_knowledge_bundles_router
 from stock_content.api.readiness import create_readiness_router, dependencies_from_application
 from stock_content.api.security import ServiceAuthError, ServiceAuthorizer
+from stock_content.application.frame_assets import FrameAssetError, read_frame_asset
 from stock_content.application.service import ContentApplication
 from stock_content.application.task_lease_service import TaskLeaseService
 from stock_content.domain.bitemporal_query import PUBLIC_STRICT
@@ -47,6 +48,8 @@ def _private_route(method: str, path: str) -> bool:
     if path in {"/api/v1/videos/bilibili/ingest", "/api/v1/videos/xiaoe/ingest"}:
         return True
     if path.startswith("/api/v1/content-snapshots/") and path.endswith("/replay"):
+        return True
+    if path.startswith("/api/v1/content-snapshots/") and "/frames/" in path:
         return True
     return path.startswith("/api/v1/tasks/")
 
@@ -221,11 +224,16 @@ def create_app(
                 )
             except ServiceAuthError as exc:
                 headers = {"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else {}
+                if "/frames/" in request.url.path:
+                    headers.update({"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
                 return JSONResponse(
                     envelope(exc.code, exc.message, exc.status_code >= 500, trace_id), exc.status_code, headers
                 )
             request.state.caller_service = caller
         response: Response = await call_next(request)
+        if "/frames/" in request.url.path and request.url.path.startswith("/api/v1/content-snapshots/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["x-trace-id"] = trace_id
         if decision_id:
             response.headers["x-decision-id"] = decision_id
@@ -400,6 +408,33 @@ def create_app(
         if payload is None:
             raise HTTPException(status_code=404, detail="content snapshot not found")
         return {"contract_version": "content.v1", "data": payload}
+
+    def _frame_asset(content_snapshot_id: str, frame_id: str) -> tuple[dict, bytes, str]:
+        try:
+            return read_frame_asset(application_for_request(), content_snapshot_id, frame_id)
+        except FrameAssetError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code},
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            ) from exc
+
+    @app.get("/api/v1/content-snapshots/{content_snapshot_id}/frames/{frame_id}")
+    def get_snapshot_frame(content_snapshot_id: str, frame_id: str) -> Response:
+        metadata, _data, _media_type = _frame_asset(content_snapshot_id, frame_id)
+        return JSONResponse(
+            {"contract_version": "content.frame-asset.v1", "data": metadata},
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
+
+    @app.get("/api/v1/content-snapshots/{content_snapshot_id}/frames/{frame_id}/image")
+    def get_snapshot_frame_image(content_snapshot_id: str, frame_id: str) -> Response:
+        _metadata, data, media_type = _frame_asset(content_snapshot_id, frame_id)
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
 
     @app.post("/api/v1/content-snapshots/{content_snapshot_id}/replay")
     def replay_content_snapshot(content_snapshot_id: str, request: ReplayRequest | None = None) -> dict:

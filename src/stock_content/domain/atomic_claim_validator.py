@@ -19,6 +19,8 @@ from pydantic import ValidationError
 
 from .artifacts import TranscriptArtifact, canonical_json
 from .claim_draft import AtomicClaimDraft
+from .knowledge_hierarchy import permitted_thesis_evidence_indices
+from .knowledge_semantics import atomic_statement
 from .semantic_segment import SemanticSegment
 from .transcript_quality import TranscriptQualityStatus
 
@@ -243,6 +245,7 @@ class AtomicClaimDraftValidator:
         for item in raw:
             try:
                 draft = AtomicClaimDraft.model_validate(item)
+                draft = draft.model_copy(update={"normalized_statement": atomic_statement(draft.normalized_statement)})
             except (ValidationError, TypeError, ValueError):
                 rejected.append(ClaimRejection(ClaimRejectionCode.SCHEMA_INVALID))
                 continue
@@ -279,7 +282,10 @@ class AtomicClaimDraftValidator:
         if segment is None:
             return ClaimRejectionCode.SEMANTIC_SEGMENT_MISMATCH
         by_index = {item.segment_index: item for item in transcript.segments}
-        valid = set(range(segment.start_segment_index, segment.end_segment_index + 1))
+        try:
+            valid = permitted_thesis_evidence_indices(draft, segment, by_index)
+        except ValueError:
+            return ClaimRejectionCode.EVIDENCE_COORDINATE_INVALID
         all_indices = (
             draft.evidence_segment_indices
             + draft.condition_evidence_segment_indices
@@ -292,6 +298,15 @@ class AtomicClaimDraftValidator:
         primary = " ".join(text_for_indices[index] for index in draft.evidence_segment_indices)
         if not _contains(draft.verbatim_quote, primary):
             return ClaimRejectionCode.QUOTE_NOT_VERBATIM
+        # A THESIS deliberately cites the complete proposal→argument→closure
+        # arc.  Forecast language elsewhere in that arc must not change the
+        # tense/polarity/entity validation of its exact atomic proposition.
+        # Ordinary atomic claims retain their existing full-primary behavior.
+        alignment_text = (
+            draft.verbatim_quote
+            if (draft.bundle_v2 or {}).get("knowledge_role") == "THESIS"
+            else primary
+        )
         if not self._atomic(draft.normalized_statement):
             return ClaimRejectionCode.NOT_ATOMIC
         if any(token in draft.verbatim_quote for token in ("如果", "若", "条件")) and not draft.condition_text:
@@ -314,26 +329,29 @@ class AtomicClaimDraftValidator:
             )
         ):
             return ClaimRejectionCode.INVALIDATION_NOT_GROUNDED
-        if not self.numeric.aligned(draft.normalized_statement, primary):
+        if not self.numeric.aligned(draft.normalized_statement, alignment_text):
             return ClaimRejectionCode.HARD_FACT_MISMATCH
-        if not _contains(draft.predicate, primary):
+        if not _contains(draft.predicate, alignment_text):
             return ClaimRejectionCode.PREDICATE_MISMATCH
-        if draft.object and draft.object.text and not _contains(draft.object.text, primary):
+        if draft.object and draft.object.text and not _contains(draft.object.text, alignment_text):
             return ClaimRejectionCode.HARD_FACT_MISMATCH
-        if draft.object and draft.object.value is not None and not _contains(str(draft.object.value), primary):
+        if draft.object and draft.object.value is not None and not _contains(str(draft.object.value), alignment_text):
             return ClaimRejectionCode.HARD_FACT_MISMATCH
-        if not self.entities.subject_aligned(draft, primary):
+        if not self.entities.subject_aligned(draft, alignment_text):
             return ClaimRejectionCode.SUBJECT_MISMATCH
         if (
-            _polarity(draft.normalized_statement) != _polarity(primary)
+            _polarity(draft.normalized_statement) != _polarity(alignment_text)
             and _polarity(draft.normalized_statement) != "NEUTRAL"
         ):
             return ClaimRejectionCode.POLARITY_MISMATCH
-        if _tense(draft.normalized_statement) != _tense(primary) and _tense(draft.normalized_statement) != "UNKNOWN":
+        if (
+            _tense(draft.normalized_statement) != _tense(alignment_text)
+            and _tense(draft.normalized_statement) != "UNKNOWN"
+        ):
             return ClaimRejectionCode.TENSE_MISMATCH
-        if draft.assertion_tense != "UNKNOWN" and draft.assertion_tense != _tense(primary):
+        if draft.assertion_tense != "UNKNOWN" and draft.assertion_tense != _tense(alignment_text):
             return ClaimRejectionCode.TENSE_MISMATCH
-        if not self.entities.statement_entities_aligned(draft.normalized_statement, primary):
+        if not self.entities.statement_entities_aligned(draft.normalized_statement, alignment_text):
             return ClaimRejectionCode.ENTITY_MISMATCH
         if not self.temporal.validate(draft, text_for_indices, valid):
             return ClaimRejectionCode.TEMPORAL_NOT_GROUNDED

@@ -180,7 +180,9 @@ def test_http_vision_schema_is_strict_and_model_version_is_configurable(tmp_path
                         "message": {
                             "content": (
                                 '{"visual_summary":"chart","labels":["price_chart"],'
-                                '"themes":[],"symbols":["600519"],"confidence_score":0.9,'
+                                '"themes":[],"symbols":["600519"],'
+                                '"observed_entities":["贵州茅台"],"observed_tickers":["600519"],'
+                                '"confidence_score":0.9,'
                                 '"narration_aligned":true}'
                             )
                         }
@@ -192,11 +194,17 @@ def test_http_vision_schema_is_strict_and_model_version_is_configurable(tmp_path
     analyzer = HttpVisionAnalyzer("https://vision.invalid/v1", "gpt-test", model_version="revision-7")
     result = analyzer.analyze(str(image), "口播")
     assert result["model"] == "gpt-test" and result["model_version"] == "revision-7"
+    assert result["observed_entities"] == ["贵州茅台"]
+    assert result["observed_tickers"] == ["600519"]
 
     with pytest.raises(RuntimeError, match="CONTENT_VISION_URL"):
         HttpVisionAnalyzer(model="gpt-test").analyze(str(image), "口播")
     with pytest.raises(ValueError, match="labels"):
         analyzer._validate({**result, "labels": []})  # noqa: SLF001 - schema boundary probe
+    with pytest.raises(ValueError, match="observed_entities"):
+        analyzer._validate({key: value for key, value in result.items() if key != "observed_entities"})  # noqa: SLF001
+    with pytest.raises(ValueError, match="observed_tickers"):
+        analyzer._validate({**result, "observed_tickers": ["bad"]})  # noqa: SLF001
 
 
 def test_no_visual_path_remains_a_deterministic_empty_optional_output():

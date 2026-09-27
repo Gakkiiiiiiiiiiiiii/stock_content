@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 from stock_content.application.pipeline import PipelineContext
+from stock_content.application.replay.errors import ReplayIntegrityError
 from stock_content.application.replay.identity import migration_derivation_namespace
+from stock_content.application.replay.integrity import ReplayIntegrityMixin
 from stock_content.application.replay_service import ReplayService
 from stock_content.application.snapshot_service import InMemorySnapshotStore, SnapshotService
 from stock_content.application.stages import DownloadStage, ResolveSourceStage
@@ -96,6 +98,109 @@ def _snapshot(artifact_ids, *, store=None):
         source_artifact_id=artifact_ids.get("source", ""),
         code_sha="test-sha",
     )
+
+
+def test_visual_packet_relation_validation_rejects_semantic_tamper_after_rehash():
+    frame = FrameArtifact(
+        artifact_id="packet-frame", artifact_type="frame", frame_id="frame-1", timestamp_ms=1_000,
+        image_hash="image-1", evidence_window_ids=("window-1",),
+    )
+    ocr = OCRArtifact(
+        artifact_id="packet-ocr", artifact_type="ocr", parent_artifact_ids=(frame.artifact_id,),
+        frame_artifact_id=frame.artifact_id, frame_id=frame.frame_id, timestamp_ms=frame.timestamp_ms,
+        image_hash=frame.image_hash, text="123", confidence_score=0.9, engine="paddle", engine_version="1",
+    )
+    crosscheck = TranscriptVisualCrosscheckArtifact(
+        artifact_id="packet-crosscheck", artifact_type="transcript_visual_crosscheck",
+        relations=(TranscriptVisualCrosscheckRecord(
+            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id, timestamp_ms=frame.timestamp_ms,
+            semantic_segment_ids=("semantic-1",), evidence_window_ids=("window-1",), relation="SUPPORTS",
+        ),),
+        eligible_frame_ids=(frame.frame_id,),
+    )
+    packet = {
+        "knowledge_id": "occurrence-1", "occurrence_id": "occurrence-1", "status": "AVAILABLE",
+        "reason": None, "windows": [{
+            "evidence_window_id": "window-1", "status": "AVAILABLE", "reason": None, "frames": [{
+                "frame_id": frame.frame_id, "frame_artifact_id": frame.artifact_id,
+                "frame_artifact_hash": f"sha256:{frame.content_hash}", "timestamp_ms": frame.timestamp_ms,
+                "image_hash": frame.image_hash, "relation": "SUPPORTS",
+                "ocr": [{
+                    "artifact_id": ocr.artifact_id, "artifact_hash": f"sha256:{ocr.content_hash}",
+                    "summary": "123", "confidence": 0.9,
+                    "model": {"name": "paddle", "version": "1", "confidence": 0.9},
+                }], "vision": [],
+            }],
+        }],
+    }
+    loaded = {frame.artifact_id: frame, ocr.artifact_id: ocr}
+    ReplayIntegrityMixin._validate_visual_packet_frame(
+        packet=packet, frame=packet["windows"][0]["frames"][0], evidence_window_id="window-1",
+        semantic_segment_id="semantic-1", crosscheck_artifact=crosscheck,
+        visual_parent_ids={frame.artifact_id, ocr.artifact_id}, loaded=loaded, artifact_id="packet-artifact",
+    )
+    tampered = {**packet["windows"][0]["frames"][0], "relation": "CONTRADICTS"}
+    with pytest.raises(ReplayIntegrityError, match="relation is not uniquely sealed"):
+        ReplayIntegrityMixin._validate_visual_packet_frame(
+            packet=packet, frame=tampered, evidence_window_id="window-1", semantic_segment_id="semantic-1",
+            crosscheck_artifact=crosscheck, visual_parent_ids={frame.artifact_id, ocr.artifact_id},
+            loaded=loaded, artifact_id="packet-artifact-rehashed",
+        )
+    ambiguous = TranscriptVisualCrosscheckArtifact(
+        artifact_id="packet-crosscheck-ambiguous", artifact_type="transcript_visual_crosscheck",
+        relations=(TranscriptVisualCrosscheckRecord(
+            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id, timestamp_ms=frame.timestamp_ms,
+            semantic_segment_ids=("semantic-1", "semantic-2"),
+            evidence_window_ids=("window-1", "window-2"), relation="SUPPORTS",
+        ),),
+        eligible_frame_ids=(frame.frame_id,),
+    )
+    with pytest.raises(ReplayIntegrityError, match="relation is not uniquely sealed"):
+        ReplayIntegrityMixin._validate_visual_packet_frame(
+            packet=packet, frame=packet["windows"][0]["frames"][0], evidence_window_id="window-1",
+            semantic_segment_id="semantic-1", crosscheck_artifact=ambiguous,
+            visual_parent_ids={frame.artifact_id, ocr.artifact_id}, loaded=loaded,
+            artifact_id="packet-artifact-ambiguous",
+        )
+
+
+def test_replay_rejects_secondary_visual_evidence_forged_for_a_sibling_window():
+    frame = FrameArtifact(
+        artifact_id="shared-frame", artifact_type="frame", frame_id="shared-frame", timestamp_ms=1_000,
+        image_hash="shared-image", evidence_window_ids=("window-a", "window-b"),
+    )
+    crosscheck = TranscriptVisualCrosscheckArtifact(
+        artifact_id="shared-crosscheck", artifact_type="transcript_visual_crosscheck",
+        relations=(TranscriptVisualCrosscheckRecord(
+            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id, timestamp_ms=frame.timestamp_ms,
+            semantic_segment_ids=("semantic-1",), evidence_window_ids=("window-a",), relation="SUPPORTS",
+        ),),
+        eligible_frame_ids=(frame.frame_id,), parent_artifact_ids=(frame.artifact_id,),
+    )
+    occurrence_b = SimpleNamespace(
+        semantic_segment_id="semantic-1",
+        provenance={
+            "bundle_v2": {},
+            "visual_evidence": {
+                "occurrence_id": "occurrence-b", "status": "AVAILABLE", "windows": [{
+                    "evidence_window_id": "window-b", "frames": [{
+                        "frame_id": frame.frame_id, "relation": "SUPPORTS", "ocr": [], "vision": [],
+                    }],
+                }],
+            },
+        },
+    )
+    evidence = EvidenceItem("forged-frame", "FRAME", source_artifact_id=frame.artifact_id)
+    evidence_artifact = EvidenceArtifact(artifact_id="evidence", artifact_type="evidence")
+
+    with pytest.raises(ReplayIntegrityError, match="exact admitted snapshot crosscheck relation"):
+        ReplayIntegrityMixin._validate_admitted_visual_evidence_source(
+            evidence=evidence,
+            evidence_artifact=evidence_artifact,
+            source_artifact=frame,
+            loaded={frame.artifact_id: frame, crosscheck.artifact_id: crosscheck},
+            occurrence=occurrence_b,
+        )
 
 
 def _cs_8b_multimodal_snapshot(

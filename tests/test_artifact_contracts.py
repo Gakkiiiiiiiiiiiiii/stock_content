@@ -14,6 +14,7 @@ from stock_content.domain.artifacts import (
     EvidenceArtifact,
     EvidenceItem,
     KnowledgeArtifact,
+    KnowledgeVisualEvidenceArtifact,
     LifecycleArtifact,
     MediaArtifact,
     SourceArtifact,
@@ -61,6 +62,16 @@ def _sample_artifacts():
         KnowledgeArtifact(
             artifact_id="knowledge-1", artifact_type="knowledge", verification_artifact_id="verification-1"
         ),
+        KnowledgeVisualEvidenceArtifact(
+            artifact_id="visual-1",
+            artifact_type="knowledge_visual_evidence",
+            occurrence_packets=[{
+                "knowledge_id": "occ-1", "occurrence_id": "occ-1", "status": "GAP",
+                "reason": "FRAME_MISSING", "windows": [{
+                    "evidence_window_id": "window-1", "status": "GAP", "reason": "FRAME_MISSING", "frames": [],
+                }],
+            }],
+        ),
         SummaryArtifact(artifact_id="summary-1", artifact_type="summary", core_summary="核心总结"),
     ]
 
@@ -87,6 +98,32 @@ def test_content_hash_is_deterministic_and_sensitive():
     )
     assert first.content_hash == second.content_hash
     assert first.content_hash != changed.content_hash
+
+
+def test_visual_packet_artifact_is_content_addressed_and_registry_serializable():
+    first = KnowledgeVisualEvidenceArtifact(
+        artifact_id="visual-pending", artifact_type="knowledge_visual_evidence",
+        occurrence_packets=[{
+            "knowledge_id": "occ-1", "occurrence_id": "occ-1", "status": "GAP",
+            "reason": "FRAME_MISSING", "windows": [],
+        }],
+    )
+    changed = KnowledgeVisualEvidenceArtifact(
+        artifact_id="visual-pending", artifact_type="knowledge_visual_evidence",
+        occurrence_packets=[{
+            "knowledge_id": "occ-1", "occurrence_id": "occ-1", "status": "GAP",
+            "reason": "EVIDENCE_WINDOW_MISSING", "windows": [],
+        }],
+    )
+    assert artifact_id_of(first) == artifact_id_of(first)
+    assert artifact_id_of(first) != artifact_id_of(changed)
+    registry = ArtifactRegistry()
+    sealed = KnowledgeVisualEvidenceArtifact(
+        **{**first.__dict__, "artifact_id": artifact_id_of(first)}
+    )
+    registry.set("knowledge_visual_evidence", sealed)
+    assert registry.artifact_ids()["knowledge_visual_evidence"] == sealed.artifact_id
+    assert deserialize_artifact(serialize_artifact(sealed)) == sealed
 
 
 def test_final_membership_lists_are_order_and_duplicate_independent():

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from stock_content.application.pipeline import PipelineContext
@@ -23,6 +25,8 @@ from stock_content.domain.artifacts import (
     serialize_artifact,
 )
 from stock_content.domain.checkpoint import CheckpointValidationError, build_checkpoint
+from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindow
+from stock_content.domain.knowledge_frame_plan import evidence_window_id
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.semantic_segment import build_semantic_segment_artifact, materialize_semantic_segments
 from stock_content.domain.transcript_visual_crosscheck import TranscriptVisualCrossChecker
@@ -293,6 +297,70 @@ def test_only_support_or_contradiction_enter_multimodal_and_semantic_context():
     assert len(context.state.multimodal_context["items"]) == 1
     SemanticContextStage().execute(context)
     assert context.state.semantic_contexts[0].frame_refs == ["a-support"]
+
+
+def test_crosscheck_stage_splits_a_shared_frame_into_exact_window_records():
+    context = _stage_context()
+    semantic_id = context.state.semantic_segments[0].semantic_segment_id
+    transcript_segment_id = context.artifacts.transcript.segments[0].segment_id
+    first = KnowledgeEvidenceWindow(
+        semantic_segment_id=semantic_id, start_ms=0, end_ms=2_000, center_ms=1_000,
+        transcript_segment_ids=(transcript_segment_id,), high_signals=(), knowledge_identity="knowledge-one",
+    )
+    second = KnowledgeEvidenceWindow(
+        semantic_segment_id=semantic_id, start_ms=0, end_ms=2_000, center_ms=1_000,
+        transcript_segment_ids=(transcript_segment_id,), high_signals=(), knowledge_identity="knowledge-two",
+    )
+    window_ids = (evidence_window_id(first), evidence_window_id(second))
+    context.state.knowledge_evidence_windows = [first, second]
+    support = context.artifacts.frames[0]
+    context.artifacts.frames[0] = FrameArtifact(
+        **{**support.__dict__, "evidence_window_ids": window_ids}
+    )
+    context.state.frames[0] = {**context.state.frames[0], "evidence_window_ids": list(window_ids)}
+
+    TranscriptVisualCrosscheckStage().execute(context)
+
+    records = [item for item in context.state.transcript_visual_crosschecks if item["frame_id"] == "support"]
+    assert {tuple(item["evidence_window_ids"]) for item in records} == {(window_ids[0],), (window_ids[1],)}
+    assert all(tuple(item["semantic_segment_ids"]) == (semantic_id,) for item in records)
+    assert all(item["relation"] == "SUPPORTS" for item in records)
+
+
+def test_crosscheck_seals_only_each_windows_own_transcript_segment_ids():
+    context = _stage_context()
+    first_segment = context.artifacts.transcript.segments[0]
+    second_segment = TranscriptSegmentItem(
+        segment_index=1, start_seconds=3, end_seconds=5, text="华发科技 300001",
+        media_artifact_id=context.artifacts.transcript.media_artifact_id,
+        asr_model=context.artifacts.transcript.asr_model,
+        asr_model_version=context.artifacts.transcript.asr_model_version,
+    )
+    context.artifacts.transcript = replace(
+        context.artifacts.transcript, segments=[first_segment, second_segment], content_hash=""
+    )
+    semantic = replace(context.state.semantic_segments[0], end_segment_index=1)
+    context.state.semantic_segments = [semantic]
+    first = KnowledgeEvidenceWindow(
+        semantic_segment_id=semantic.semantic_segment_id, start_ms=0, end_ms=2_000, center_ms=1_000,
+        transcript_segment_ids=(first_segment.segment_id,), high_signals=(), knowledge_identity="first",
+    )
+    second = KnowledgeEvidenceWindow(
+        semantic_segment_id=semantic.semantic_segment_id, start_ms=3_000, end_ms=5_000, center_ms=4_000,
+        transcript_segment_ids=(second_segment.segment_id,), high_signals=(), knowledge_identity="second",
+    )
+    window_ids = (evidence_window_id(first), evidence_window_id(second))
+    context.state.knowledge_evidence_windows = [first, second]
+    frame = context.artifacts.frames[0]
+    context.artifacts.frames[0] = replace(frame, evidence_window_ids=window_ids, content_hash="")
+    context.state.frames[0] = {**context.state.frames[0], "evidence_window_ids": list(window_ids)}
+
+    TranscriptVisualCrosscheckStage().execute(context)
+
+    records = [item for item in context.artifacts.transcript_visual_crosscheck.relations if item.frame_id == "support"]
+    by_window = {item.evidence_window_ids[0]: item for item in records}
+    assert by_window[window_ids[0]].transcript_segment_ids == (first_segment.segment_id,)
+    assert by_window[window_ids[1]].transcript_segment_ids == (second_segment.segment_id,)
 
 
 def test_crosscheck_artifact_roundtrips_is_content_addressed_and_rehydrates_eligible_state():

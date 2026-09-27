@@ -1,0 +1,17 @@
+{
+  "source_transcript_sha256": "107abe600dd947ffc1391d629ce777f2d28444e2c1d6d8c70a023468ce4a7cc5",
+  "segment_index": 962,
+  "start_seconds": 1569.23,
+  "end_seconds": 1571.15,
+  "raw_text": "那麼主要是陳大藥液和藍小科技",
+  "normalized_text": "那么主要是陈大药液和蓝小科技",
+  "correction_records": [
+    {
+      "type": "TRADITIONAL_TO_SIMPLIFIED",
+      "before": "那麼主要是陳大藥液和藍小科技",
+      "after": "那么主要是陈大药液和蓝小科技",
+      "converter": "opencc",
+      "version": "opencc.t2s@unknown"
+    }
+  ]
+}

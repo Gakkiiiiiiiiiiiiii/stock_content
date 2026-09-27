@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from calendar import monthrange
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from typing import Any
 
@@ -25,7 +26,33 @@ _DOMAINS = frozenset(
     }
 )
 _ATTRIBUTED = frozenset({"OPINION", "FORECAST", "CAUSAL_THESIS"})
-_COURSE_PREFIX = re.compile(r"^(?:(?:本)?课程|视频)(?:提出|设置|建议|强调|认为|指出)[：:，,、\s]*")
+# Source attribution belongs in the semantic envelope, never at the beginning
+# of the proposition a downstream consumer evaluates.  Keep this intentionally
+# narrow and anchored: it removes only presentation framing, not a real claim
+# subject such as "讲者所在公司".
+_ATTRIBUTION_PREFIX = re.compile(
+    r"^(?:(?:本)?课程|视频|讲者|讲师|老师|主讲人|演讲者)"
+    r"(?:认为|称|表示|指出|建议|强调)[：:，,、\s]*"
+)
+_REPORTED_ATTRIBUTION_PREFIX = re.compile(
+    r"^据(?:讲者|讲师|老师|主讲人|演讲者)介绍[：:，,、\s]*"
+)
+# The product requirement explicitly treats a leading ``视频展示`` as source
+# framing even without punctuation.  Keep the narrower boundary rule below
+# for ``课程设置`` because it may be the proposition subject.
+_VIDEO_DISPLAY_PREFIX = re.compile(r"^(?:视频)展示[：:，,、\s]*")
+# 展示/设置/提出 can themselves be the proposition's predicate (for example
+# ``视频展示技术提升画质``).  Strip them only with an explicit framing boundary.
+_BOUNDARY_ATTRIBUTION_PREFIX = re.compile(
+    r"^(?:(?:本)?课程|视频)(?:展示|提出|设置)[：:，,]\s*"
+)
+_DETAIL_SOURCE_PREFIX = re.compile(
+    r"^(?:据(?:讲述者|讲者|讲师|老师|主讲人|演讲者)(?:介绍|表示|指出)?|"
+    r"(?:(?:本)?(?:讲述者|讲者|讲师|老师|主讲人|演讲者|视频|节目|课程|口播|转录))"
+    r"(?:内容|文本)?(?:中|里)?(?:首先|先|随后)?"
+    r"(?:认为|称|表示|指出|建议|强调|提到|展示|介绍|说明|举例说明|举)?)"
+    r"[：:，,、\s]*"
+)
 _YEAR = re.compile(r"(?:19|20)\d{2}")
 _YEAR_ONLY = re.compile(r"^(?P<year>(?:19|20)\d{2})(?:年)?$")
 _YEAR_MONTH = re.compile(r"^(?P<year>(?:19|20)\d{2})(?:-|年\s*)(?P<month>0?[1-9]|1[0-2])(?:月)?$")
@@ -34,11 +61,67 @@ _YEAR_MONTH_DAY = re.compile(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedExternalVerification:
+    """A pipeline/authority-only seam for independently sealed verification.
+
+    This type is intentionally not parsed from model output or JSON.  An
+    adapter that has already authenticated and sealed a verification result
+    constructs it explicitly; arbitrary ``bundle_v2`` dictionaries cannot.
+    """
+
+    verification_artifact_id: str
+    claim_id: str
+    verification_id: str
+    status: str = "EXTERNALLY_VERIFIED"
+    source_grade: str = "PRIMARY"
+
+    def __post_init__(self) -> None:
+        if (
+            not self.verification_artifact_id.strip()
+            or not self.claim_id.strip()
+            or not self.verification_id.strip()
+            or self.status != "EXTERNALLY_VERIFIED"
+        ):
+            raise ValueError("INVALID_TRUSTED_EXTERNAL_VERIFICATION")
+
+
 def atomic_statement(value: Any) -> str:
-    statement = _COURSE_PREFIX.sub("", str(value or "").strip())
+    statement = str(value or "").strip()
+    # Presentation layers can be nested (for example ``视频展示：讲者认为：…``).
+    # Strip only the controlled framing forms, repeatedly to a fixed point;
+    # a real subject such as ``讲者所在公司`` or ``课程设置`` never matches.
+    while True:
+        cleaned = _ATTRIBUTION_PREFIX.sub("", statement)
+        cleaned = _REPORTED_ATTRIBUTION_PREFIX.sub("", cleaned)
+        cleaned = _VIDEO_DISPLAY_PREFIX.sub("", cleaned)
+        cleaned = _BOUNDARY_ATTRIBUTION_PREFIX.sub("", cleaned)
+        if cleaned == statement:
+            break
+        statement = cleaned
     if not statement:
         raise ValueError("EMPTY_ATOMIC_STATEMENT")
     return statement
+
+
+def starts_with_detail_source_framing(value: Any) -> bool:
+    """Return whether consumer-facing detail starts with source boilerplate."""
+
+    return bool(_DETAIL_SOURCE_PREFIX.match(str(value or "").strip()))
+
+
+def normalize_detail_text(value: Any) -> str:
+    """Move source framing out of detailed prose while retaining its content."""
+
+    detail = str(value or "").strip()
+    while detail and (match := _DETAIL_SOURCE_PREFIX.match(detail)):
+        cleaned = detail[match.end():].strip()
+        if cleaned == detail:
+            break
+        detail = cleaned
+    if not detail:
+        raise ValueError("EMPTY_KNOWLEDGE_DETAIL")
+    return detail
 
 
 def primary_domain_for(statement: str, declared: Any = None) -> str:
@@ -84,7 +167,10 @@ def claim_nature_for(claim_type: str, statement: str, declared: Any = None) -> s
 def _detail(value: Any, statement: str) -> dict[str, str | None]:
     raw = dict(value) if isinstance(value, Mapping) else {}
     allowed = ("explanation", "mechanism", "procedure", "formula", "example", "scope", "risks")
-    result = {key: (str(raw[key]).strip() if raw.get(key) is not None else None) for key in allowed}
+    result = {
+        key: (normalize_detail_text(raw[key]) if raw.get(key) is not None and str(raw[key]).strip() else None)
+        for key in allowed
+    }
     # A production model is instructed to provide rich detail.  This fallback
     # remains source-bound rather than inventing a generic risk disclaimer.
     if not any(result.values()):
@@ -274,6 +360,7 @@ def bundle_v2_semantics(
     supplied: Any = None,
     temporal_expressions: list[dict[str, Any]] | None = None,
     review_reason_codes: list[str] | None = None,
+    trusted_verification: TrustedExternalVerification | None = None,
 ) -> dict[str, Any]:
     """Return a complete, conservative v2 semantic envelope.
 
@@ -284,14 +371,33 @@ def bundle_v2_semantics(
     statement = atomic_statement(statement)
     nature = claim_nature_for(claim_type, statement, raw.get("claim_nature"))
     attribution_raw = dict(raw.get("attribution") or {})
-    source_grade = str(raw.get("source_grade") or ("SOURCE_ASSERTION" if nature in _ATTRIBUTED else "UNKNOWN"))
-    external_truth_status = str(raw.get("external_truth_status") or "NOT_CHECKED")
+    requested_source_grade = str(raw.get("source_grade") or "").upper()
+    requested_truth_status = str(raw.get("external_truth_status") or "NOT_CHECKED").upper()
+    independently_verified = isinstance(trusted_verification, TrustedExternalVerification)
+    # Model output and a displayed source are source assertions.  Only a
+    # separately identified verification record may preserve PRIMARY /
+    # EXTERNALLY_VERIFIED.  This deliberately leaves the proposition's nature
+    # intact: an unverified fact is still a fact *asserted by the source*.
+    if independently_verified:
+        source_grade = trusted_verification.source_grade
+        external_truth_status = trusted_verification.status
+    else:
+        source_grade = "SOURCE_ASSERTION" if requested_source_grade == "PRIMARY" else (
+            requested_source_grade or ("SOURCE_ASSERTION" if nature in _ATTRIBUTED else "UNKNOWN")
+        )
+        external_truth_status = (
+            "NOT_CHECKED" if requested_truth_status == "EXTERNALLY_VERIFIED" else requested_truth_status
+        )
     # Secondary/unknown external facts remain a sourced assertion until an
     # independent primary source verifies them.
+    # Attribution describes the source expression, not the later verification
+    # outcome.  In particular, admitting a sealed verification token must not
+    # mutate canonical proposition semantics (or its content address).
     attributed = (
         bool(attribution_raw.get("attributed"))
         or nature in _ATTRIBUTED
-        or source_grade in {"SECONDARY", "UNKNOWN"}
+        or requested_source_grade in {"SECONDARY", "UNKNOWN"}
+        or not requested_source_grade
     )
     attribution = {
         "attributed": attributed,
@@ -305,7 +411,7 @@ def bundle_v2_semantics(
     raw_reasons = review_reason_codes or raw_review.get("reason_codes") or []
     reasons = sorted({str(code) for code in raw_reasons if str(code)})
     review_status = "HUMAN_REVIEW_REQUIRED" if reasons else str(raw_review.get("status") or "NOT_REQUIRED")
-    return {
+    result = {
         "primary_domain": primary_domain_for(statement, raw.get("primary_domain")),
         "claim_nature": nature,
         "attribution": attribution,
@@ -321,6 +427,33 @@ def bundle_v2_semantics(
         # externally verified investment fact.
         "external_truth_status": external_truth_status,
     }
+    # Hierarchy is additive and opt-in so older sealed canonical claims keep
+    # their content identity.  It is populated only by the pre-atomic chapter
+    # thesis stage, never inferred during read projection.
+    for key in (
+        "knowledge_title",
+        "knowledge_role",
+        "parent_knowledge_id",
+        "parent_knowledge_title",
+        "child_knowledge_ids",
+        "thesis_evidence_scope",
+        # Internal hierarchy identity.  The SQL projection resolves this to
+        # the parent's real occurrence/knowledge ID and never exposes it on
+        # the public wire contract.
+        "hierarchy_node_id",
+    ):
+        if key in raw:
+            result[key] = raw[key]
+    if trusted_verification is not None:
+        result["trusted_verification"] = {
+            "verification_artifact_id": trusted_verification.verification_artifact_id,
+            "claim_id": trusted_verification.claim_id,
+            "verification_id": trusted_verification.verification_id,
+        }
+    return result
 
 
-__all__ = ["atomic_statement", "bundle_v2_semantics", "claim_nature_for", "primary_domain_for"]
+__all__ = [
+    "TrustedExternalVerification", "atomic_statement", "bundle_v2_semantics", "claim_nature_for",
+    "normalize_detail_text", "primary_domain_for", "starts_with_detail_source_framing",
+]

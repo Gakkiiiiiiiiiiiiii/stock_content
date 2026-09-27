@@ -39,14 +39,15 @@ def test_targeted_extract_uses_exact_ffmpeg_seek_and_preserves_request_provenanc
     assert frames[0]["evidence_window_ids"] == ["window-1234"]
 
 
-def test_targeted_extract_deduplicates_image_bytes_against_existing_and_targeted_frames(tmp_path, monkeypatch):
+def test_targeted_extract_preserves_every_window_relation_for_duplicate_image_bytes(tmp_path, monkeypatch):
     def fake_run(command, **_kwargs):
         Path(command[-1]).write_bytes(b"duplicate-image")
 
     monkeypatch.setattr("stock_content.adapters.media.frame.subprocess.run", fake_run)
     video = tmp_path / "source.mp4"
     video.write_bytes(b"video")
-    existing_hash = __import__("hashlib").sha256(b"duplicate-image").hexdigest()
-    assert FfmpegFrameExtractor().extract_targeted(
-        video, tmp_path, [_request(1_000), _request(2_000)], existing_image_hashes={existing_hash}
-    ) == []
+    frames = FfmpegFrameExtractor().extract_targeted(
+        video, tmp_path, [_request(1_000), _request(2_000)], existing_image_hashes={"already-present"}
+    )
+    assert [item["evidence_window_ids"] for item in frames] == [["window-1000"], ["window-2000"]]
+    assert len({item["image_hash"] for item in frames}) == 1

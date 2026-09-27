@@ -54,6 +54,26 @@ def _price_claim() -> FinancialClaim:
     )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("market_snapshot_id", ""),
+        ("market_snapshot_id", "   "),
+        ("market_data_version", ""),
+        ("market_data_version", "   "),
+    ],
+)
+def test_terminal_verification_requires_nonblank_snapshot_string_bindings(field, value):
+    payload = {
+        "claim_id": "claim-1", "status": "VERIFIED", "market_snapshot_id": "market-1",
+        "market_data_version": "md.v1", "fact_date": datetime(2026, 8, 15, tzinfo=UTC).date(),
+        "verification_timestamp": datetime(2026, 8, 16, tzinfo=UTC),
+    }
+    payload[field] = value
+    with pytest.raises(ValueError, match="requires quant snapshot binding"):
+        VerificationResult(**payload)
+
+
 def test_quant_unavailable_keeps_ingest_alive_and_schedules_retry():
     service = VerificationService(provider=None)
     item = service.submit(_price_claim())

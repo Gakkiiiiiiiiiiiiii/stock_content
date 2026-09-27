@@ -8,6 +8,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from stock_content.domain.knowledge_schema import KnowledgeUnitSchemaValidator
+from stock_content.domain.knowledge_semantics import atomic_statement
 from stock_content.domain.model_gateway import StructuredModelGateway
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,8 @@ class KnowledgeUnitExtractor:
             "跳过免责声明、寒暄、重复复述、泛泛感慨和没有结论的背景。当前片段应输出 2-4 条；"
             "同一观点即使有不同表述也只保留一条。\n"
             "conclusion 是供用户阅读的原子结论：必须是独立、简洁、可判断的中文总结（不超过 80 字），"
+            "不得以讲者认为、讲者称、视频认为、视频展示、课程认为、课程提出、课程设置、老师表示或主讲人指出开头；"
+            "来源归因另存 attribution。"
             "应消除口语重复和明显的 ASR 错字；不得照抄长段转写。条件写入 condition_text，"
             "风险/失效条件写入 invalidation_text，"
             "实体写入 entities。evidence 仅用于定位原始语音证据，每项只填写 source_ref（window_N）；"
@@ -286,7 +289,9 @@ class KnowledgeUnitExtractor:
 
     def _normalize_llm_unit(self, item: dict[str, Any], chapter: dict, response: dict) -> dict:
         unit = dict(item)
-        statement = re.sub(r"\s+", " ", str(unit.get("conclusion") or unit.get("statement") or "")).strip()
+        statement = atomic_statement(
+            re.sub(r"\s+", " ", str(unit.get("conclusion") or unit.get("statement") or "")).strip()
+        )
         canonical = re.sub(r"\s+", "", str(unit.get("canonical_statement") or statement)).strip()
         unit["chapter_index"] = chapter.get("chapter_index")
         unit["primary_domain"] = unit.get("primary_domain") or chapter.get("primary_domain") or "GENERAL"

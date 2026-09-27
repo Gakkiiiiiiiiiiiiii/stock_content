@@ -223,7 +223,16 @@ def _ocr_worker_environment(python_path: str, device: str, require_gpu: bool) ->
     library_paths = [part for part in os.getenv("CONTENT_OCR_LIBRARY_PATH", "").split(os.pathsep) if part]
     if library_paths:
         environment["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(library_paths))
-    for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "HOME"):
+    # The video container has a read-only root filesystem.  Forward only its
+    # explicit writable temp path, never ambient TEMP/TMP or service secrets.
+    if temp_dir := os.getenv("TMPDIR", ""):
+        environment["TMPDIR"] = temp_dir
+    elif os.name == "nt":
+        # Local Windows OCR still needs its standard writable temp location.
+        for name in ("TEMP", "TMP"):
+            if os.getenv(name):
+                environment[name] = str(os.environ[name])
+    for name in ("SYSTEMROOT", "WINDIR", "HOME"):
         if os.getenv(name):
             environment[name] = str(os.environ[name])
     environment.update(_ocr_model_cache_environment())
@@ -233,17 +242,16 @@ def _ocr_worker_environment(python_path: str, device: str, require_gpu: bool) ->
 def _ocr_model_cache_environment() -> dict[str, str]:
     """Locate Paddle/PaddleX caches without forwarding the user environment.
 
-    PaddleOCR imports ModelScope, which calls ``Path.home()`` even when all
-    OCR weights are already cached.  The worker intentionally receives a
-    scrubbed environment, so pass only explicit cache locations.  Deployments
-    can isolate those caches with ``CONTENT_OCR_CACHE_HOME``.
+    PaddleOCR imports ModelScope and Hugging Face clients, which may write
+    cache files during a cold start.  The worker receives a scrubbed
+    environment, so place those caches under ``CONTENT_OCR_CACHE_HOME``.
     """
 
     configured = os.getenv("CONTENT_OCR_CACHE_HOME", "").strip()
     profile = os.getenv("USERPROFILE", "").strip()
     if configured:
         cache_home = Path(configured)
-        home = Path(profile) if profile else cache_home.parent
+        home = (Path(profile) if profile else cache_home.parent) if os.name == "nt" else cache_home
     elif profile:
         cache_home = Path(profile) / ".paddlex"
         home = Path(profile)
@@ -253,13 +261,18 @@ def _ocr_model_cache_environment() -> dict[str, str]:
     else:
         # ModelScope must not call Path.home() in a profile-less service.
         cache_home = Path(tempfile.gettempdir()) / "stock_content" / "ocr-cache"
-        home = cache_home.parent
+        home = cache_home.parent if os.name == "nt" else cache_home
+    hf_home = cache_home / "huggingface"
     return {
         # ModelScope evaluates its Path.home()-based default eagerly even when
         # MODELSCOPE_CACHE is supplied.  On Windows, pathlib resolves home
         # from USERPROFILE rather than HOME, so both carry only this path.
         "HOME": str(home),
         "USERPROFILE": str(home),
+        "XDG_CACHE_HOME": str(cache_home / ".cache"),
+        "HF_HOME": str(hf_home),
+        "HF_HUB_CACHE": str(hf_home / "hub"),
+        "HF_XET_CACHE": str(hf_home / "xet"),
         "PADDLE_PDX_CACHE_HOME": str(cache_home),
         "MODELSCOPE_CACHE": str(cache_home / "modelscope"),
     }

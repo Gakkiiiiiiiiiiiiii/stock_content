@@ -37,6 +37,7 @@ _REQUIRED = {
     "knowledge_as_of",
     "availability_as_of",
 }
+_TRADING_AUTHORIZATION_FIELDS = frozenset({"order_qty", "limit_price", "portfolio_weight", "execute_at"})
 
 
 def canonical_signal_json(value: Mapping[str, Any]) -> str:
@@ -98,6 +99,9 @@ def signal_checksum(signal: Mapping[str, Any]) -> str:
 def validate_signal_v5_1(signal: Mapping[str, Any], *, expected_checksum: str | None = None) -> dict[str, Any]:
     if not isinstance(signal, Mapping):
         raise ValueError("v5.1 signal must be an object")
+    forbidden = sorted(_TRADING_AUTHORIZATION_FIELDS.intersection(signal))
+    if forbidden:
+        raise ValueError(f"v5.1 signal cannot contain trading instruction fields: {', '.join(forbidden)}")
     missing = sorted(key for key in _REQUIRED if key not in signal)
     if missing:
         raise ValueError(f"v5.1 signal missing {', '.join(missing)}")

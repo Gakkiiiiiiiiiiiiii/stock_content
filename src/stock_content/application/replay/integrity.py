@@ -231,6 +231,15 @@ class ReplayIntegrityMixin:
         loaded_evidence_parents = {
             str(item) for item in (getattr(evidence_artifact, "parent_artifact_ids", ()) or ())
         }
+        evidence_by_id = {
+            str(getattr(item, "evidence_id", "") or ""): item
+            for item in (getattr(evidence_artifact, "evidences", ()) or ())
+        }
+        occurrence_scope_artifact = loaded.get(str(mapping.get("occurrences") or ""))
+        requires_occurrence_visual_scope = bool(
+            tuple(getattr(occurrence_scope_artifact, "occurrence_ids", ()) or ())
+        )
+        deferred_visual_evidence_ids: set[str] = set()
         for evidence in getattr(evidence_artifact, "evidences", ()) or ():
             source_id = str(getattr(evidence, "source_artifact_id", "") or "")
             if not source_id:
@@ -239,12 +248,21 @@ class ReplayIntegrityMixin:
             if source_id not in loaded:
                 raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING",
                                            f"evidence references missing source artifact {source_id}")
-            if source_id not in loaded_evidence_parents:
+            if (
+                requires_occurrence_visual_scope
+                and str(getattr(evidence, "source_type", "") or "").upper() in {"FRAME", "OCR", "VISION"}
+            ):
+                # Visual evidence is occurrence-owned.  Scope is unavailable
+                # until immutable occurrence rows are loaded below, so defer
+                # its admission rather than accepting a global frame relation.
+                deferred_visual_evidence_ids.add(str(getattr(evidence, "evidence_id", "") or ""))
+            elif source_id not in loaded_evidence_parents:
                 self._validate_admitted_visual_evidence_source(
                     evidence=evidence,
                     evidence_artifact=evidence_artifact,
                     source_artifact=loaded[source_id],
                     loaded=loaded,
+                    occurrence=None,
                 )
         claim_ids = {str(getattr(item, "claim_id", None) or
                           (item.get("claim_id") if isinstance(item, dict) else item))
@@ -421,6 +439,91 @@ class ReplayIntegrityMixin:
                     )
             occurrence_rows[str(occurrence_id)] = occurrence
 
+        admitted_secondary_visual_ids: set[str] = set()
+        for occurrence in occurrence_rows.values():
+            for evidence_id in getattr(occurrence, "secondary_evidence_refs", ()) or ():
+                evidence = evidence_by_id.get(str(evidence_id))
+                if evidence is None:
+                    continue
+                if str(getattr(evidence, "source_type", "") or "").upper() not in {"FRAME", "OCR", "VISION"}:
+                    continue
+                source_id = str(getattr(evidence, "source_artifact_id", "") or "")
+                source_artifact = loaded.get(source_id)
+                if source_artifact is None:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_MISSING",
+                        "secondary visual evidence source is missing from snapshot",
+                        artifact_id=source_id,
+                    )
+                self._validate_admitted_visual_evidence_source(
+                    evidence=evidence,
+                    evidence_artifact=evidence_artifact,
+                    source_artifact=source_artifact,
+                    loaded=loaded,
+                    occurrence=occurrence,
+                )
+                admitted_secondary_visual_ids.add(str(evidence_id))
+        if deferred_visual_evidence_ids - admitted_secondary_visual_ids:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "visual evidence is not owned by an occurrence secondary relation",
+                evidence_ids=sorted(deferred_visual_evidence_ids - admitted_secondary_visual_ids),
+            )
+
+        # New producer snapshots seal the complete per-occurrence visual
+        # packet independently of the mutable query projection.  A historical
+        # snapshot legitimately has no such slot; never synthesize one during
+        # replay.  When present, however, every byte must still agree with the
+        # immutable occurrence rows and every referenced visual artifact must
+        # be in this artifact's parent closure.
+        visual_packet_artifact_id = str(mapping.get("knowledge_visual_evidence") or "")
+        if visual_packet_artifact_id:
+            visual_packet_artifact = loaded.get(visual_packet_artifact_id)
+            if visual_packet_artifact is None or str(
+                getattr(visual_packet_artifact, "artifact_type", "")
+            ) != "knowledge_visual_evidence":
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "knowledge visual evidence slot does not resolve to its artifact",
+                    artifact_id=visual_packet_artifact_id,
+                )
+            actual_packets = list(getattr(visual_packet_artifact, "occurrence_packets", ()) or ())
+            expected_packets = [
+                dict((getattr(occurrence, "provenance", {}) or {}).get("visual_evidence") or {})
+                for occurrence in occurrence_rows.values()
+            ]
+            if actual_packets != expected_packets:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "sealed knowledge visual evidence differs from occurrence projection",
+                    artifact_id=visual_packet_artifact_id,
+                )
+            visual_parents = {
+                str(parent_id)
+                for parent_id in (getattr(visual_packet_artifact, "parent_artifact_ids", ()) or ())
+            }
+            crosscheck_artifact = loaded.get(str(mapping.get("transcript_visual_crosscheck") or ""))
+            for packet in actual_packets:
+                occurrence = (
+                    occurrence_rows.get(str(packet.get("occurrence_id") or ""))
+                    if isinstance(packet, dict)
+                    else None
+                )
+                for window in list(packet.get("windows") or ()) if isinstance(packet, dict) else ():
+                    for frame in list(window.get("frames") or ()) if isinstance(window, dict) else ():
+                        self._validate_visual_packet_frame(
+                            packet=packet,
+                            frame=frame,
+                            evidence_window_id=str(window.get("evidence_window_id") or ""),
+                            window_status=str(window.get("status") or ""),
+                            window_reason=str(window.get("reason") or ""),
+                            semantic_segment_id=str(getattr(occurrence, "semantic_segment_id", "") or ""),
+                            crosscheck_artifact=crosscheck_artifact,
+                            visual_parent_ids=visual_parents,
+                            loaded=loaded,
+                            artifact_id=visual_packet_artifact_id,
+                        )
+
         lifecycle_artifact = loaded.get(str(mapping.get("lifecycle") or ""))
         lifecycle_ids = (
             tuple(getattr(lifecycle_artifact, "claim_lifecycle_event_ids", ()) or ())
@@ -490,10 +593,212 @@ class ReplayIntegrityMixin:
                     raise ReplayIntegrityError(
                         "REPLAY_LINEAGE_REFERENCE_INVALID", "signal verification artifact mismatch"
                     )
+        self._validate_security_entity_alignment(mapping, loaded)
 
     @staticmethod
-    def _validate_admitted_visual_evidence_source(*, evidence: Any, evidence_artifact: Any,
-                                                  source_artifact: Any, loaded: dict[str, Any]) -> None:
+    def _validate_security_entity_alignment(mapping: dict[str, str], loaded: dict[str, Any]) -> None:
+        """Validate audit-only mentions against the sealed owning window."""
+        alignment_id = str(mapping.get("security_entity_alignment") or "")
+        if not alignment_id:
+            return  # Historical snapshots predate this additive slot.
+        alignment = loaded.get(alignment_id)
+        if alignment is None or getattr(alignment, "artifact_type", "") != "security_entity_alignment":
+            raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_MISSING", "security alignment artifact missing")
+        transcript_id = str(getattr(alignment, "transcript_artifact_id", "") or "")
+        crosscheck_id = str(getattr(alignment, "crosscheck_artifact_id", "") or "")
+        transcript = loaded.get(transcript_id)
+        crosscheck = loaded.get(crosscheck_id)
+        parents = set(getattr(alignment, "parent_artifact_ids", ()) or ())
+        if (
+            transcript_id != str(mapping.get("transcript") or "")
+            or crosscheck_id != str(mapping.get("transcript_visual_crosscheck") or "")
+            or transcript is None or crosscheck is None
+            or getattr(transcript, "artifact_type", "") != "transcript"
+            or getattr(crosscheck, "artifact_type", "") != "transcript_visual_crosscheck"
+            or not {transcript_id, crosscheck_id} <= parents
+        ):
+            raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID", "security alignment root closure invalid")
+        segments = {str(item.segment_id): item for item in getattr(transcript, "segments", ()) or ()}
+        records = (*getattr(alignment, "security_mentions", ()),
+                   *getattr(alignment, "displayed_target_candidates", ()))
+        for record in records:
+            kind = str(getattr(record, "record_type", ""))
+            segment_id = str(getattr(record, "asr_segment_id", "") or "")
+            if kind in {"ASR_MENTION", "ALIGNED_MENTION"}:
+                segment = segments.get(segment_id)
+                source_id = str(getattr(record, "source_artifact_id", "") or "")
+                if segment is None or source_id not in {
+                    transcript_id, str(getattr(segment, "source_artifact_id", "") or "")
+                }:
+                    raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID", "ASR mention source mismatch")
+            if kind == "ASR_MENTION":
+                continue
+            frame_artifact_id = str(getattr(record, "frame_artifact_id", "") or "")
+            ocr_artifact_id = str(getattr(record, "ocr_artifact_id", "") or "")
+            frame = loaded.get(frame_artifact_id)
+            ocr = loaded.get(ocr_artifact_id) if ocr_artifact_id else None
+            window_id = str(getattr(record, "evidence_window_id", "") or "")
+            visual_refs = {
+                frame_artifact_id, ocr_artifact_id, str(getattr(record, "vision_artifact_id", "") or "")
+            } - {""}
+            if (
+                frame is None or not visual_refs <= parents
+                or getattr(frame, "artifact_type", "") != "frame"
+                or getattr(frame, "frame_id", "") != getattr(record, "frame_id", "")
+                or getattr(frame, "timestamp_ms", None) != getattr(record, "timestamp_ms", None)
+                or getattr(frame, "image_hash", "") != getattr(record, "image_hash", "")
+                or window_id not in set(getattr(frame, "evidence_window_ids", ()) or ())
+                or (ocr_artifact_id and (
+                    ocr is None or getattr(ocr, "artifact_type", "") != "ocr"
+                    or getattr(ocr, "frame_artifact_id", "") != frame_artifact_id
+                    or getattr(ocr, "frame_id", "") != getattr(record, "frame_id", "")
+                    or window_id not in set(getattr(ocr, "evidence_window_ids", ()) or ())
+                ))
+            ):
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID", "displayed mention window/frame/OCR mismatch"
+                )
+            vision_id = str(getattr(record, "vision_artifact_id", "") or "")
+            if vision_id:
+                vision = loaded.get(vision_id)
+                if (vision is None or vision_id not in parents
+                    or getattr(vision, "frame_artifact_id", "") != frame_artifact_id
+                    or window_id not in set(getattr(vision, "evidence_window_ids", ()) or ())):
+                    raise ReplayIntegrityError("REPLAY_LINEAGE_REFERENCE_INVALID", "displayed mention vision mismatch")
+            if kind == "ALIGNED_MENTION":
+                scoped = [
+                    relation for relation in (getattr(crosscheck, "relations", ()) or ())
+                    if str(getattr(relation, "frame_id", "") or "") == str(getattr(record, "frame_id", "") or "")
+                    and tuple(getattr(relation, "evidence_window_ids", ()) or ()) == (window_id,)
+                ]
+                if len(scoped) != 1 or segment_id not in set(getattr(scoped[0], "transcript_segment_ids", ()) or ()):
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID", "aligned mention transcript outside sealed window"
+                    )
+
+    @staticmethod
+    def _validate_visual_packet_frame(*, packet: Any, frame: Any, evidence_window_id: str,
+                                      semantic_segment_id: str, crosscheck_artifact: Any,
+                                      visual_parent_ids: set[str], loaded: dict[str, Any], artifact_id: str,
+                                      window_status: str = "", window_reason: str = "") -> None:
+        if not isinstance(packet, dict) or not isinstance(frame, dict):
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "knowledge visual evidence packet is malformed",
+                artifact_id=artifact_id,
+            )
+        frame_artifact_id = str(frame.get("frame_artifact_id") or "")
+        frame_artifact = loaded.get(frame_artifact_id)
+        if not frame_artifact_id or frame_artifact_id not in visual_parent_ids or frame_artifact is None:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_MISSING", "visual packet frame is outside sealed parent closure",
+                artifact_id=artifact_id, frame_artifact_id=frame_artifact_id,
+            )
+        expected_frame_hash = f"sha256:{getattr(frame_artifact, 'content_hash', '')}"
+        if frame.get("frame_artifact_hash") != expected_frame_hash:
+            raise ReplayIntegrityError(
+                "REPLAY_ARTIFACT_HASH_MISMATCH", "visual packet frame hash does not match artifact",
+                artifact_id=artifact_id, frame_artifact_id=frame_artifact_id,
+            )
+        if (
+            str(frame.get("frame_id") or "") != str(getattr(frame_artifact, "frame_id", "") or "")
+            or frame.get("timestamp_ms") != getattr(frame_artifact, "timestamp_ms", None)
+            or str(frame.get("image_hash") or "") != str(getattr(frame_artifact, "image_hash", "") or "")
+            or evidence_window_id not in set(getattr(frame_artifact, "evidence_window_ids", ()) or ())
+        ):
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID", "visual packet frame fields do not match sealed artifact",
+                artifact_id=artifact_id, frame_artifact_id=frame_artifact_id,
+            )
+        matching_relations = [
+            relation for relation in (getattr(crosscheck_artifact, "relations", ()) or ())
+            if str(getattr(relation, "frame_id", "") or "") == str(frame.get("frame_id") or "")
+            and tuple(getattr(relation, "evidence_window_ids", ()) or ()) == (evidence_window_id,)
+            and tuple(getattr(relation, "semantic_segment_ids", ()) or ()) == (semantic_segment_id,)
+        ]
+        # A GAP can legitimately be sealed precisely because no scoped
+        # crosscheck exists (or because several conflicting scoped checks do).
+        # Such a frame remains UNKNOWN and must never be replay-promoted into
+        # support. All other packets still require one exact scoped relation.
+        packet_status = str(packet.get("status") or "")
+        mixed_human_review = packet_status == "HUMAN_REVIEW_REQUIRED" and any(
+            isinstance(window, dict) and window.get("status") == "HUMAN_REVIEW_REQUIRED"
+            for window in packet.get("windows") or ()
+        )
+        unresolved_gap = (
+            window_status == "GAP"
+            and (packet_status == "GAP" or mixed_human_review)
+            and str(frame.get("relation") or "") == "UNKNOWN"
+            and (
+                (window_reason == "CROSSCHECK_MISSING" and len(matching_relations) == 0)
+                or (window_reason == "CROSSCHECK_SCOPE_AMBIGUOUS" and len(matching_relations) != 1)
+            )
+        )
+        if not unresolved_gap and (
+            len(matching_relations) != 1
+            or str(getattr(matching_relations[0], "relation", "")) != str(frame.get("relation") or "")
+        ):
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID", "visual packet relation is not uniquely sealed for its scope",
+                artifact_id=artifact_id,
+            )
+        for modality in ("ocr", "vision"):
+            for result in list(frame.get(modality) or ()):
+                if not isinstance(result, dict):
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        "visual packet modality result is malformed",
+                        artifact_id=artifact_id,
+                    )
+                result_artifact_id = str(result.get("artifact_id") or "")
+                result_artifact = loaded.get(result_artifact_id)
+                if not result_artifact_id or result_artifact_id not in visual_parent_ids or result_artifact is None:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_MISSING", "visual packet modality is outside sealed parent closure",
+                        artifact_id=artifact_id, result_artifact_id=result_artifact_id,
+                    )
+                if result.get("artifact_hash") != f"sha256:{getattr(result_artifact, 'content_hash', '')}":
+                    raise ReplayIntegrityError(
+                        "REPLAY_ARTIFACT_HASH_MISMATCH", "visual packet modality hash does not match artifact",
+                        artifact_id=artifact_id, result_artifact_id=result_artifact_id,
+                    )
+                expected_type = modality
+                if str(getattr(result_artifact, "artifact_type", "")) != expected_type:
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID", "visual packet modality type does not match artifact",
+                        artifact_id=artifact_id, result_artifact_id=result_artifact_id,
+                    )
+                if modality == "ocr":
+                    summary = str(getattr(result_artifact, "text", "") or "")
+                    model_name = getattr(result_artifact, "engine", "")
+                    model_version = getattr(result_artifact, "engine_version", "")
+                else:
+                    label = getattr(result_artifact, "label", "")
+                    labels = getattr(result_artifact, "labels", ()) or ()
+                    summary = str(label or " ".join(labels))
+                    model_name = getattr(result_artifact, "model_name", "")
+                    model_version = getattr(result_artifact, "model_version", "")
+                if (
+                    str(getattr(result_artifact, "frame_artifact_id", "") or "") != frame_artifact_id
+                    or str(getattr(result_artifact, "frame_id", "") or "") != str(frame.get("frame_id") or "")
+                    or getattr(result_artifact, "timestamp_ms", None) != frame.get("timestamp_ms")
+                    or str(getattr(result_artifact, "image_hash", "") or "") != str(frame.get("image_hash") or "")
+                    or str(result.get("summary") or "") != summary
+                    or result.get("confidence") != getattr(result_artifact, "confidence_score", None)
+                    or dict(result.get("model") or {}).get("name") != model_name
+                    or dict(result.get("model") or {}).get("version") != model_version
+                ):
+                    raise ReplayIntegrityError(
+                        "REPLAY_LINEAGE_REFERENCE_INVALID",
+                        "visual packet modality fields do not match sealed artifact",
+                        artifact_id=artifact_id, result_artifact_id=result_artifact_id,
+                    )
+
+    @staticmethod
+    def _validate_admitted_visual_evidence_source(
+        *, evidence: Any, evidence_artifact: Any, source_artifact: Any,
+        loaded: dict[str, Any], occurrence: Any | None,
+    ) -> None:
         """Accept only visual evidence admitted by the sealed crosscheck graph.
 
         Historical EPIC-043 snapshots keep their visual evidence on the
@@ -544,6 +849,79 @@ class ReplayIntegrityMixin:
             )
 
         evidence_transcript_id = str(getattr(evidence_artifact, "transcript_artifact_id", "") or "")
+        if occurrence is None:
+            # Pre-item-level snapshots have no occurrence membership to bind.
+            # Keep their historical read path, while every snapshot that does
+            # carry occurrence IDs takes the exact-scope branch below.
+            for crosscheck in loaded.values():
+                if str(getattr(crosscheck, "artifact_type", "")) != "transcript_visual_crosscheck":
+                    continue
+                parent_ids = {str(item) for item in (getattr(crosscheck, "parent_artifact_ids", ()) or ())}
+                if artifact_id not in parent_ids or frame_artifact_id not in parent_ids:
+                    continue
+                if evidence_transcript_id and str(getattr(crosscheck, "transcript_artifact_id", "") or "") != (
+                    evidence_transcript_id
+                ):
+                    continue
+                matches = [
+                    relation
+                    for relation in (getattr(crosscheck, "relations", ()) or ())
+                    if str(getattr(relation, "frame_id", "") or "") == frame_id
+                    and str(getattr(relation, "frame_artifact_id", "") or "") == frame_artifact_id
+                    and str(getattr(relation, "relation", "") or "")
+                    in {"SUPPORTS", "CONTRADICTS", "SUPPORTS_DISPLAYED_SECONDARY"}
+                ]
+                if len(matches) == 1:
+                    return
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "legacy visual evidence source is outside the admitted snapshot crosscheck graph",
+                artifact_id=artifact_id,
+            )
+        packet = dict((getattr(occurrence, "provenance", {}) or {}).get("visual_evidence") or {})
+        semantic_segment_id = str(getattr(occurrence, "semantic_segment_id", "") or "")
+        scoped_windows = {
+            str(window.get("evidence_window_id") or "")
+            for window in packet.get("windows") or ()
+            if isinstance(window, dict)
+            and any(
+                isinstance(frame, dict) and str(frame.get("frame_id") or "") == frame_id
+                for frame in window.get("frames") or ()
+            )
+        }
+        if not semantic_segment_id or not scoped_windows:
+            raise ReplayIntegrityError(
+                "REPLAY_LINEAGE_REFERENCE_INVALID",
+                "visual evidence lacks an exact owning occurrence/window scope",
+                artifact_id=artifact_id,
+            )
+        if expected_type != "frame":
+            packet_has_modality = any(
+                str(result.get("artifact_id") or "") == artifact_id
+                for window in packet.get("windows") or ()
+                if isinstance(window, dict)
+                for frame in window.get("frames") or ()
+                if isinstance(frame, dict) and str(frame.get("frame_id") or "") == frame_id
+                for result in frame.get("ocr" if expected_type == "ocr" else "vision") or ()
+                if isinstance(result, dict)
+            )
+            if not packet_has_modality:
+                raise ReplayIntegrityError(
+                    "REPLAY_LINEAGE_REFERENCE_INVALID",
+                    "secondary visual modality is absent from the owning occurrence packet",
+                    artifact_id=artifact_id,
+                )
+        occurrence_semantic = dict((getattr(occurrence, "provenance", {}) or {}).get("bundle_v2") or {})
+        attribution = dict(occurrence_semantic.get("attribution") or {})
+        permits_displayed_secondary = (
+            occurrence_semantic.get("claim_nature") in {
+                "ATTRIBUTED_SECONDARY_POLICY_REPORT", "ATTRIBUTED_SECONDARY_MACRO_FACT_REPORT",
+            }
+            and occurrence_semantic.get("source_grade") == "SECONDARY"
+            and bool(attribution.get("attributed"))
+            and "displayed" in str(attribution.get("source_label") or "").lower()
+        )
+        exact_relations = []
         for crosscheck in loaded.values():
             if str(getattr(crosscheck, "artifact_type", "")) != "transcript_visual_crosscheck":
                 continue
@@ -557,11 +935,17 @@ class ReplayIntegrityMixin:
             for relation in getattr(crosscheck, "relations", ()) or ():
                 relation_type = str(getattr(relation, "relation", "") or "")
                 admitted = relation_type in {"SUPPORTS", "CONTRADICTS"}
-                displayed_secondary = relation_type == "SUPPORTS_DISPLAYED_SECONDARY"
+                displayed_secondary = (
+                    relation_type == "SUPPORTS_DISPLAYED_SECONDARY" and permits_displayed_secondary
+                )
                 if (
                     (admitted or displayed_secondary)
                     and str(getattr(relation, "frame_id", "") or "") == frame_id
                     and str(getattr(relation, "frame_artifact_id", "") or "") == frame_artifact_id
+                    and tuple(getattr(relation, "semantic_segment_ids", ()) or ()) == (semantic_segment_id,)
+                    and tuple(getattr(relation, "evidence_window_ids", ()) or ()) in {
+                        (window_id,) for window_id in scoped_windows
+                    }
                     # Displayed-secondary pages are intentionally excluded
                     # from the normal eligible frame set: they prove only
                     # that the attributed page was shown.  The immutable
@@ -569,10 +953,12 @@ class ReplayIntegrityMixin:
                     # their narrow admission boundary.
                     and (displayed_secondary or frame_id in set(getattr(crosscheck, "eligible_frame_ids", ()) or ()))
                 ):
-                    return
+                    exact_relations.append(relation)
+        if len(exact_relations) == 1:
+            return
         raise ReplayIntegrityError(
             "REPLAY_LINEAGE_REFERENCE_INVALID",
-            "visual evidence source is outside the admitted snapshot crosscheck graph",
+            "visual evidence source lacks one exact admitted snapshot crosscheck relation",
             artifact_id=artifact_id,
         )
 

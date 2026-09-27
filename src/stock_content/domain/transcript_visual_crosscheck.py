@@ -102,7 +102,7 @@ class TranscriptVisualCrossChecker:
     """Classify a frame only against its owning transcript coordinates."""
 
     ocr_correction_threshold: float = 0.98
-    version: str = "transcript-visual-crosscheck.v1"
+    version: str = "transcript-visual-crosscheck.v3"
 
     def check(
         self,
@@ -175,6 +175,13 @@ class TranscriptVisualCrossChecker:
                     reasons.append(f"{kind}_MISMATCH")
             semantic_anchors = _SEMANTIC_ANCHOR_KINDS & matches.keys()
             material_mismatches = _MATERIAL_FACT_KINDS & mismatches.keys()
+            material_matches = bool(
+                (set(matches.get("NUMBER") or ()) - set(matches.get("TICKER") or ()))
+                or matches.get("DATE") or matches.get("DIRECTION")
+            )
+            near_entity_variant = _has_nonexact_near_entity_variant(
+                transcript_facts["ENTITY"], ocr_facts["ENTITY"]
+            )
             if matches and not ocr_text:
                 # A vision response saying that it agrees with the narration is
                 # not an independent financial-fact source.  Keep it auditable
@@ -187,6 +194,14 @@ class TranscriptVisualCrossChecker:
                 # date, or direction a material contradiction rather than a
                 # partial visual confirmation.
                 relation = "CONTRADICTS"
+            elif near_entity_variant:
+                relation = "ENTITY_CORRECTION_PENDING"
+                reasons.append("ENTITY_SPELLING_VARIANT_PENDING")
+            elif (
+                matches.get("TICKER") or _has_security_entity_match(matches.get("ENTITY") or ())
+            ) and not material_matches:
+                relation = "SUPPORTS_DISPLAYED_MENTION"
+                reasons.append("DISPLAYED_SECURITY_MENTION_ONLY")
             elif matches:
                 relation = "SUPPORTS"
             elif "TICKER" in mismatches:
@@ -194,6 +209,11 @@ class TranscriptVisualCrossChecker:
             else:
                 relation = "UNRELATED"
                 reasons.append("NO_SHARED_HARD_FACT")
+        if relation == "UNRELATED" and _has_nonexact_near_entity_variant(
+            transcript_facts["ENTITY"], ocr_facts["ENTITY"]
+        ):
+            relation = "ENTITY_CORRECTION_PENDING"
+            reasons.append("ENTITY_SPELLING_VARIANT_PENDING")
         ocr_confidences = [
             value
             for item in ocr_list
@@ -266,6 +286,25 @@ class TranscriptVisualCrossChecker:
                 }
             )
         return candidates
+
+
+def _has_nonexact_near_entity_variant(transcript_entities: set[str], ocr_entities: set[str]) -> bool:
+    def distance(left: str, right: str) -> int:
+        if abs(len(left) - len(right)) > 1:
+            return 99
+        prior = list(range(len(right) + 1))
+        for index, char in enumerate(left, start=1):
+            current = [index]
+            for other_index, other in enumerate(right, start=1):
+                current.append(min(current[-1] + 1, prior[other_index] + 1, prior[other_index - 1] + (char != other)))
+            prior = current
+        return prior[-1]
+
+    return any(left != right and distance(left, right) <= 1 for left in transcript_entities for right in ocr_entities)
+
+
+def _has_security_entity_match(entities: Iterable[str]) -> bool:
+    return any(len(item) > 2 for item in entities)
 
 
 __all__ = ["TranscriptVisualCrossChecker"]

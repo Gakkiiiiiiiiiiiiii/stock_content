@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import UTC, date, datetime, time
-from typing import Any
+from typing import Any, Mapping
 
 from sqlalchemy import or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -31,8 +31,9 @@ from stock_content.adapters.postgres.repositories.snapshot_repository import (
 )
 from stock_content.application.historical_claim_projector import HistoricalClaimProjector
 from stock_content.domain.claim_state_event import ClaimStateEvent
+from stock_content.domain.claims import VerificationResult
 from stock_content.domain.knowledge_bundle import V2_CONTRACT, KnowledgeBundleRequest, sha256
-from stock_content.domain.knowledge_semantics import bundle_v2_semantics
+from stock_content.domain.knowledge_semantics import TrustedExternalVerification, bundle_v2_semantics
 from stock_content.ports.repositories import IdempotencyConflict
 
 
@@ -252,6 +253,7 @@ class PostgresKnowledgeBundleAuthority:
                 )
             ).all()
             items = []
+            hierarchy_nodes: dict[str, str] = {}
             for claim, occurrence in rows:
                 projection = _historical_projection(session, claim, request)
                 if projection is None:
@@ -309,7 +311,11 @@ class PostgresKnowledgeBundleAuthority:
                 if not any(entry["ownership"] == "PRIMARY" for entry in evidence):
                     continue
                 if request.contract_version == V2_CONTRACT:
-                    semantic = _v2_semantics(claim, occurrence)
+                    semantic = _v2_semantics(
+                        claim,
+                        occurrence,
+                        trusted_verification=_sealed_trusted_v2_verification(session, snapshot, claim, occurrence),
+                    )
                     artifact_ids = {
                         str(evidence_map[link.evidence_id].get("source_artifact_id") or "")
                         for link in links
@@ -353,8 +359,7 @@ class PostgresKnowledgeBundleAuthority:
                             existing_artifact_ids={str(item.get("artifact_id") or "") for item in direct_evidence},
                         )
                     )
-                    items.append(
-                        {
+                    item = {
                             "knowledge_id": occurrence.occurrence_id,
                             "claim_id": claim.claim_id,
                             "occurrence_id": occurrence.occurrence_id,
@@ -390,8 +395,27 @@ class PostgresKnowledgeBundleAuthority:
                             "claim_schema_version": claim.claim_schema_version,
                             "grounding_status": claim.grounding_status,
                             "legacy_grounding_incomplete": claim.legacy_grounding_incomplete,
-                        }
-                    )
+                    }
+                    # A sealed v2 occurrence predating item-level visual
+                    # evidence has no decision to project.  Do not fabricate
+                    # an empty packet: the v2 schema correctly rejects it.
+                    visual_evidence = (occurrence.provenance or {}).get("visual_evidence")
+                    if visual_evidence:
+                        item["visual_evidence"] = dict(visual_evidence)
+                    for hierarchy_key in (
+                        "knowledge_title",
+                        "knowledge_role",
+                        "parent_knowledge_id",
+                        "parent_knowledge_title",
+                        "child_knowledge_ids",
+                        "thesis_evidence_scope",
+                    ):
+                        if hierarchy_key in semantic:
+                            item[hierarchy_key] = semantic[hierarchy_key]
+                    hierarchy_node_id = str(semantic.get("hierarchy_node_id") or "").strip()
+                    if hierarchy_node_id:
+                        hierarchy_nodes[hierarchy_node_id] = occurrence.occurrence_id
+                    items.append(item)
                     continue
                 items.append(
                     {
@@ -429,6 +453,7 @@ class PostgresKnowledgeBundleAuthority:
                         "legacy_grounding_incomplete": claim.legacy_grounding_incomplete,
                     }
                 )
+            _resolve_hierarchy_links(items, hierarchy_nodes)
             return {
                 "snapshot_available": snapshot_available,
                 "source_available_from": (
@@ -439,6 +464,33 @@ class PostgresKnowledgeBundleAuthority:
                 "source": source,
                 "items": items,
             }
+
+
+def _resolve_hierarchy_links(items: list[dict[str, Any]], hierarchy_nodes: Mapping[str, str]) -> None:
+    """Resolve internal thesis node IDs to public occurrence-backed IDs.
+
+    The extractor cannot know an occurrence ID before persistence.  Keeping
+    the internal node identifier out of the wire contract lets children be
+    attached early while Bundle publication still exposes real, dereferenceable
+    knowledge IDs.  Historical rows without a materialized parent retain their
+    existing metadata instead of being rewritten during read projection.
+    """
+
+    by_knowledge_id = {str(item.get("knowledge_id") or ""): item for item in items}
+    for item in items:
+        parent_node_id = str(item.get("parent_knowledge_id") or "").strip()
+        if parent_node_id in hierarchy_nodes:
+            item["parent_knowledge_id"] = hierarchy_nodes[parent_node_id]
+    children_by_parent: dict[str, list[str]] = {}
+    for item in items:
+        parent_id = str(item.get("parent_knowledge_id") or "").strip()
+        knowledge_id = str(item.get("knowledge_id") or "").strip()
+        if parent_id and knowledge_id and parent_id in by_knowledge_id:
+            children_by_parent.setdefault(parent_id, []).append(knowledge_id)
+    for knowledge_id in hierarchy_nodes.values():
+        parent = by_knowledge_id.get(knowledge_id)
+        if parent is not None and parent.get("knowledge_role") == "THESIS":
+            parent["child_knowledge_ids"] = sorted(set(children_by_parent.get(knowledge_id, ())))
 
 
 def _historical_projection(session, claim: FinancialClaimRow, request: KnowledgeBundleRequest) -> dict[str, Any] | None:
@@ -526,7 +578,12 @@ def _citation(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _v2_semantics(claim: FinancialClaimRow, occurrence: ClaimOccurrenceRow) -> dict[str, Any]:
+def _v2_semantics(
+    claim: FinancialClaimRow,
+    occurrence: ClaimOccurrenceRow,
+    *,
+    trusted_verification: TrustedExternalVerification | None = None,
+) -> dict[str, Any]:
     """Read explicit occurrence semantics from immutable JSON authority.
 
     The JSON columns are intentionally used for this additive projection: they
@@ -556,6 +613,68 @@ def _v2_semantics(claim: FinancialClaimRow, occurrence: ClaimOccurrenceRow) -> d
         statement=claim.normalized_statement or claim.predicate,
         claim_type=claim.claim_type,
         supplied={**semantic, "claim_nature": nature, "occurrence_review": review},
+        trusted_verification=trusted_verification,
+    )
+
+
+def _sealed_trusted_v2_verification(
+    session,
+    snapshot: ContentSnapshotRow,
+    claim: FinancialClaimRow,
+    occurrence: ClaimOccurrenceRow,
+) -> TrustedExternalVerification | None:
+    """Resolve the re-projection seam only through sealed snapshot authority.
+
+    A ``bundle_v2`` JSON key alone is untrusted model/extractor input.  The
+    marker becomes usable only when it names this snapshot's sealed
+    verification artifact, which has already passed the snapshot and artifact
+    integrity checks before projection.
+    """
+    semantic = dict(claim.payload or {}).get("bundle_v2") or {}
+    semantic = {**dict(semantic), **dict((occurrence.provenance or {}).get("bundle_v2") or {})}
+    trusted = dict(semantic.get("trusted_verification") or {})
+    trusted_artifact_id = str(trusted.get("verification_artifact_id") or "").strip()
+    trusted_claim_id = str(trusted.get("claim_id") or "").strip()
+    trusted_result_id = str(trusted.get("verification_id") or "").strip()
+    verification_id = str((snapshot.artifact_ids or {}).get("verification") or "")
+    if (
+        not trusted_artifact_id
+        or trusted_artifact_id != verification_id
+        or trusted_claim_id != claim.claim_id
+        or not trusted_result_id
+        or semantic.get("external_truth_status") != "EXTERNALLY_VERIFIED"
+    ):
+        return None
+    artifact = session.get(ContentArtifactRow, verification_id)
+    if artifact is None or artifact.artifact_type != "verification":
+        return None
+    results = list((artifact.payload or {}).get("results") or ())
+    verified_result = None
+    for result in results:
+        if (
+            not isinstance(result, dict)
+            or str(result.get("claim_id") or "") != claim.claim_id
+            or str(result.get("verification_id") or "") != trusted_result_id
+            # ``EXTERNALLY_VERIFIED`` is a Bundle truth label, never a
+            # VerificationResult terminal state.  Admission is deliberately
+            # limited to the domain's fully bound ``VERIFIED`` result.
+            or str(result.get("status") or "") != "VERIFIED"
+        ):
+            continue
+        try:
+            candidate = VerificationResult.model_validate(result)
+        except (TypeError, ValueError):
+            continue
+        if candidate.status == "VERIFIED" and candidate.claim_id == claim.claim_id:
+            verified_result = candidate
+            break
+    if verified_result is None:
+        return None
+    return TrustedExternalVerification(
+        verification_artifact_id=verification_id,
+        claim_id=claim.claim_id,
+        verification_id=trusted_result_id,
+        source_grade=str(semantic.get("source_grade") or "PRIMARY"),
     )
 
 

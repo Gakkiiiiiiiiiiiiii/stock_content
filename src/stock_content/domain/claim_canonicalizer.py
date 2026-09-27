@@ -88,6 +88,16 @@ class ClaimCanonicalizer:
         # published item is non-empty and proposition-only.
         source_statement = draft.normalized_statement or draft.conclusion
         statement = atomic_statement(source_statement) if source_statement else ""
+        semantic = (
+            bundle_v2_semantics(
+                statement=statement,
+                claim_type=draft.claim_type,
+                supplied=draft.bundle_v2,
+                temporal_expressions=[item.model_dump(mode="json") for item in draft.temporal_expressions],
+            )
+            if statement
+            else {}
+        )
         claim = FinancialClaim(
             claim_type=draft.claim_type,
             # Stage 2 may not promote an arbitrary knowledge_kind into the
@@ -121,16 +131,7 @@ class ClaimCanonicalizer:
             extractor_confidence=draft.extraction_confidence,
             claim_schema_version=draft.claim_schema_version,
             normalization_version=effective_normalization_version,
-            bundle_v2=(
-                bundle_v2_semantics(
-                    statement=statement,
-                    claim_type=draft.claim_type,
-                    supplied=draft.bundle_v2,
-                    temporal_expressions=[item.model_dump(mode="json") for item in draft.temporal_expressions],
-                )
-                if statement
-                else {}
-            ),
+            bundle_v2=semantic,
         )
         return claim
 

@@ -70,6 +70,9 @@ class KnowledgeProjectionBuilder:
                 "invalidation_evidence_refs": list(occurrence.invalidation_evidence_refs),
                 "bundle_v2": dict(occurrence.provenance.get("bundle_v2") or claim.bundle_v2),
             })
+            visual_evidence = (occurrence.provenance or {}).get("visual_evidence")
+            if visual_evidence:
+                payload["attributes"]["visual_evidence"] = dict(visual_evidence)
             payload["available_from"] = occurrence.times.available_from
         if verification is not None:
             payload["attributes"]["verification"] = (

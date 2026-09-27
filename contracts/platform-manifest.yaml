@@ -12,10 +12,13 @@ contracts:
     owner: content-platform
   - id: content-knowledge-bundle.v2
     schema: contracts/content-knowledge-bundle.v2.json
-    checksum: sha256:23C1D9C6BE131CBA8F270F01F7F45EB5D3148EE219EDF43D689F1C5707115800
+    checksum: sha256:A4F6A344C932B1C0D92BB97E2D4950021C38094C0AEA05EC8591F7DDF512BF5F
     producer: stock_content
     consumers: [stock_agent]
-    compatibility: additive
+    # v2 consumers use additionalProperties:false.  New producers emit
+    # item-level visual_evidence, so each consumer must adopt this revision;
+    # old sealed producer snapshots remain readable without that field.
+    compatibility: consumer-update-required
     formal_expected: false
     deprecated: false
     sunset: null
