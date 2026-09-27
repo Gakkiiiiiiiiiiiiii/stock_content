@@ -10,6 +10,7 @@ from stock_content.application.stages import (
     ClaimVisualBindingStage,
     KnowledgeDirectedFrameExtractionStage,
     _occurrence_visual_evidence,
+    _occurrence_visual_evidence_packet,
 )
 from stock_content.domain.artifacts import (
     FrameArtifact,
@@ -96,7 +97,7 @@ def test_targeted_frame_stage_materializes_traceable_frames_after_semantic_segme
     assert all(item.producer_stage == "knowledge_frame" for item in frames)
     assert all(item.semantic_segment_ids for item in frames)
     assert all(item.evidence_window_ids for item in frames)
-    assert all(item.planner_version == "knowledge-frame-plan.v1" for item in frames)
+    assert all(item.planner_version == "knowledge-frame-plan.v3" for item in frames)
     assert all(item.planner_request_id.startswith("kfr_") for item in frames)
     assert all(item.frame_id.startswith("frame_") for item in frames)
     assert all(item.storage_ref and Path(item.storage_ref).is_file() for item in frames)
@@ -182,8 +183,14 @@ def test_crosschecked_visual_evidence_is_bound_to_its_own_claim_window(tmp_path)
     ]
     context.state.claim_evidence_window_ids = {0: ("window-one",), 1: ("window-two",)}
     context.state.transcript_visual_crosschecks = [
-        {"frame_id": "frame-one", "relation": "SUPPORTS"},
-        {"frame_id": "frame-two", "relation": "SUPPORTS"},
+        {
+            "frame_id": "frame-one", "relation": "SUPPORTS",
+            "evidence_window_ids": ["window-one"], "semantic_segment_ids": [first.semantic_segment_id],
+        },
+        {
+            "frame_id": "frame-two", "relation": "SUPPORTS",
+            "evidence_window_ids": ["window-two"], "semantic_segment_ids": [second.semantic_segment_id],
+        },
     ]
     for frame_id, window_id, timestamp in (("frame-one", "window-one", 1_000), ("frame-two", "window-two", 5_000)):
         frame = FrameArtifact(
@@ -221,6 +228,43 @@ def test_crosschecked_visual_evidence_is_bound_to_its_own_claim_window(tmp_path)
     assert [anchor.frame_id for anchor in context.state.claim_drafts[1].visual_anchors] == ["frame-two"]
 
 
+def test_shared_frame_support_is_admitted_only_to_its_exact_occurrence_scope(tmp_path):
+    context = _context(tmp_path)
+    semantic_id = context.state.semantic_segments[0].semantic_segment_id
+    first = ClaimOccurrenceDraft(semantic_segment_id=semantic_id, knowledge_kind="CLAIM", claim_type="OPINION")
+    second = ClaimOccurrenceDraft(semantic_segment_id=semantic_id, knowledge_kind="CLAIM", claim_type="OPINION")
+    context.state.claim_drafts = [first, second]
+    context.state.claim_evidence_window_ids = {0: ("window-a",), 1: ("window-b",)}
+    frame = FrameArtifact(
+        artifact_id="shared-frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
+        frame_id="shared-frame", timestamp_ms=3_000, image_hash="image", storage_ref="fixture",
+        evidence_window_ids=("window-a", "window-b"),
+    )
+    context.artifacts.add("frames", frame)
+    context.artifacts.add(
+        "ocr",
+        OCRArtifact(
+            artifact_id="shared-ocr", artifact_type="ocr", frame_artifact_id=frame.artifact_id,
+            frame_id=frame.frame_id, timestamp_ms=3_000, image_hash="image",
+            evidence_window_ids=frame.evidence_window_ids, text="图中文字", bbox=[0, 0, 1, 1],
+            confidence_score=0.9, engine="paddle", engine_version="1",
+        ),
+    )
+    context.state.transcript_visual_crosschecks = [{
+        "frame_id": frame.frame_id, "relation": "SUPPORTS",
+        "evidence_window_ids": ["window-a"], "semantic_segment_ids": [semantic_id],
+    }]
+
+    ClaimVisualBindingStage().execute(context)
+
+    first, second = context.state.claim_drafts
+    assert [anchor.frame_id for anchor in first.visual_anchors] == [frame.frame_id]
+    assert second.visual_anchors == []
+    assert {item.source_type for item in _occurrence_visual_evidence(context, first, 0)} == {"FRAME", "OCR"}
+    assert _occurrence_visual_evidence(context, second, 1) == []
+    assert _occurrence_visual_evidence_packet(context, second, 1, knowledge_id="occurrence-b")["status"] == "GAP"
+
+
 @pytest.mark.parametrize(
     ("claim_nature", "source_label", "expected"),
     [
@@ -248,7 +292,10 @@ def test_displayed_secondary_page_binding_excludes_speaker_thesis_and_forecast(
     context.state.claim_drafts = [draft]
     context.state.claim_evidence_window_ids = {0: ("owned-window",)}
     context.state.transcript_visual_crosschecks = [
-        {"frame_id": "secondary-frame", "relation": "SUPPORTS_DISPLAYED_SECONDARY"}
+        {
+            "frame_id": "secondary-frame", "relation": "SUPPORTS_DISPLAYED_SECONDARY",
+            "evidence_window_ids": ["owned-window"], "semantic_segment_ids": [semantic.semantic_segment_id],
+        }
     ]
     frame = FrameArtifact(
         artifact_id="secondary-frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
@@ -281,8 +328,13 @@ def test_displayed_secondary_page_binding_excludes_speaker_thesis_and_forecast(
 
 def test_displayed_secondary_report_anchor_materializes_direct_frame_and_ocr_evidence(tmp_path):
     context = _context(tmp_path)
+    semantic_id = context.state.semantic_segments[0].semantic_segment_id
+    context.state.claim_evidence_window_ids = {0: ("owned-window",)}
     context.state.transcript_visual_crosschecks = [
-        {"frame_id": "secondary-frame", "relation": "SUPPORTS_DISPLAYED_SECONDARY"}
+        {
+            "frame_id": "secondary-frame", "relation": "SUPPORTS_DISPLAYED_SECONDARY",
+            "evidence_window_ids": ["owned-window"], "semantic_segment_ids": [semantic_id],
+        }
     ]
     frame = FrameArtifact(
         artifact_id="secondary-frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
@@ -300,7 +352,7 @@ def test_displayed_secondary_report_anchor_materializes_direct_frame_and_ocr_evi
         ),
     )
     draft = ClaimOccurrenceDraft(
-        semantic_segment_id=context.state.semantic_segments[0].semantic_segment_id,
+        semantic_segment_id=semantic_id,
         knowledge_kind="CLAIM",
         claim_type="OPINION",
         bundle_v2={
@@ -317,9 +369,98 @@ def test_displayed_secondary_report_anchor_materializes_direct_frame_and_ocr_evi
         ],
     )
 
-    evidence = _occurrence_visual_evidence(context, draft)
+    evidence = _occurrence_visual_evidence(context, draft, 0)
 
     assert {item.source_type for item in evidence} == {"FRAME", "OCR"}
+
+
+@pytest.mark.parametrize(
+    ("case", "relation", "with_modalities", "expected_reason"),
+    [
+        ("window_missing", None, False, "EVIDENCE_WINDOW_MISSING"),
+        ("frame_missing", None, False, "FRAME_MISSING"),
+        ("crosscheck_missing", None, True, "CROSSCHECK_MISSING"),
+        ("unknown", "UNKNOWN", True, "CROSSCHECK_UNKNOWN_OR_UNRELATED"),
+        ("unrelated", "UNRELATED", True, "CROSSCHECK_UNKNOWN_OR_UNRELATED"),
+        ("modalities_missing", "SUPPORTS", False, "OCR_AND_VISION_MISSING"),
+        ("ordinary_displayed_secondary", "SUPPORTS_DISPLAYED_SECONDARY", True, "DISPLAYED_SECONDARY_NOT_ATTRIBUTED"),
+    ],
+)
+def test_item_visual_packet_fails_closed_for_every_missing_or_unadmitted_link(
+    tmp_path, case, relation, with_modalities, expected_reason
+):
+    context = _context(tmp_path)
+    draft = ClaimOccurrenceDraft(
+        semantic_segment_id=context.state.semantic_segments[0].semantic_segment_id,
+        knowledge_kind="CLAIM", claim_type="OPINION",
+    )
+    if case != "window_missing":
+        context.state.claim_evidence_window_ids = {0: ("window-1",)}
+    if case not in {"window_missing", "frame_missing"}:
+        frame = FrameArtifact(
+            artifact_id="frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
+            frame_id="frame-1", timestamp_ms=3_000, image_hash="image", storage_ref="fixture",
+            evidence_window_ids=("window-1",),
+        )
+        context.artifacts.add("frames", frame)
+        if relation is not None:
+            context.state.transcript_visual_crosschecks = [{
+                "frame_id": frame.frame_id,
+                "relation": relation,
+                "evidence_window_ids": ["window-1"],
+                "semantic_segment_ids": [draft.semantic_segment_id],
+            }]
+        if with_modalities:
+            context.artifacts.add(
+                "ocr",
+                OCRArtifact(
+                    artifact_id="ocr-artifact", artifact_type="ocr", frame_artifact_id=frame.artifact_id,
+                    frame_id=frame.frame_id, timestamp_ms=3_000, image_hash="image",
+                    evidence_window_ids=("window-1",), text="图中文字", bbox=[0, 0, 1, 1],
+                    confidence_score=0.9, engine="paddle", engine_version="1",
+                ),
+            )
+
+    packet = _occurrence_visual_evidence_packet(context, draft, 0, knowledge_id="occurrence-1")
+
+    assert packet["status"] == "GAP"
+    assert packet["reason"] == expected_reason
+    if packet["windows"]:
+        assert packet["windows"][0]["reason"] == expected_reason
+
+
+def test_item_visual_packet_scopes_a_shared_frame_to_its_own_window(tmp_path):
+    context = _context(tmp_path)
+    semantic_id = context.state.semantic_segments[0].semantic_segment_id
+    first = ClaimOccurrenceDraft(semantic_segment_id=semantic_id, knowledge_kind="CLAIM", claim_type="OPINION")
+    second = ClaimOccurrenceDraft(semantic_segment_id=semantic_id, knowledge_kind="CLAIM", claim_type="OPINION")
+    context.state.claim_evidence_window_ids = {0: ("window-supported",), 1: ("window-other",)}
+    frame = FrameArtifact(
+        artifact_id="shared-frame-artifact", artifact_type="frame", media_artifact_id="media-targeted",
+        frame_id="shared-frame", timestamp_ms=3_000, image_hash="image", storage_ref="fixture",
+        evidence_window_ids=("window-supported", "window-other"),
+    )
+    context.artifacts.add("frames", frame)
+    context.artifacts.add(
+        "ocr",
+        OCRArtifact(
+            artifact_id="shared-ocr", artifact_type="ocr", frame_artifact_id=frame.artifact_id,
+            frame_id=frame.frame_id, timestamp_ms=3_000, image_hash="image",
+            evidence_window_ids=frame.evidence_window_ids, text="图中文字", bbox=[0, 0, 1, 1],
+            confidence_score=0.9, engine="paddle", engine_version="1",
+        ),
+    )
+    context.state.transcript_visual_crosschecks = [{
+        "frame_id": frame.frame_id, "relation": "SUPPORTS",
+        "evidence_window_ids": ["window-supported"], "semantic_segment_ids": [semantic_id],
+    }]
+
+    supported = _occurrence_visual_evidence_packet(context, first, 0, knowledge_id="occurrence-supported")
+    other = _occurrence_visual_evidence_packet(context, second, 1, knowledge_id="occurrence-other")
+
+    assert supported["status"] == "AVAILABLE"
+    assert other["status"] == "GAP"
+    assert other["reason"] == "CROSSCHECK_SCOPE_AMBIGUOUS"
 
 
 def test_targeted_stage_fails_closed_for_live_media_without_semantic_windows(tmp_path):

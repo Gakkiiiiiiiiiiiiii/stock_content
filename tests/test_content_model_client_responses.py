@@ -36,8 +36,14 @@ def test_responses_api_uses_text_format_and_runtime_model(monkeypatch):
 
     assert captured["url"] == "https://example.test/v1/responses"
     assert captured["json"] == {
-        "model": "gpt-6-sol", "instructions": "Return JSON", "input": "Locate topic changes",
-        "store": False, "text": {"format": {"type": "json_object"}},
+        "model": "gpt-6-sol",
+        "input": [
+            {"role": "system", "content": "Return JSON"},
+            {"role": "user", "content": "Locate topic changes"},
+        ],
+        "reasoning": {"effort": "medium"},
+        "store": False,
+        "text": {"format": {"type": "json_object"}},
     }
     assert result["content"] == '{"boundaries":[]}'
     assert result["model"] == "gpt-6-sol"

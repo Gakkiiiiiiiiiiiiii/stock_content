@@ -5,6 +5,10 @@ services:
       dockerfile: docker/Dockerfile.migration
     environment:
       CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
+    command: ["sh", "-ec", "chown 10001:10001 /data /var/run/stock-content && exec stock-content-migrate"]
+    volumes:
+      - content-raw-storage:/data
+      - content-worker-state:/var/run/stock-content
     depends_on:
       postgres:
         condition: service_healthy
@@ -21,6 +25,7 @@ services:
       CONTENT_QDRANT_URL: http://qdrant:6333
       CONTENT_QDRANT_COLLECTION: knowledge_v3
       CONTENT_SERVICE_API_KEY_FILE: /run/secrets/content-service-api-key
+      CONTENT_RAW_STORAGE_DIR: /data
       # This is read-only in the API container and written only by the video
       # worker after a real GPU OCR probe.
       CONTENT_VIDEO_WORKER_HEARTBEAT_FILE: /var/run/stock-content/video-worker-heartbeat.json
@@ -36,6 +41,7 @@ services:
       - content-service-api-key
     volumes:
       - content-worker-state:/var/run/stock-content:ro
+      - content-raw-storage:/data:ro
     ports:
       - "8100:8100"
     depends_on:
@@ -76,13 +82,24 @@ services:
     env_file:
       - path: .env
         required: false
-    command: ["stock-content-worker"]
+    command:
+      - sh
+      - -ec
+      - >-
+        mkdir -p /data/raw /data/frames
+        && /usr/local/bin/python -c 'import tempfile;
+        tempfile.TemporaryFile(dir="/work").close();
+        tempfile.TemporaryFile(dir="/data/raw").close();
+        tempfile.TemporaryFile(dir="/data/frames").close()'
+        && exec stock-content-worker
     environment:
       CONTENT_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/stock_content
       CONTENT_QDRANT_URL: http://qdrant:6333
       CONTENT_QDRANT_COLLECTION: knowledge_v3
       CONTENT_WORKER_PROFILE: video
       CONTENT_WORKER_QUEUE: video_pipeline
+      TMPDIR: /work
+      CONTENT_RAW_STORAGE_DIR: /data
       CONTENT_VIDEO_WORKER_HEARTBEAT_FILE: /var/run/stock-content/video-worker-heartbeat.json
       # OCR is a local subprocess in the video worker, but executes only
       # /opt/ocr Python. It must fail closed if the NVIDIA device is absent.
@@ -105,6 +122,7 @@ services:
     volumes:
       - content-worker-state:/var/run/stock-content
       - content-ocr-cache:/var/cache/stock-content/ocr
+      - content-raw-storage:/data
     secrets:
       - xiaoe-storage-state
       - bilibili-cookiefile
@@ -114,7 +132,6 @@ services:
     read_only: true
     tmpfs:
       - /work:uid=10001,gid=10001,mode=700
-      - /data:uid=10001,gid=10001,mode=700
     deploy:
       resources:
         limits:
@@ -237,6 +254,7 @@ volumes:
   content-qdrant:
   content-worker-state:
   content-ocr-cache:
+  content-raw-storage:
 
 secrets:
   content-service-api-key:

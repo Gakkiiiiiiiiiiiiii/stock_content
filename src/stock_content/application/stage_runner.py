@@ -228,6 +228,7 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
         "knowledge_evidence_window_planner",
         "knowledge_frame_planner",
         "transcript_visual_crosscheck",
+        "security_entity_alignment",
         "ocr_engine",
         "ocr_engine_version",
         "ocr_requested_device",
@@ -244,6 +245,7 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "knowledge_evidence_window_planner": config.get("knowledge_evidence_window_planner_version") or "",
             "knowledge_frame_planner": config.get("knowledge_frame_planner_version") or "",
             "transcript_visual_crosscheck": config.get("transcript_visual_crosscheck_version") or "",
+            "security_entity_alignment": config.get("security_entity_alignment_version") or "",
             "ocr_engine": config.get("ocr_engine") or context.options.get("ocr_model") or "",
             "ocr_engine_version": config.get("ocr_engine_version") or context.options.get("ocr_model_version") or "",
             "ocr_requested_device": config.get("ocr_device") or "",
@@ -268,6 +270,7 @@ def _checkpoint_identity(context: PipelineContext) -> dict[str, Any]:
             "extraction": (
                 context.options.get("atomic_claim_prompt_version") or config.get("extraction_prompt_version")
             ),
+            "chapter_thesis": config.get("chapter_thesis_prompt_version"),
             "vision": context.options.get("vision_prompt_version") or config.get("vision_prompt_version"),
             "vision_adapter": config.get("vision_adapter_version"),
         }.items()

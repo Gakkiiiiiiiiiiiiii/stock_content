@@ -60,6 +60,7 @@ _VISUAL_CHECKPOINT_STAGES = frozenset(
         "ocr",
         "vision",
         "transcript_visual_crosscheck",
+        "security_entity_alignment",
         "multimodal_context",
         "temporal_window",
         "semantic_context",
@@ -70,6 +71,7 @@ _VISUAL_MODEL_IDENTITY_KEYS = frozenset(
         "knowledge_evidence_window_planner",
         "knowledge_frame_planner",
         "transcript_visual_crosscheck",
+        "security_entity_alignment",
         "ocr_engine",
         "ocr_engine_version",
         "ocr_requested_device",
@@ -84,6 +86,7 @@ _OCR_RUNTIME_BOUND_STAGES = frozenset(
         "ocr",
         "vision",
         "transcript_visual_crosscheck",
+        "security_entity_alignment",
         "claim_visual_binding",
         "multimodal_context",
         "temporal_window",
@@ -637,6 +640,7 @@ class ContentApplication:
             "ocr",
             "vision",
             "transcript_visual_crosscheck",
+            "security_entity_alignment",
         }
         prefix: list[Any] = []
         for record in records:
@@ -671,6 +675,7 @@ class ContentApplication:
                     "knowledge",
                     "summary",
                     "transcript_visual_crosscheck",
+                    "security_entity_alignment",
                 }:
                     context.artifacts.set(slot, artifact)
         self._restore_typed_prefix(context, persisted)
@@ -786,6 +791,12 @@ class ContentApplication:
                     text=item.text,
                     confidence=item.confidence,
                     speaker_id=item.speaker_id or "UNKNOWN",
+                    raw_text=item.raw_text,
+                    normalized_text=item.normalized_text,
+                    source=item.source,
+                    source_artifact_id=item.source_artifact_id,
+                    alignment_status=item.alignment_status,
+                    correction_records=list(item.correction_records),
                 )
                 for item in transcript.segments
             ]
@@ -852,6 +863,12 @@ class ContentApplication:
             context.state.eligible_frame_insights = [
                 item for item in context.state.frame_insights if str(item.get("frame_id") or "") in eligible
             ]
+        alignment = context.artifacts.security_entity_alignment
+        if alignment is not None:
+            context.state.security_mentions = list(alignment.to_dict().get("security_mentions") or ())
+            context.state.displayed_target_candidates = list(
+                alignment.to_dict().get("displayed_target_candidates") or ()
+            )
         context.state.evidence = list(getattr(context.artifacts.evidence, "evidences", ()) or ())
         if context.artifacts.semantic_segments:
             context.state.semantic_segments = list(context.artifacts.semantic_segments.segments or ())

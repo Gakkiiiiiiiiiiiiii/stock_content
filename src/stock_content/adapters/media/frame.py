@@ -98,7 +98,11 @@ class FfmpegFrameExtractor:
         """
         frame_dir = output_dir / "knowledge_frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
-        known_hashes = set(existing_image_hashes or ())
+        # Byte-identical frames share their durable content-addressed object
+        # later in the pipeline, but every planner request still needs a
+        # materialised relation to its own evidence window.  Do not collapse
+        # these result records by image hash here.
+        del existing_image_hashes
         frames: list[dict] = []
         ordered = sorted(
             requests,
@@ -130,11 +134,6 @@ class FfmpegFrameExtractor:
                 capture_output=True,
             )
             digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            if digest in known_hashes:
-                # One image byte sequence is enough evidence.  Skipping its
-                # duplicate prevents non-deterministic frame multiplication.
-                continue
-            known_hashes.add(digest)
             frames.append(
                 {
                     "timestamp_ms": timestamp_ms,

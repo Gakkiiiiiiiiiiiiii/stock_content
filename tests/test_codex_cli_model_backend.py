@@ -72,6 +72,7 @@ def test_codex_vision_uses_same_model_and_validates_frame(monkeypatch, tmp_path)
                 "content": json.dumps({
                     "visual_summary": "图上出现公司名称",
                     "labels": ["chart"], "themes": ["earnings"], "symbols": ["600519"],
+                    "observed_entities": ["公司"], "observed_tickers": ["600519"],
                     "confidence_score": 0.8, "narration_aligned": True,
                 }),
                 "model_identity_source": "accepted_codex_cli_invocation_not_response_metadata",
@@ -82,6 +83,7 @@ def test_codex_vision_uses_same_model_and_validates_frame(monkeypatch, tmp_path)
     assert "公司盈利增长" in observed["prompt"]
     assert result["model"] == "gpt-6-sol"
     assert result["symbols"] == ["600519"]
+    assert result["observed_tickers"] == ["600519"]
 
 
 def test_codex_mode_defaults_all_interpretation_models_to_sol(monkeypatch):

@@ -85,11 +85,17 @@ class PipelineState:
     ocr_evidence: list[dict[str, Any]] = field(default_factory=list)
     # Internal audit records only.  These do not change transcript or Bundle.
     transcript_visual_crosschecks: list[dict[str, Any]] = field(default_factory=list)
+    security_mentions: list[dict[str, Any]] = field(default_factory=list)
+    displayed_target_candidates: list[dict[str, Any]] = field(default_factory=list)
     eligible_frame_insights: list[dict[str, Any]] = field(default_factory=list)
     multimodal_context: dict[str, Any] = field(default_factory=dict)
     temporal_windows: list[dict[str, Any]] = field(default_factory=list)
     semantic_segments: list[Any] = field(default_factory=list)
     semantic_contexts: list[Any] = field(default_factory=list)
+    # Chapter-level theses are identified before atomic claims so downstream
+    # extraction can attach mechanisms/evidence/implications to one parent.
+    chapter_theses: list[Any] = field(default_factory=list)
+    knowledge_hierarchy: list[dict[str, Any]] = field(default_factory=list)
     claim_drafts: list[Any] = field(default_factory=list)
     grounded_occurrences: list[Any] = field(default_factory=list)
     temporal_bindings: list[Any] = field(default_factory=list)

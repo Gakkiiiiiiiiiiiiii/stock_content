@@ -1,6 +1,7 @@
 .git
 .github
 .codex
+.codex-runs/
 .pytest*
 .test-*
 .tmp*

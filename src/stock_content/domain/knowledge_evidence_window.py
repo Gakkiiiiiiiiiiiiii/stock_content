@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from .artifacts import TranscriptArtifact, canonical_json
 from .semantic_segment import SemanticSegment
 
-KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION = "knowledge-evidence-window.v1"
+KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION = "knowledge-evidence-window.v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +30,7 @@ class HighSignal:
     kind: str
     reason: str
     transcript_segment_ids: tuple[str, ...]
+    anchor_ms: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,11 +43,15 @@ class KnowledgeEvidenceWindow:
     center_ms: int
     transcript_segment_ids: tuple[str, ...]
     high_signals: tuple[HighSignal, ...]
+    transcript_anchor_ms: tuple[int, ...] = ()
     planner_version: str = KNOWLEDGE_EVIDENCE_WINDOW_PLANNER_VERSION
     # A semantic segment can contain several unrelated atomic propositions.
     # This opaque, deterministic identity keeps their visual plans distinct
     # without putting source text into a frame request.
     knowledge_identity: str = ""
+    # A chapter THESIS owns the full rhetorical arc as transcript evidence,
+    # but must not turn every transcript row in that arc into a screenshot.
+    sampling_strategy: str = "ATOMIC"
 
 
 _SIGNAL_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
@@ -71,6 +76,7 @@ _SIGNAL_PATTERNS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("INDUSTRY", "industry_or_sector_cue", re.compile(r"(?:行业|板块|赛道|产业链|金融|算力|半导体|银行业)")),
     ("CHART", "chart_or_price_action_cue", re.compile(r"(?:K线|走势图|曲线|图表|成交量|均线|支撑位|压力位)")),
     ("POLICY_DOCUMENT", "policy_document_cue", re.compile(r"(?:政策|文件|通知|公告|规划|条例|意见|增资|降准)")),
+    ("TARGET_CUE", "displayed_target_cue", re.compile(r"(?:关注|關注|上游|设备|設備|弹性|彈性)")),
 )
 
 
@@ -142,6 +148,7 @@ class KnowledgeEvidenceWindowPlanner:
                     end_ms=end_ms,
                     center_ms=center_ms,
                     transcript_segment_ids=tuple(item.segment_id for item in selected),
+                    transcript_anchor_ms=tuple((item.start_ms + item.end_ms) // 2 for item in selected),
                     high_signals=self._signals(selected),
                     planner_version=self._planner_version,
                 )
@@ -173,16 +180,43 @@ class KnowledgeEvidenceWindowPlanner:
         seen: set[str] = set()
         for draft in claim_drafts:
             semantic_id = str(getattr(draft, "semantic_segment_id", "") or "")
-            indices = tuple(
-                sorted(
-                    {int(value) for value in getattr(draft, "evidence_segment_indices", ()) if int(value) in by_index}
-                )
-            )
+            indices = evidence_segment_indices_for_draft(draft, set(by_index))
             if not semantic_id or not indices:
                 # An atomic draft without transcript coordinates is never a
                 # visual-planning authority; later grounding will reject it.
                 continue
             selected = tuple(by_index[index] for index in indices)
+            bundle = getattr(draft, "bundle_v2", {}) or {}
+            thesis_scope = bundle.get("thesis_evidence_scope") if isinstance(bundle, dict) else None
+            is_thesis = (
+                isinstance(bundle, dict)
+                and str(bundle.get("knowledge_role") or "").upper() == "THESIS"
+                and isinstance(thesis_scope, dict)
+            )
+            phase_anchors: tuple[int, ...] = ()
+            if is_thesis:
+                phase_indices: list[tuple[int, ...]] = []
+                for name in (
+                    "proposal_segment_indices",
+                    "argument_segment_indices",
+                    "conclusion_segment_indices",
+                ):
+                    values = tuple(
+                        sorted(
+                            {
+                                int(value)
+                                for value in thesis_scope.get(name) or ()
+                                if int(value) in by_index and int(value) in indices
+                            }
+                        )
+                    )
+                    if not values:
+                        raise ValueError("thesis visual planning requires all three rhetorical phases")
+                    phase_indices.append(values)
+                phase_anchors = tuple(
+                    (by_index[values[len(values) // 2]].start_ms + by_index[values[len(values) // 2]].end_ms) // 2
+                    for values in phase_indices
+                )
             identity_payload = {
                 "semantic_segment_id": semantic_id,
                 "evidence_segment_indices": indices,
@@ -205,9 +239,17 @@ class KnowledgeEvidenceWindowPlanner:
                     end_ms=self._clamp(spoken_end + self._padding_ms, duration_ms),
                     center_ms=self._clamp((spoken_start + spoken_end) // 2, duration_ms),
                     transcript_segment_ids=tuple(item.segment_id for item in selected),
-                    high_signals=self._signals(selected),
+                    transcript_anchor_ms=(
+                        phase_anchors
+                        if is_thesis
+                        else tuple((item.start_ms + item.end_ms) // 2 for item in selected)
+                    ),
+                    # Child EVIDENCE records retain dense numeric/chart
+                    # checks.  A thesis itself gets one frame per phase.
+                    high_signals=() if is_thesis else self._signals(selected),
                     planner_version=self._planner_version,
                     knowledge_identity=knowledge_identity,
+                    sampling_strategy="THESIS_PHASES" if is_thesis else "ATOMIC",
                 )
             )
         return tuple(sorted(output, key=lambda item: (item.start_ms, item.end_ms, item.knowledge_identity)))
@@ -220,14 +262,50 @@ class KnowledgeEvidenceWindowPlanner:
     def _signals(transcript_segments: tuple[object, ...]) -> tuple[HighSignal, ...]:
         signals: list[HighSignal] = []
         for kind, reason, pattern in _SIGNAL_PATTERNS:
-            ids = tuple(
-                item.segment_id
-                for item in transcript_segments
+            matched = tuple(
+                item for item in transcript_segments
                 if pattern.search(item.text or item.normalized_text or item.raw_text or "")
             )
+            ids = tuple(item.segment_id for item in matched)
             if ids:
-                signals.append(HighSignal(kind=kind, reason=reason, transcript_segment_ids=ids))
+                signals.append(
+                    HighSignal(
+                        kind=kind,
+                        reason=reason,
+                        transcript_segment_ids=ids,
+                        anchor_ms=tuple((item.start_ms + item.end_ms) // 2 for item in matched),
+                    )
+                )
         return tuple(signals)
+
+
+def evidence_segment_indices_for_draft(draft: Any, available_indices: set[int]) -> tuple[int, ...]:
+    """Return the visual-planning span, expanding an atomic citation to its thesis arc."""
+
+    atomic = tuple(
+        sorted(
+            {
+                int(value)
+                for value in getattr(draft, "evidence_segment_indices", ())
+                if int(value) in available_indices
+            }
+        )
+    )
+    bundle = getattr(draft, "bundle_v2", {}) or {}
+    if not isinstance(bundle, dict) or str(bundle.get("knowledge_role") or "").upper() != "THESIS":
+        return atomic
+    scope = bundle.get("thesis_evidence_scope") if isinstance(bundle, dict) else None
+    if not isinstance(scope, dict):
+        return atomic
+    try:
+        start = int(scope["start_segment_index"])
+        end = int(scope["end_segment_index"])
+    except (KeyError, TypeError, ValueError):
+        return atomic
+    if end < start:
+        return atomic
+    expanded = tuple(index for index in sorted(available_indices) if start <= index <= end)
+    return expanded or atomic
 
 
 __all__ = [
@@ -235,4 +313,5 @@ __all__ = [
     "HighSignal",
     "KnowledgeEvidenceWindow",
     "KnowledgeEvidenceWindowPlanner",
+    "evidence_segment_indices_for_draft",
 ]

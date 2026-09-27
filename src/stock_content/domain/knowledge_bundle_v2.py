@@ -13,6 +13,8 @@ from typing import Any
 
 from .knowledge_bundle import canonical_json
 from .knowledge_enums import support_rank
+from .knowledge_hierarchy import KNOWLEDGE_ROLES
+from .knowledge_semantics import atomic_statement, starts_with_detail_source_framing
 
 PRIMARY_DOMAINS = frozenset(
     {
@@ -28,16 +30,7 @@ ATTRIBUTED_NATURES = frozenset({"OPINION", "FORECAST", "CAUSAL_THESIS"})
 SOURCE_GRADES = frozenset({"PRIMARY", "SECONDARY", "SOURCE_ASSERTION", "UNKNOWN"})
 EXTERNAL_TRUTH_STATUSES = frozenset({"NOT_CHECKED", "NOT_FOUND", "EXTERNALLY_VERIFIED", "EXTERNAL_CONFLICT"})
 REVIEW_REQUIRED = "HUMAN_REVIEW_REQUIRED"
-_COURSE_PREFIX = re.compile(r"^(?:(?:本)?课程|视频)(?:提出|设置|建议|强调|认为|指出)[：:，,、\s]*")
 _NUMBER = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?(?:\s*[%％]|\s*(?:万亿|亿|万|日|月|年|bps|倍|EFLOPS))?")
-
-
-def atomic_statement(value: Any) -> str:
-    """Remove presentation framing, without removing source attribution data."""
-    statement = _COURSE_PREFIX.sub("", str(value or "").strip())
-    if not statement:
-        raise ValueError("EMPTY_ATOMIC_STATEMENT")
-    return statement
 
 
 def is_numeric_claim(item: Mapping[str, Any]) -> bool:
@@ -121,6 +114,8 @@ def validate_v2_item(raw: Mapping[str, Any], *, minimum_support_status: str) -> 
         raise ValueError("INVALID_SOURCE_GRADE")
     if item.get("external_truth_status") not in EXTERNAL_TRUTH_STATUSES:
         raise ValueError("INVALID_EXTERNAL_TRUTH_STATUS")
+    if "visual_evidence" in item:
+        _validate_visual_evidence(item["visual_evidence"], knowledge_id=str(item["knowledge_id"]))
     if item["source_grade"] in {"SECONDARY", "UNKNOWN"} and not attribution["attributed"]:
         raise ValueError("UNVERIFIED_EXTERNAL_FACT_MUST_BE_ATTRIBUTED")
     detail = item["detail"]
@@ -134,6 +129,16 @@ def validate_v2_item(raw: Mapping[str, Any], *, minimum_support_status: str) -> 
     # closed until the producer supplies at least one substantive detail.
     if all(atomic_statement(value) == item["statement"] for value in detail_values):
         raise ValueError("NONTRIVIAL_KNOWLEDGE_DETAIL_REQUIRED")
+    if any(starts_with_detail_source_framing(value) for value in detail_values):
+        raise ValueError("SOURCE_FRAMING_IN_KNOWLEDGE_DETAIL")
+    role = item.get("knowledge_role")
+    if role is not None and role not in KNOWLEDGE_ROLES:
+        raise ValueError("INVALID_KNOWLEDGE_ROLE")
+    parent_id = str(item.get("parent_knowledge_id") or "").strip()
+    if role in KNOWLEDGE_ROLES - {"THESIS"} and not parent_id:
+        raise ValueError("PARENT_KNOWLEDGE_REQUIRED")
+    if role == "THESIS" and parent_id:
+        raise ValueError("THESIS_CANNOT_HAVE_PARENT")
     temporal = item["temporal"]
     if not isinstance(temporal, Mapping) or temporal.get("kind") not in {
         "EVENT", "AS_OF", "FORECAST_TARGET", "RECURRING_RULE", "UNKNOWN"
@@ -208,6 +213,64 @@ def _validate_evidence(entry: Any) -> None:
             or not str(model.get("version") or "").strip()
         ):
             raise ValueError("EVIDENCE_MODEL_IDENTITY_REQUIRED")
+
+
+def _validate_visual_evidence(packet: Any, *, knowledge_id: str) -> None:
+    """Validate the additive item packet while accepting old sealed rows.
+
+    New producer rows always carry this packet.  Its absence is only a legacy
+    read compatibility case and is never reconstructed from root entities.
+    """
+    if not isinstance(packet, Mapping):
+        raise ValueError("INVALID_VISUAL_EVIDENCE_PACKET")
+    if packet.get("knowledge_id") != knowledge_id or packet.get("occurrence_id") != knowledge_id:
+        raise ValueError("VISUAL_EVIDENCE_IDENTITY_MISMATCH")
+    status = packet.get("status")
+    windows = packet.get("windows")
+    if status not in {"AVAILABLE", "GAP", REVIEW_REQUIRED} or not isinstance(windows, list):
+        raise ValueError("INVALID_VISUAL_EVIDENCE_PACKET")
+    if status == "AVAILABLE" and not windows:
+        raise ValueError("VISUAL_EVIDENCE_AVAILABLE_WITHOUT_WINDOW")
+    allowed_relations = {"SUPPORTS", "SUPPORTS_DISPLAYED_SECONDARY", "CONTRADICTS", "UNKNOWN", "UNRELATED"}
+    statuses: list[str] = []
+    for window in windows:
+        if not isinstance(window, Mapping) or not str(window.get("evidence_window_id") or "").strip():
+            raise ValueError("INVALID_VISUAL_EVIDENCE_WINDOW")
+        window_status = window.get("status")
+        frames = window.get("frames")
+        if window_status not in {"AVAILABLE", "GAP", REVIEW_REQUIRED} or not isinstance(frames, list):
+            raise ValueError("INVALID_VISUAL_EVIDENCE_WINDOW")
+        statuses.append(str(window_status))
+        for frame in frames:
+            required = {
+                "frame_id", "frame_artifact_id", "frame_artifact_hash", "timestamp_ms",
+                "image_hash", "relation", "ocr", "vision",
+            }
+            if not isinstance(frame, Mapping) or required - set(frame):
+                raise ValueError("INCOMPLETE_VISUAL_EVIDENCE_FRAME")
+            if frame.get("relation") not in allowed_relations or not isinstance(frame.get("timestamp_ms"), int):
+                raise ValueError("INVALID_VISUAL_EVIDENCE_FRAME")
+            if not all(
+                str(frame.get(key) or "").strip()
+                for key in ("frame_id", "frame_artifact_id", "frame_artifact_hash", "image_hash")
+            ):
+                raise ValueError("INVALID_VISUAL_EVIDENCE_FRAME")
+            if not str(frame["frame_artifact_hash"]).startswith("sha256:"):
+                raise ValueError("INVALID_VISUAL_EVIDENCE_FRAME")
+            for modality in ("ocr", "vision"):
+                items = frame[modality]
+                if not isinstance(items, list):
+                    raise ValueError("INVALID_VISUAL_EVIDENCE_FRAME")
+                for item in items:
+                    model = item.get("model") if isinstance(item, Mapping) else None
+                    if not isinstance(item, Mapping) or not isinstance(model, Mapping) or not all(
+                        str(item.get(key) or "").strip() for key in ("artifact_id", "artifact_hash", "summary")
+                    ) or not all(str(model.get(key) or "").strip() for key in ("name", "version")):
+                        raise ValueError("INVALID_VISUAL_EVIDENCE_SUMMARY")
+    if status == "AVAILABLE" and (not statuses or any(value != "AVAILABLE" for value in statuses)):
+        raise ValueError("VISUAL_EVIDENCE_STATUS_MISMATCH")
+    if status == REVIEW_REQUIRED and REVIEW_REQUIRED not in statuses:
+        raise ValueError("VISUAL_EVIDENCE_STATUS_MISMATCH")
 
 
 def conservative_quality(

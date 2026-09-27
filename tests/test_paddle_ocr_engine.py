@@ -250,12 +250,21 @@ def test_worker_environment_uses_explicit_ocr_cache_without_profile_or_credentia
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     monkeypatch.setenv("CONTENT_OCR_CACHE_HOME", str(tmp_path / "isolated-cache"))
     monkeypatch.setenv("CONTENT_XIAOE_COOKIE", "must-not-cross-boundary")
+    monkeypatch.setenv("HF_HOME", "host-hf-cache")
+    monkeypatch.setenv("XDG_CACHE_HOME", "host-xdg-cache")
 
     environment = _ocr_worker_environment("C:/ocr/python.exe", "gpu:0", True)
 
     assert environment["PADDLE_PDX_CACHE_HOME"] == str(tmp_path / "isolated-cache")
     assert environment["MODELSCOPE_CACHE"] == str(tmp_path / "isolated-cache" / "modelscope")
-    assert environment["HOME"] == str(tmp_path)
-    assert environment["USERPROFILE"] == str(tmp_path)
+    expected_home = tmp_path if os.name == "nt" else tmp_path / "isolated-cache"
+    assert environment["HOME"] == str(expected_home)
+    assert environment["USERPROFILE"] == str(expected_home)
+    assert environment["XDG_CACHE_HOME"] == str(tmp_path / "isolated-cache" / ".cache")
+    assert environment["HF_HOME"] == str(tmp_path / "isolated-cache" / "huggingface")
+    assert environment["HF_HUB_CACHE"] == str(tmp_path / "isolated-cache" / "huggingface" / "hub")
+    assert environment["HF_XET_CACHE"] == str(tmp_path / "isolated-cache" / "huggingface" / "xet")
+    assert "host-hf-cache" not in json.dumps(environment)
+    assert "host-xdg-cache" not in json.dumps(environment)
     assert "CONTENT_XIAOE_COOKIE" not in environment
     assert os.environ["CONTENT_XIAOE_COOKIE"] not in json.dumps(environment)

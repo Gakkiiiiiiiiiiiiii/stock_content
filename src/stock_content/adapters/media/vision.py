@@ -4,8 +4,10 @@ import base64
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -35,6 +37,13 @@ def _string_list(value: Any, field: str, *, required: bool = False) -> list[str]
     return list(value)
 
 
+def _ticker_list(value: Any) -> list[str]:
+    tickers = _string_list(value, "observed_tickers")
+    if any(not re.fullmatch(r"\d{6}", item) for item in tickers):
+        raise ValueError("vision observed_tickers must contain six-digit tickers")
+    return tickers
+
+
 class HttpVisionAnalyzer:
     """Strict OpenAI-compatible visual context adapter.
 
@@ -57,38 +66,70 @@ class HttpVisionAnalyzer:
     def analyze(self, frame_path: str, transcript_context: str) -> dict:
         if not self._url or not self._model:
             raise RuntimeError("CONTENT_VISION_URL and CONTENT_VISION_MODEL are required for vision analysis")
+        responses_api = urlparse(self._url).path.rstrip("/").endswith("/responses")
+        if self._model == "gpt-6-sol" and not responses_api:
+            raise RuntimeError("gpt-6-sol vision requires a Responses API endpoint")
         image = base64.b64encode(Path(frame_path).read_bytes()).decode("ascii")
         headers = {"Authorization": f"Bearer {self._key}"} if self._key else {}
         prompt = (
             "分析金融视频帧，只输出 JSON 对象，严格包含："
             "visual_summary(非空字符串),labels(至少一个非空标签),themes(字符串数组),"
-            "symbols(字符串数组),confidence_score(0到1有限数字),narration_aligned(布尔值)。"
+            "symbols(字符串数组),observed_entities(字符串数组),observed_tickers(六码股票代码字符串数组),"
+            "confidence_score(0到1有限数字),narration_aligned(布尔值)。"
             "只描述画面，不得创造金融事实。口播上下文：" + transcript_context[:3000]
         )
-        body = {
-            "model": self._model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image}},
-                    ],
-                }
-            ],
-            "response_format": {"type": "json_object"},
-        }
+        if responses_api:
+            body = {
+                "model": self._model,
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64," + image},
+                ]}],
+                "reasoning": {"effort": os.getenv("CONTENT_VISION_REASONING_EFFORT", "medium")},
+                "text": {"format": {"type": "json_object"}},
+            }
+        else:
+            body = {
+                "model": self._model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image}},
+                        ],
+                    }
+                ],
+                "response_format": {"type": "json_object"},
+            }
         response = httpx.post(self._url, json=body, headers=headers, timeout=httpx.Timeout(10, read=90))
         response.raise_for_status()
+        payload = response.json()
+        if responses_api:
+            if payload.get("status") != "completed":
+                raise ValueError("vision response was not completed")
+            returned_model = str(payload.get("model") or "")
+            if not returned_model or (self._model == "gpt-6-sol" and returned_model != self._model):
+                raise ValueError("vision response identity does not match gpt-6-sol")
+        else:
+            returned_model = self._model
         try:
-            payload = response.json()
-            content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if responses_api:
+                content = "".join(
+                    str(part.get("text") or "")
+                    for item in payload.get("output") or ()
+                    if isinstance(item, dict) and item.get("type") == "message"
+                    for part in item.get("content") or ()
+                    if isinstance(part, dict) and part.get("type") == "output_text"
+                )
+            else:
+                content = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
             result = json.loads(content or "{}")
         except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("vision endpoint returned invalid JSON") from exc
-        return self._validate(result)
+        return self._validate(result, model=returned_model)
 
-    def _validate(self, result: Any) -> dict:
+    def _validate(self, result: Any, *, model: str | None = None) -> dict:
         if not isinstance(result, dict):
             raise ValueError("vision endpoint response must be an object")
         narration_aligned = result.get("narration_aligned")
@@ -99,9 +140,11 @@ class HttpVisionAnalyzer:
             "labels": _string_list(result.get("labels"), "labels", required=True),
             "themes": _string_list(result.get("themes"), "themes"),
             "symbols": _string_list(result.get("symbols"), "symbols"),
+            "observed_entities": _string_list(result.get("observed_entities"), "observed_entities"),
+            "observed_tickers": _ticker_list(result.get("observed_tickers")),
             "confidence_score": _finite_confidence(result.get("confidence_score")),
             "narration_aligned": narration_aligned,
-            "model": self._model,
+            "model": model or self._model,
             "model_version": self._model_version,
         }
 
@@ -122,7 +165,9 @@ class CodexCliVisionAnalyzer(HttpVisionAnalyzer):
             prompt=(
                 "Inspect the attached frame. Return exactly a JSON object with "
                 "visual_summary (non-empty string), labels (non-empty string array), "
-                "themes (string array), symbols (string array), confidence_score (number from 0 to 1), "
+                "themes (string array), symbols (string array), "
+                "observed_entities (string array), observed_tickers (six-digit ticker string array), "
+                "confidence_score (number from 0 to 1), "
                 "and narration_aligned (boolean). Do not invent ticker symbols, chart values, or facts. "
                 "Narration context: " + transcript_context[:3000]
             ),

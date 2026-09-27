@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from .artifacts import EvidenceItem, TranscriptArtifact, canonical_json
 from .claim_draft import ClaimOccurrenceDraft
+from .knowledge_hierarchy import permitted_thesis_evidence_indices
 from .semantic_segment import SemanticSegment
 
 
@@ -40,7 +41,7 @@ class ClaimDraftGrounder:
         if draft.semantic_segment_id != semantic_segment.semantic_segment_id:
             raise ValueError("draft does not belong to semantic segment")
         by_index = {item.segment_index: item for item in transcript.segments}
-        valid_range = set(range(semantic_segment.start_segment_index, semantic_segment.end_segment_index + 1))
+        valid_range = permitted_thesis_evidence_indices(draft, semantic_segment, by_index)
         groups = {
             "PRIMARY": draft.evidence_segment_indices,
             "CONDITION": draft.condition_evidence_segment_indices,

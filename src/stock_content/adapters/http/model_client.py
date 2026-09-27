@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -43,12 +44,17 @@ class ContentModelClient:
         if not self.available():
             raise RuntimeError("CONTENT_MODEL_URL and CONTENT_MODEL_NAME are required for production extraction")
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        responses_api = self.base_url.endswith("/responses")
+        responses_api = urlparse(self.base_url).path.rstrip("/").endswith("/responses")
+        if self.model == "gpt-6-sol" and not responses_api:
+            raise RuntimeError("gpt-6-sol extraction requires a Responses API endpoint")
         if responses_api:
             payload: dict[str, Any] = {
                 "model": self.model,
-                "instructions": system,
-                "input": prompt,
+                "input": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "reasoning": {"effort": os.getenv("CONTENT_MODEL_REASONING_EFFORT", "medium")},
                 "store": False,
             }
             if max_tokens is not None:
@@ -71,17 +77,22 @@ class ContentModelClient:
         if responses_api:
             if body.get("status") != "completed":
                 raise RuntimeError("model response did not complete")
+            returned_model = str(body.get("model") or "")
+            if not returned_model or (self.model == "gpt-6-sol" and returned_model != self.model):
+                raise ValueError("model response identity does not match gpt-6-sol")
             output = "".join(
-                item.get("text", "")
-                for message in body.get("output", [])
-                if message.get("type") == "message"
-                for item in message.get("content", [])
-                if item.get("type") == "output_text"
+                str(item.get("text") or "")
+                for message in body.get("output") or ()
+                if isinstance(message, dict) and message.get("type") == "message"
+                for item in message.get("content") or ()
+                if isinstance(item, dict) and item.get("type") == "output_text"
             )
+            if not output:
+                raise ValueError("model response contained no output text")
             return {
                 "content": output,
                 "provider": self.provider,
-                "model": body.get("model") or "",
+                "model": returned_model,
                 "finish_reason": body.get("status"),
                 "raw_response": body,
             }

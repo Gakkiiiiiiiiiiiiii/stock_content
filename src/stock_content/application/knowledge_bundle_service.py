@@ -210,7 +210,7 @@ class KnowledgeBundleService:
                 "condition", "invalidation", "primary_domain", "claim_nature", "attribution", "detail",
                 "source_grade", "temporal", "evidence", "occurrence_review", "support_status", "lifecycle_status",
                 "confidence", "verification", "contradiction_group_id", "grounding_status",
-                "external_truth_status",
+                "external_truth_status", "visual_evidence",
             )
             if key in item
         }

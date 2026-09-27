@@ -21,6 +21,13 @@ SIGNAL_SCHEMA_V5 = "content-factor-signal.v5"
 SIGNAL_SCHEMA_V5_MAJOR = 5
 
 _DIRECTION_BY_SENTIMENT = {"BULLISH": "LONG", "BEARISH": "SHORT"}
+_TRADING_AUTHORIZATION_FIELDS = frozenset({"order_qty", "limit_price", "portfolio_weight", "execute_at"})
+
+
+def _reject_trading_authorization(payload: dict[str, Any], *, contract: str) -> None:
+    forbidden = sorted(_TRADING_AUTHORIZATION_FIELDS.intersection(payload))
+    if forbidden:
+        raise ValueError(f"{contract} cannot contain trading instruction fields: {', '.join(forbidden)}")
 
 
 def signal_major_version(schema_version: str) -> int | None:
@@ -43,6 +50,7 @@ def upgrade_signal_v3(item: dict[str, Any], *, code_sha: str | None = None) -> d
     P0 C-03：ContentSnapshot 缺失的结果不得作为 v3 正常信号发送，
     只能以 DEGRADED_NO_SNAPSHOT 显式降级，consumer 必须拒绝当正常信号消费。
     """
+    _reject_trading_authorization(item, contract="content-factor-signal.v3")
     attributes = item.get("provenance") or {}
     sentiment = str(item.get("sentiment") or "")
     resolved_code_sha = code_sha if code_sha is not None else os.getenv("CONTENT_GIT_COMMIT", "unknown")
@@ -106,6 +114,7 @@ def upgrade_signal_v4(
     policy_version: str = "signal_policy.v1",
 ) -> dict[str, Any]:
     """Normalize a v4 payload and enforce its lineage references."""
+    _reject_trading_authorization(item, contract="content-factor-signal.v4")
     snapshot = content_snapshot_id or item.get("content_snapshot_id") or item.get("snapshot_id")
     claim = claim_id or item.get("claim_id")
     verification = verification_artifact_id or item.get("verification_artifact_id")
@@ -254,9 +263,7 @@ def validate_signal_v4(signal: dict[str, Any]) -> dict[str, Any]:
         _require_key(signal, key, "signal")
     if signal.get("signal_schema_version") != SIGNAL_SCHEMA_V4:
         raise ValueError("unsupported signal schema major")
-    forbidden = {"order_qty", "limit_price", "portfolio_weight", "execute_at"}
-    if forbidden.intersection(signal):
-        raise ValueError("v4 signal cannot contain trading instruction fields")
+    _reject_trading_authorization(signal, contract="content-factor-signal.v4")
     _require_string(signal, "signal_id", min_length=1)
     _require_string(signal, "decision_id", min_length=1)
     _require_string(signal, "signal_policy_version", min_length=1)
@@ -356,6 +363,7 @@ def validate_signal_v4(signal: dict[str, Any]) -> dict[str, Any]:
 
 def upgrade_signal_v5(item: dict[str, Any]) -> dict[str, Any]:
     """Build the lineage-only v5 signal projection from a knowledge payload."""
+    _reject_trading_authorization(item, contract="content-factor-signal.v5")
     attributes = dict(item.get("attributes") or {})
     snapshot = item.get("content_snapshot_id") or attributes.get("content_snapshot_id")
     claim_id = item.get("claim_id") or attributes.get("claim_id")
@@ -439,9 +447,7 @@ def validate_signal_v5(signal: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"v5 signal missing {', '.join(missing)}")
     if signal.get("signal_schema_version") != SIGNAL_SCHEMA_V5:
         raise ValueError("unsupported signal schema major")
-    forbidden = {"order_qty", "limit_price", "portfolio_weight", "execute_at"}
-    if forbidden.intersection(signal):
-        raise ValueError("v5 signal cannot contain trading instruction fields")
+    _reject_trading_authorization(signal, contract="content-factor-signal.v5")
     for key in (
         "signal_id", "claim_id", "occurrence_id", "semantic_segment_id", "available_from", "content_snapshot_id"
     ):

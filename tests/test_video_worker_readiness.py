@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -64,6 +65,25 @@ def test_api_readiness_uses_worker_proof_not_storage_state_file(tmp_path, monkey
     assert proof["health_code"] == "READY"
     assert "credential_ref" not in proof
     assert components["xiaoe_browser"]["ready"] is True
+
+
+def test_api_raw_storage_requires_read_and_traverse_but_not_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTENT_RAW_STORAGE_DIR", str(tmp_path))
+    modes = []
+
+    def readonly_access(path, mode):
+        modes.append((path, mode))
+        return mode == os.R_OK | os.X_OK
+
+    monkeypatch.setattr("stock_content.api.readiness.os.access", readonly_access)
+
+    components = _video_components(ReadinessDependencies(), None)
+
+    assert components["raw_storage"] == {"ready": True, "code": "READY"}
+    assert modes == [(str(tmp_path), os.R_OK | os.X_OK)]
+
+    monkeypatch.setenv("CONTENT_RAW_STORAGE_DIR", str(tmp_path / "missing"))
+    assert _video_components(ReadinessDependencies(), None)["raw_storage"]["ready"] is False
 
 
 def test_video_worker_heartbeat_fails_closed_when_stale_cpu_or_allowlist_mismatched(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ from stock_content.adapters.postgres.repositories.claim_event_repository import 
 from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
     PostgresKnowledgeBundleAuthority,
     PostgresKnowledgeBundleRepository,
+    _sealed_trusted_v2_verification,
     _v2_semantics,
 )
 from stock_content.adapters.postgres.repositories.snapshot_repository import SnapshotIntegrityError
@@ -47,6 +48,7 @@ from stock_content.domain.artifacts import (
 )
 from stock_content.domain.claim_state_event import ClaimStateEvent
 from stock_content.domain.knowledge_bundle import KnowledgeBundleRequest, canonical_json
+from stock_content.domain.knowledge_semantics import TrustedExternalVerification
 from stock_content.domain.lineage import build_content_snapshot
 
 
@@ -322,6 +324,40 @@ def test_v2_sql_authority_keeps_review_blocked_extracted_row_for_quality_only(tm
     assert v2["items"][0]["occurrence_review"]["status"] == "HUMAN_REVIEW_REQUIRED"
 
 
+def test_legacy_v2_sql_occurrence_omits_absent_visual_packet_through_service(tmp_path):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        claim = session.get(FinancialClaimRow, "claim-1")
+        claim.payload = {
+            "bundle_v2": {
+                "claim_nature": "FACT",
+                "primary_domain": "UNKNOWN",
+                "attribution": {"attributed": True, "source_label": "source_speaker"},
+                "source_grade": "SOURCE_ASSERTION",
+                "detail": {"explanation": "财务报告中的同比收入指标。"},
+                "external_truth_status": "NOT_CHECKED",
+            }
+        }
+    request = replace(_request(), contract_version="content-knowledge-bundle.v2")
+    authority = PostgresKnowledgeBundleAuthority(database.session_factory)
+    authoritative_item = authority.read_bundle_source(request)["items"][0]
+    assert "visual_evidence" not in authoritative_item
+    checksum = "sha256:" + hashlib.sha256(
+        (Path(__file__).parents[1] / "contracts" / "content-knowledge-bundle.v2.json").read_bytes()
+    ).hexdigest().upper()
+    service = KnowledgeBundleService(
+        authority,
+        PostgresKnowledgeBundleRepository(database.session_factory),
+        BundleProducerMetadata("stock_content", "test", "content-test-sha", "pipeline-test", "sha256:" + "a" * 64),
+        v2_contract_checksum=checksum,
+    )
+
+    bundle = service.create(request)
+
+    assert bundle["items"]
+    assert "visual_evidence" not in bundle["items"][0]
+
+
 def test_sql_bundle_authority_fails_closed_without_claim_history(tmp_path):
     database, _ = _authority_with_snapshot(tmp_path, events=False)
     with pytest.raises(ValueError, match="HISTORICAL_CLAIM_AUTHORITY_MISSING"):
@@ -357,6 +393,154 @@ def test_v2_sql_projection_normalizes_legacy_bare_year_without_mutating_its_snap
     assert semantic["temporal"]["start"] == "2030-01-01T00:00:00Z"
     assert semantic["temporal"]["end"] == "2030-12-31T23:59:59.999999Z"
     assert raw_temporal["start"] == "2030"
+
+
+def test_v2_sql_reprojection_preserves_only_the_persisted_trusted_verification_marker():
+    raw = {
+        "bundle_v2": {
+            "claim_nature": "FACT", "primary_domain": "UNKNOWN",
+            "source_grade": "PRIMARY", "external_truth_status": "EXTERNALLY_VERIFIED",
+            "detail": {"explanation": "独立核验记录确认该指标。"},
+        }
+    }
+    occurrence_provenance = {"bundle_v2": {"trusted_verification": {
+        "verification_artifact_id": "verification-artifact-1",
+        "claim_id": "claim-1",
+        "verification_id": "verification-result-1",
+    }}}
+    untrusted = _v2_semantics(
+        SimpleNamespace(
+            payload=raw,
+            fact_category="FACT", claim_type="FINANCIAL_METRIC", grounding_reason_codes=[],
+            normalized_statement="公司收入增长12%", predicate="revenue_growth",
+        ),
+        SimpleNamespace(provenance=occurrence_provenance),
+    )
+    assert untrusted["source_grade"] == "SOURCE_ASSERTION"
+    assert untrusted["external_truth_status"] == "NOT_CHECKED"
+    semantic = _v2_semantics(
+        SimpleNamespace(
+            payload=raw,
+            fact_category="FACT", claim_type="FINANCIAL_METRIC", grounding_reason_codes=[],
+            normalized_statement="公司收入增长12%", predicate="revenue_growth",
+        ),
+        SimpleNamespace(provenance=occurrence_provenance),
+        trusted_verification=TrustedExternalVerification(
+            verification_artifact_id="verification-artifact-1",
+            claim_id="claim-1",
+            verification_id="verification-result-1",
+        ),
+    )
+
+    assert semantic["source_grade"] == "PRIMARY"
+    assert semantic["external_truth_status"] == "EXTERNALLY_VERIFIED"
+    assert semantic["trusted_verification"]["verification_artifact_id"] == "verification-artifact-1"
+
+
+@pytest.mark.parametrize(
+    ("result_claim_id", "result_status", "result_id", "missing_binding", "expected"),
+    [
+        ("claim-1", "VERIFIED", "result-1", None, True),
+        ("claim-1", "EXTERNALLY_VERIFIED", "result-1", None, False),
+        ("claim-1", "VERIFIED", "result-1", "market_snapshot_id", False),
+        ("claim-1", "VERIFIED", "result-1", "market_data_version", False),
+        ("claim-1", "VERIFIED", "result-1", "fact_date", False),
+        ("claim-1", "VERIFIED", "result-1", "verification_timestamp", False),
+        ("claim-1", "VERIFIED", "result-1", "ALL", False),
+        ("other-claim", "VERIFIED", "result-1", None, False),
+        ("claim-1", "CONTRADICTED", "result-1", None, False),
+        ("claim-1", "VERIFICATION_PENDING", "result-1", None, False),
+        ("claim-1", "VERIFIED", "other-result", None, False),
+        ("claim-1", "VERIFIED", "", None, False),
+    ],
+)
+def test_sql_trusted_verification_requires_matching_sealed_claim_result(
+    tmp_path, result_claim_id, result_status, result_id, missing_binding, expected
+):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        claim = session.get(FinancialClaimRow, "claim-1")
+        occurrence = session.get(ClaimOccurrenceRow, "occurrence-1")
+        claim.payload = {
+            "bundle_v2": {
+                "source_grade": "PRIMARY", "external_truth_status": "EXTERNALLY_VERIFIED",
+            }
+        }
+        occurrence.provenance = {"bundle_v2": {
+            "source_grade": "PRIMARY", "external_truth_status": "EXTERNALLY_VERIFIED",
+            "trusted_verification": {
+                "verification_artifact_id": "verification-artifact",
+                "claim_id": "claim-1", "verification_id": "result-1",
+            },
+        }}
+        bindings = {
+            "market_snapshot_id": "market-1", "market_data_version": "v1",
+            "fact_date": "2026-09-01", "verification_timestamp": "2026-09-01T00:00:00Z",
+        }
+        if missing_binding == "ALL":
+            bindings = {}
+        elif missing_binding:
+            bindings.pop(missing_binding)
+        artifact = ContentArtifactRow(
+            artifact_id="verification-artifact", artifact_type="verification", content_hash="sealed-verification",
+            payload={"results": ([
+                {
+                    "claim_id": result_claim_id,
+                    "provider": "fixture",
+                    "status": result_status,
+                    "verification_id": result_id,
+                    **bindings,
+                    **({"verification_job_id": "job-1"} if result_status == "VERIFICATION_PENDING" else {}),
+                }
+            ] if result_id else [])},
+        )
+        session.add(artifact)
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        _seal_snapshot(session, {**snapshot.artifact_ids, "verification": artifact.artifact_id})
+
+        trusted = _sealed_trusted_v2_verification(session, snapshot, claim, occurrence)
+
+    assert bool(trusted) is expected
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("market_snapshot_id", ""),
+        ("market_snapshot_id", "   "),
+        ("market_data_version", ""),
+        ("market_data_version", "   "),
+    ],
+)
+def test_sql_trusted_verification_rejects_blank_snapshot_bindings(tmp_path, field, value):
+    database, _ = _authority_with_snapshot(tmp_path)
+    with database.session_factory.begin() as session:
+        claim = session.get(FinancialClaimRow, "claim-1")
+        occurrence = session.get(ClaimOccurrenceRow, "occurrence-1")
+        occurrence.provenance = {"bundle_v2": {
+            "source_grade": "PRIMARY", "external_truth_status": "EXTERNALLY_VERIFIED",
+            "trusted_verification": {
+                "verification_artifact_id": "verification-artifact",
+                "claim_id": "claim-1", "verification_id": "result-1",
+            },
+        }}
+        bindings = {
+            "market_snapshot_id": "market-1", "market_data_version": "v1",
+            "fact_date": "2026-09-01", "verification_timestamp": "2026-09-01T00:00:00Z",
+        }
+        bindings[field] = value
+        artifact = ContentArtifactRow(
+            artifact_id="verification-artifact", artifact_type="verification", content_hash="sealed-verification",
+            payload={"results": [{
+                "claim_id": "claim-1", "provider": "fixture", "status": "VERIFIED",
+                "verification_id": "result-1", **bindings,
+            }]},
+        )
+        session.add(artifact)
+        snapshot = session.get(ContentSnapshotRow, "snapshot-1")
+        _seal_snapshot(session, {**snapshot.artifact_ids, "verification": artifact.artifact_id})
+
+        assert _sealed_trusted_v2_verification(session, snapshot, claim, occurrence) is None
 
 
 def test_production_sql_evidence_item_bundle_uses_consumer_canonical_quote_hash(tmp_path):

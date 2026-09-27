@@ -1,12 +1,17 @@
 """content-factor-signal.v3 契约测试（详细修改方案 §7）。"""
 from __future__ import annotations
 
+import pytest
+
 from stock_content.domain.signal_contract import (
     SIGNAL_SCHEMA_VERSION,
     accepts_schema_version,
     signal_major_version,
     upgrade_signal_v3,
+    upgrade_signal_v4,
+    upgrade_signal_v5,
 )
+from stock_content.domain.signal_contract_v5_1 import validate_signal_v5_1
 
 
 def _v2_item() -> dict:
@@ -67,3 +72,22 @@ def test_factor_can_reject_unsupported_major_version():
     # 只支持到 v3 的消费方必须拒绝 v4
     assert not accepts_schema_version("content-factor-signal.v4", max_supported_major=3)
     assert not accepts_schema_version("garbage")
+
+
+@pytest.mark.parametrize("field", ["order_qty", "limit_price", "portfolio_weight", "execute_at"])
+def test_v3_rejects_trading_authorization_fields(field):
+    with pytest.raises(ValueError, match="trading instruction"):
+        upgrade_signal_v3({"knowledge_uid": "knowledge-1", field: 1}, code_sha="test")
+
+
+@pytest.mark.parametrize("upgrader", [upgrade_signal_v4, upgrade_signal_v5])
+@pytest.mark.parametrize("field", ["order_qty", "limit_price", "portfolio_weight", "execute_at"])
+def test_v4_and_v5_reject_trading_authorization_fields_before_projection(upgrader, field):
+    with pytest.raises(ValueError, match="trading instruction"):
+        upgrader({field: 1})
+
+
+@pytest.mark.parametrize("field", ["order_qty", "limit_price", "portfolio_weight", "execute_at"])
+def test_v5_1_rejects_trading_authorization_fields_before_required_field_validation(field):
+    with pytest.raises(ValueError, match="trading instruction"):
+        validate_signal_v5_1({field: 1})

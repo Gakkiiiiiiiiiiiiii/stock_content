@@ -229,11 +229,16 @@ class VerificationResult(BaseModel):
     @model_validator(mode="after")
     def _binding_invariants(self) -> "VerificationResult":
         if self.status in {"VERIFIED", "CONTRADICTED", "PARTIALLY_VERIFIED"}:
-            missing = [
+            missing = []
+            for name in ("market_snapshot_id", "market_data_version"):
+                value = getattr(self, name)
+                if not isinstance(value, str) or not value.strip():
+                    missing.append(name)
+            missing.extend(
                 name
-                for name in ("market_snapshot_id", "market_data_version", "fact_date", "verification_timestamp")
+                for name in ("fact_date", "verification_timestamp")
                 if getattr(self, name) is None
-            ]
+            )
             if missing:
                 raise ValueError(f"{self.status} requires quant snapshot binding, missing: {missing}")
         return self

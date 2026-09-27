@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -24,10 +25,12 @@ ARTIFACT_SCHEMA_VERSION = "artifact.v1"
 _IDENTITY_PROFILE_CURRENT = "current"
 _IDENTITY_PROFILE_LEGACY_FRAME = "legacy-frame.v1"
 _IDENTITY_PROFILE_LEGACY_OCR = "legacy-ocr.v1"
+_IDENTITY_PROFILE_LEGACY_TRANSCRIPT = "legacy-transcript.v1"
 _IDENTITY_PROFILES = {
     _IDENTITY_PROFILE_CURRENT,
     _IDENTITY_PROFILE_LEGACY_FRAME,
     _IDENTITY_PROFILE_LEGACY_OCR,
+    _IDENTITY_PROFILE_LEGACY_TRANSCRIPT,
 }
 
 
@@ -156,6 +159,10 @@ class ArtifactBase:
             payload.pop("requested_device", None)
             payload.pop("actual_device", None)
             payload.pop("runtime_identity", None)
+        elif profile == _IDENTITY_PROFILE_LEGACY_TRANSCRIPT:
+            for segment in payload.get("segments") or ():
+                if isinstance(segment, dict):
+                    segment.pop("correction_records", None)
         return payload
 
 
@@ -202,6 +209,7 @@ class TranscriptSegmentItem:
     source_artifact_id: str = ""
     alignment_status: str = "ALIGNED"
     speaker_id: str | None = None
+    correction_records: list[dict[str, Any]] = field(default_factory=list)
     media_artifact_id: str = ""
     asr_model: str = "unknown"
     asr_model_version: str = "unknown"
@@ -277,6 +285,7 @@ class TranscriptArtifact(ArtifactBase):
                     source_artifact_id=item.source_artifact_id,
                     alignment_status=item.alignment_status,
                     speaker_id=item.speaker_id,
+                    correction_records=list(item.correction_records),
                     media_artifact_id=self.media_artifact_id,
                     asr_model=self.asr_model,
                     asr_model_version=self.asr_model_version,
@@ -485,7 +494,10 @@ class TranscriptVisualCrosscheckArtifact(ArtifactBase):
             )
         )
         if any(
-            item.relation not in {"SUPPORTS", "CONTRADICTS", "SUPPORTS_DISPLAYED_SECONDARY", "UNRELATED", "UNKNOWN"}
+            item.relation not in {
+                "SUPPORTS", "CONTRADICTS", "SUPPORTS_DISPLAYED_SECONDARY",
+                "SUPPORTS_DISPLAYED_MENTION", "ENTITY_CORRECTION_PENDING", "UNRELATED", "UNKNOWN",
+            }
             for item in records
         ):
             raise ValueError("invalid transcript visual crosscheck relation")
@@ -500,6 +512,92 @@ class TranscriptVisualCrosscheckArtifact(ArtifactBase):
         object.__setattr__(
             self, "visual_identity", {str(key): str(value) for key, value in sorted(self.visual_identity.items())}
         )
+        super().__post_init__()
+
+
+@dataclass(frozen=True)
+class SecurityEntityAlignmentRecord:
+    """Window-scoped, audit-only ASR/OCR security observation."""
+
+    evidence_window_id: str = ""
+    asr_original_name: str = ""
+    asr_normalized_name: str = ""
+    raw_asr_text: str = ""
+    asr_ticker: str = ""
+    source_artifact_id: str = ""
+    ocr_name: str = ""
+    ticker: str = ""
+    canonical_display: str = ""
+    asr_segment_id: str = ""
+    asr_start_ms: int = 0
+    asr_end_ms: int = 0
+    frame_id: str = ""
+    frame_artifact_id: str = ""
+    timestamp_ms: int = 0
+    image_hash: str = ""
+    bbox: list[Any] = field(default_factory=list)
+    ocr_artifact_id: str = ""
+    vision_artifact_id: str = ""
+    ocr_confidence_score: float | None = None
+    relation: str = "ENTITY_CORRECTION_PENDING"
+    relation_strength: str = "LOW"
+    review_status: str = "HUMAN_REVIEW_REQUIRED"
+    authorization_status: str = "NOT_AUTHORIZED"
+    correction_trace: tuple[dict[str, Any], ...] = ()
+    record_type: str = "ASR_MENTION"
+
+
+@dataclass(frozen=True)
+class SecurityEntityAlignmentArtifact(ArtifactBase):
+    """Never admitted as claim, signal, ACTIVE, or trading evidence."""
+
+    transcript_artifact_id: str = ""
+    crosscheck_artifact_id: str = ""
+    security_mentions: tuple[SecurityEntityAlignmentRecord, ...] = ()
+    displayed_target_candidates: tuple[SecurityEntityAlignmentRecord, ...] = ()
+    alignment_version: str = "security-entity-alignment.v1"
+
+    def __post_init__(self) -> None:
+        records = tuple(sorted(self.security_mentions, key=lambda item: (
+            item.evidence_window_id, item.timestamp_ms, item.frame_id, item.asr_segment_id, item.ocr_name
+        )))
+        candidates = tuple(sorted(self.displayed_target_candidates, key=lambda item: (
+            item.evidence_window_id, item.timestamp_ms, item.frame_id, item.ocr_name
+        )))
+        parents = set(self.parent_artifact_ids)
+        if not self.transcript_artifact_id or not self.crosscheck_artifact_id:
+            raise ValueError("security alignment requires transcript and crosscheck")
+        if not {self.transcript_artifact_id, self.crosscheck_artifact_id} <= parents:
+            raise ValueError("security alignment parent closure incomplete")
+        for item in (*records, *candidates):
+            if item.relation not in {"SUPPORTS_DISPLAYED_MENTION", "ENTITY_CORRECTION_PENDING"}:
+                raise ValueError("invalid security alignment relation")
+            if item.relation_strength not in {"LOW", "HIGH"}:
+                raise ValueError("invalid security alignment strength")
+            if item.review_status != "HUMAN_REVIEW_REQUIRED" or item.authorization_status != "NOT_AUTHORIZED":
+                raise ValueError("security alignment cannot authorize claims or trades")
+            if item.ocr_confidence_score is not None and (
+                isinstance(item.ocr_confidence_score, bool)
+                or not isinstance(item.ocr_confidence_score, (int, float))
+                or not math.isfinite(item.ocr_confidence_score)
+                or not 0 <= item.ocr_confidence_score <= 1
+            ):
+                raise ValueError("invalid OCR confidence")
+            if item.record_type == "ASR_MENTION":
+                if not item.asr_segment_id or not item.source_artifact_id:
+                    raise ValueError("ASR mention requires source segment")
+            else:
+                if not item.evidence_window_id or not item.frame_id or not item.frame_artifact_id or not (
+                    item.ocr_artifact_id or item.vision_artifact_id
+                ):
+                    raise ValueError("displayed mention requires window, frame, OCR or vision")
+                visual_refs = {item.frame_artifact_id, item.ocr_artifact_id, item.vision_artifact_id} - {""}
+                if not visual_refs <= parents:
+                    raise ValueError("displayed mention parent closure incomplete")
+                if item.vision_artifact_id and item.vision_artifact_id not in parents:
+                    raise ValueError("displayed mention vision parent closure incomplete")
+        object.__setattr__(self, "security_mentions", records)
+        object.__setattr__(self, "displayed_target_candidates", candidates)
         super().__post_init__()
 
 
@@ -567,6 +665,25 @@ class KnowledgeArtifact(ArtifactBase):
 
 
 @dataclass(frozen=True)
+class KnowledgeVisualEvidenceArtifact(ArtifactBase):
+    """Content-addressed occurrence-level visual evidence packets.
+
+    The occurrence row retains the packet for query projection, while this
+    artifact makes the exact packet bytes a snapshot member and replay input.
+    """
+
+    occurrence_packets: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "occurrence_packets",
+            _stable_membership(self.occurrence_packets, field_identity=False),
+        )
+        super().__post_init__()
+
+
+@dataclass(frozen=True)
 class SummaryArtifact(ArtifactBase):
     knowledge_artifact_id: str = ""
     core_summary: str = ""
@@ -613,7 +730,10 @@ ARTIFACT_SLOT_NAMES = (
 # Formal single-value slots introduced by the semantic/temporal chain.  The
 # legacy tuple remains stable for callers that enumerate the original slots;
 # this unified registry set is the source of truth for all slot operations.
-SINGLE_ARTIFACT_SLOT_NAMES = ("semantic_segments", "occurrences", "lifecycle", "transcript_visual_crosscheck")
+SINGLE_ARTIFACT_SLOT_NAMES = (
+    "semantic_segments", "occurrences", "lifecycle", "transcript_visual_crosscheck",
+    "security_entity_alignment", "knowledge_visual_evidence",
+)
 
 VISUAL_ARTIFACT_SLOT_NAMES = ("frames", "ocr", "vision")
 
@@ -637,6 +757,8 @@ class ArtifactRegistry:
     occurrences: ClaimOccurrenceArtifact | None = None
     lifecycle: LifecycleArtifact | None = None
     transcript_visual_crosscheck: TranscriptVisualCrosscheckArtifact | None = None
+    security_entity_alignment: SecurityEntityAlignmentArtifact | None = None
+    knowledge_visual_evidence: KnowledgeVisualEvidenceArtifact | None = None
 
     def set(self, slot: str, artifact: ArtifactBase) -> None:
         if slot in SINGLE_ARTIFACT_SLOT_NAMES:
@@ -652,6 +774,8 @@ class ArtifactRegistry:
                 "occurrences": ClaimOccurrenceArtifact,
                 "lifecycle": LifecycleArtifact,
                 "transcript_visual_crosscheck": TranscriptVisualCrosscheckArtifact,
+                "security_entity_alignment": SecurityEntityAlignmentArtifact,
+                "knowledge_visual_evidence": KnowledgeVisualEvidenceArtifact,
             }[slot]
             if not isinstance(artifact, expected):
                 raise TypeError(f"{slot} expects {expected.__name__}")
@@ -757,6 +881,11 @@ def deserialize_artifact(payload: dict[str, Any]) -> ArtifactBase:
                 else TranscriptVisualCrosscheckRecord.from_dict(item)
                 for item in value
             )
+        if key in {"security_mentions", "displayed_target_candidates"} and cls is SecurityEntityAlignmentArtifact:
+            value = tuple(
+                item if isinstance(item, SecurityEntityAlignmentRecord) else SecurityEntityAlignmentRecord(**item)
+                for item in value
+            )
         if key == "evidences" and cls is EvidenceArtifact:
             value = [EvidenceItem(**item) if isinstance(item, dict) else item for item in value]
         if key == "results" and cls is VerificationArtifact:
@@ -826,6 +955,10 @@ def _identity_profile_from_serialized_payload(payload: dict[str, Any], artifact_
         "runtime_identity",
     }.intersection(payload):
         return _IDENTITY_PROFILE_LEGACY_OCR
+    if artifact_type == "transcript" and any(
+        isinstance(item, dict) and "correction_records" not in item for item in payload.get("segments") or ()
+    ):
+        return _IDENTITY_PROFILE_LEGACY_TRANSCRIPT
     return _IDENTITY_PROFILE_CURRENT
 
 
@@ -837,11 +970,13 @@ _TYPE_REGISTRY: dict[str, type[ArtifactBase]] = {
     "claims": ClaimArtifact,
     "verification": VerificationArtifact,
     "knowledge": KnowledgeArtifact,
+    "knowledge_visual_evidence": KnowledgeVisualEvidenceArtifact,
     "summary": SummaryArtifact,
     "frame": FrameArtifact,
     "ocr": OCRArtifact,
     "vision": VisionArtifact,
     "transcript_visual_crosscheck": TranscriptVisualCrosscheckArtifact,
+    "security_entity_alignment": SecurityEntityAlignmentArtifact,
     "semantic_segments": SemanticSegmentArtifact,
     "occurrences": ClaimOccurrenceArtifact,
     "lifecycle": LifecycleArtifact,
@@ -936,6 +1071,7 @@ __all__ = [
     "EvidenceArtifact",
     "EvidenceItem",
     "KnowledgeArtifact",
+    "KnowledgeVisualEvidenceArtifact",
     "MediaArtifact",
     "FrameArtifact",
     "OCRArtifact",

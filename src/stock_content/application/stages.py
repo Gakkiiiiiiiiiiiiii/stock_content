@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import re
 import shutil
 import tempfile
 from contextlib import nullcontext
@@ -26,9 +27,12 @@ from stock_content.domain.artifacts import (
     EvidenceItem,
     FrameArtifact,
     KnowledgeArtifact,
+    KnowledgeVisualEvidenceArtifact,
     LifecycleArtifact,
     MediaArtifact,
     OCRArtifact,
+    SecurityEntityAlignmentArtifact,
+    SecurityEntityAlignmentRecord,
     SourceArtifact,
     SummaryArtifact,
     TranscriptArtifact,
@@ -58,15 +62,27 @@ from stock_content.domain.governance_evidence import governance_evidence_for, re
 from stock_content.domain.initial_verification import build_initial_verification_plan
 from stock_content.domain.knowledge import KnowledgeExtractor
 from stock_content.domain.knowledge_deduplicator import KnowledgeDeduplicator
-from stock_content.domain.knowledge_evidence_window import KnowledgeEvidenceWindowPlanner
+from stock_content.domain.knowledge_evidence_window import (
+    KnowledgeEvidenceWindowPlanner,
+    evidence_segment_indices_for_draft,
+)
 from stock_content.domain.knowledge_frame_plan import (
     KnowledgeFramePlanner,
     evidence_window_id,
     frame_id_for,
     request_id_for,
 )
+from stock_content.domain.knowledge_hierarchy import (
+    ChapterThesisIdentifier,
+    attach_thesis_hierarchy,
+    materialize_thesis_claim_drafts,
+)
 from stock_content.domain.knowledge_projection_builder import KnowledgeProjectionBuilder
-from stock_content.domain.knowledge_semantics import atomic_statement, bundle_v2_semantics
+from stock_content.domain.knowledge_semantics import (
+    TrustedExternalVerification,
+    atomic_statement,
+    bundle_v2_semantics,
+)
 from stock_content.domain.knowledge_temporal_policy import KnowledgeTemporalPolicy
 from stock_content.domain.knowledge_unit_extractor import KnowledgeUnitExtractor
 from stock_content.domain.knowledge_unit_normalizer import KnowledgeUnitNormalizer
@@ -735,11 +751,14 @@ def _register_transcript_artifact(
             start_seconds=item.start_seconds,
             end_seconds=item.end_seconds,
             text=item.text,
+            raw_text=item.raw_text,
+            normalized_text=item.normalized_text,
             confidence=item.confidence,
             source=item.source,
             source_artifact_id=item.source_artifact_id,
             alignment_status=item.alignment_status,
             speaker_id=item.speaker_id,
+            correction_records=list(item.correction_records),
         )
         for item in context.state["segments"]
     ]
@@ -1274,6 +1293,10 @@ def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], resu
     labels = _normalise_string_list(result.get("labels"), "vision labels", allow_empty=False)
     themes = _normalise_string_list(result.get("themes"), "vision themes")
     symbols = _normalise_string_list(result.get("symbols"), "vision symbols")
+    observed_entities = _normalise_string_list(result.get("observed_entities", []), "vision observed_entities")
+    observed_tickers = _normalise_string_list(result.get("observed_tickers", []), "vision observed_tickers")
+    if any(not re.fullmatch(r"\d{6}", value) for value in observed_tickers):
+        raise ValueError("vision observed_tickers must contain six-digit tickers")
     narration_aligned = result.get("narration_aligned")
     if not isinstance(narration_aligned, bool):
         raise ValueError("vision narration_aligned must be boolean")
@@ -1287,6 +1310,8 @@ def _normalise_vision_item(context: PipelineContext, frame: dict[str, Any], resu
         "labels": labels,
         "themes": themes,
         "symbols": symbols,
+        "observed_entities": observed_entities,
+        "observed_tickers": observed_tickers,
         "confidence_score": _finite_confidence(result.get("confidence_score"), "vision confidence_score"),
         "narration_aligned": narration_aligned,
         "model": model,
@@ -1340,8 +1365,16 @@ class VisionStage:
                         **raw,
                         "model": raw.get("model") or "fixture",
                         "model_version": raw.get("model_version") or "fixture.v1",
+                        "observed_entities": _normalise_string_list(
+                            raw.get("observed_entities", []), "vision observed_entities"
+                        ),
+                        "observed_tickers": _normalise_string_list(
+                            raw.get("observed_tickers", []), "vision observed_tickers"
+                        ),
                     }
                 )
+                if any(not re.fullmatch(r"\d{6}", value) for value in vision_items[-1]["observed_tickers"]):
+                    raise ValueError("vision observed_tickers must contain six-digit tickers")
         elif context.state.get("frames"):
             bind_context = getattr(self._analyzer, "bind_context", None)
             if callable(bind_context):
@@ -1441,6 +1474,14 @@ class TranscriptVisualCrosscheckStage:
                 for item in transcript.segments
                 if semantic.start_segment_index <= item.segment_index <= semantic.end_segment_index
             ]
+        window_semantics = {
+            evidence_window_id(window): str(window.semantic_segment_id)
+            for window in context.state.get("knowledge_evidence_windows") or ()
+        }
+        window_transcript_ids = {
+            evidence_window_id(window): set(window.transcript_segment_ids)
+            for window in context.state.get("knowledge_evidence_windows") or ()
+        }
         checks: list[dict[str, Any]] = []
         eligible_ids: set[str] = set()
         for raw_frame in context.state.get("frames") or ():
@@ -1448,31 +1489,42 @@ class TranscriptVisualCrosscheckStage:
                 continue
             frame_id = str(raw_frame.get("frame_id") or "")
             artifact = artifact_by_frame.get(frame_id)
-            frame = {
-                **raw_frame,
-                "frame_artifact_id": artifact.artifact_id if artifact else "",
-                "semantic_segment_ids": list(
-                    artifact.semantic_segment_ids if artifact else raw_frame.get("semantic_segment_ids") or ()
-                ),
-                "evidence_window_ids": list(
-                    artifact.evidence_window_ids if artifact else raw_frame.get("evidence_window_ids") or ()
-                ),
-            }
-            owned, seen = [], set()
-            for semantic_id in frame["semantic_segment_ids"]:
-                for segment in segments_by_semantic.get(str(semantic_id), ()):
-                    if segment.segment_id not in seen:
-                        seen.add(segment.segment_id)
-                        owned.append(segment)
-            check = self._checker.check(
-                frame=frame,
-                ocr_items=ocr_by_frame.get(frame_id, ()),
-                vision_item=vision_by_frame.get(frame_id),
-                transcript_segments=owned,
+            semantic_ids = tuple(
+                artifact.semantic_segment_ids if artifact else raw_frame.get("semantic_segment_ids") or ()
             )
-            checks.append(check)
-            if check["relation"] in {"SUPPORTS", "CONTRADICTS"}:
-                eligible_ids.add(frame_id)
+            window_ids = tuple(
+                artifact.evidence_window_ids if artifact else raw_frame.get("evidence_window_ids") or ()
+            )
+            scoped_pairs = [
+                (window_id, window_semantics[window_id])
+                for window_id in window_ids
+                if window_id in window_semantics and window_semantics[window_id] in semantic_ids
+            ]
+            # Older fixtures without the planner mapping are admissible only
+            # when the frame itself already proves one exact scope.  A shared
+            # legacy frame remains deliberately unadmitted rather than being
+            # copied into every knowledge packet.
+            if not scoped_pairs and len(window_ids) == len(semantic_ids) == 1:
+                scoped_pairs = [(window_ids[0], semantic_ids[0])]
+            for window_id, semantic_id in sorted(set(scoped_pairs)):
+                frame = {
+                    **raw_frame,
+                    "frame_artifact_id": artifact.artifact_id if artifact else "",
+                    "semantic_segment_ids": [semantic_id],
+                    "evidence_window_ids": [window_id],
+                }
+                check = self._checker.check(
+                    frame=frame,
+                    ocr_items=ocr_by_frame.get(frame_id, ()),
+                    vision_item=vision_by_frame.get(frame_id),
+                    transcript_segments=[
+                        item for item in segments_by_semantic.get(semantic_id, ())
+                        if item.segment_id in window_transcript_ids.get(window_id, set())
+                    ] if window_id in window_transcript_ids else segments_by_semantic.get(semantic_id, ()),
+                )
+                checks.append(check)
+                if check["relation"] in {"SUPPORTS", "CONTRADICTS"}:
+                    eligible_ids.add(frame_id)
         context.state["transcript_visual_crosschecks"] = sorted(
             checks, key=lambda item: (item["timestamp_ms"], item["frame_id"])
         )
@@ -1514,6 +1566,220 @@ class TranscriptVisualCrosscheckStage:
         return _stage_result(context, "transcript_visual_crosscheck")
 
 
+_SECURITY_NAME = re.compile(r"[\u4e00-\u9fff]{2,16}(?:科技|集团|集團|银行|銀行|证券|證券|股份|控股)")
+_SECURITY_TICKER = re.compile(r"(?<!\d)\d{6}(?!\d)")
+
+
+def _security_tokens(text: str) -> tuple[list[str], list[str]]:
+    prefixes = (
+        "我们关注", "我們關注", "关注", "關注", "上游设备弹性", "上游設備彈性",
+        "上游", "设备", "設備", "弹性", "彈性", "公司", "标的", "標的",
+    )
+    names = set()
+    for raw in _SECURITY_NAME.findall(text):
+        value = raw
+        for prefix in prefixes:
+            if prefix in value and len(value.rsplit(prefix, 1)[-1]) >= 2:
+                value = value.rsplit(prefix, 1)[-1]
+        # ASR often joins an earlier non-security noun and a security name
+        # with a spoken conjunction. Keep the final complete suffix-bearing
+        # name rather than inventing a company from the whole utterance.
+        for conjunction in ("和", "與", "与", "及", "、", "，"):
+            if conjunction in value and len(value.rsplit(conjunction, 1)[-1]) >= 4:
+                value = value.rsplit(conjunction, 1)[-1]
+        names.add(value)
+    return sorted(names), sorted(set(_SECURITY_TICKER.findall(text)))
+
+
+def _entity_edit_distance(left: str, right: str) -> int:
+    if abs(len(left) - len(right)) > 1:
+        return 99
+    previous = list(range(len(right) + 1))
+    for index, char in enumerate(left, start=1):
+        current = [index]
+        for other_index, other in enumerate(right, start=1):
+            current.append(min(current[-1] + 1, previous[other_index] + 1,
+                               previous[other_index - 1] + (char != other)))
+        previous = current
+    return previous[-1]
+
+
+class SecurityEntityAlignmentStage:
+    """Observe displayed entities per knowledge window, independent of claim relation."""
+
+    name = "security_entity_alignment"
+    required_inputs = ("transcript", "transcript_visual_crosscheck")
+    output_types = ("security_entity_alignment",)
+
+    def __init__(self, *, version: str = "security-entity-alignment.v2", min_ocr_confidence: float = 0.98) -> None:
+        self._version = version
+        self._min_ocr_confidence = min_ocr_confidence
+
+    def execute(self, context: PipelineContext) -> StageResult:
+        transcript = context.artifacts.transcript
+        crosscheck = context.artifacts.transcript_visual_crosscheck
+        if transcript is None or crosscheck is None:
+            raise ValueError("security alignment requires transcript and crosscheck")
+        by_segment = {item.segment_id: item for item in transcript.segments}
+        windows = {
+            evidence_window_id(window): set(window.transcript_segment_ids)
+            for window in context.state.get("knowledge_evidence_windows") or ()
+        }
+        ocr_by_frame: dict[str, list[OCRArtifact]] = {}
+        for item in context.artifacts.ocr:
+            ocr_by_frame.setdefault(item.frame_id, []).append(item)
+        vision_by_frame = {item.frame_id: item for item in context.artifacts.vision}
+        scoped_crosscheck_segments: dict[tuple[str, str], set[str] | None] = {}
+        for relation in crosscheck.relations:
+            if len(relation.evidence_window_ids) == 1:
+                key = (relation.frame_id, relation.evidence_window_ids[0])
+                if key in scoped_crosscheck_segments:
+                    scoped_crosscheck_segments[key] = None  # ambiguous scope cannot align an ASR mention
+                else:
+                    scoped_crosscheck_segments[key] = set(relation.transcript_segment_ids)
+        mentions: list[SecurityEntityAlignmentRecord] = []
+        displayed: list[SecurityEntityAlignmentRecord] = []
+        # ASR-only tokens retain provenance but are not visual observations.
+        for segment in transcript.segments:
+            raw_names, raw_codes = _security_tokens(segment.raw_text or segment.text)
+            normal_names, normal_codes = _security_tokens(segment.normalized_text or segment.text)
+            for index in range(max(len(raw_names), len(normal_names), len(raw_codes), len(normal_codes))):
+                original = raw_names[index] if index < len(raw_names) else ""
+                normalized = normal_names[index] if index < len(normal_names) else original
+                asr_code = normal_codes[index] if index < len(normal_codes) else (
+                    raw_codes[index] if index < len(raw_codes) else ""
+                )
+                mentions.append(SecurityEntityAlignmentRecord(
+                    asr_original_name=original, asr_normalized_name=normalized,
+                    raw_asr_text=segment.raw_text or segment.text, asr_ticker=asr_code,
+                    source_artifact_id=segment.source_artifact_id or transcript.artifact_id,
+                    asr_segment_id=segment.segment_id, asr_start_ms=segment.start_ms,
+                    asr_end_ms=segment.end_ms,
+                    canonical_display=(
+                        f"{normalized}（{asr_code}）" if normalized and asr_code else (normalized or asr_code)
+                    ),
+                    correction_trace=tuple(segment.correction_records),
+                ))
+        for frame in sorted(context.artifacts.frames, key=lambda item: (item.timestamp_ms, item.frame_id)):
+            vision = vision_by_frame.get(frame.frame_id)
+            for window_id in sorted(set(frame.evidence_window_ids).intersection(windows)):
+                scoped_segments = [
+                    by_segment[segment_id] for segment_id in sorted(windows[window_id]) if segment_id in by_segment
+                ]
+                for ocr in sorted(ocr_by_frame.get(frame.frame_id, ()), key=lambda item: item.artifact_id):
+                    if window_id not in ocr.evidence_window_ids or ocr.frame_artifact_id != frame.artifact_id:
+                        continue
+                    names, codes = _security_tokens(ocr.text)
+                    # Multiple names or codes in a list are observations, not
+                    # justified pairings. Never assign a guessed ticker.
+                    ambiguous = len(names) > 1 or len(codes) > 1
+                    tokens = [(name, codes[0] if len(codes) == 1 and not ambiguous else "") for name in names]
+                    tokens.extend(("", code) for code in codes if ambiguous or not names)
+                    for name, code in tokens:
+                        common = dict(
+                            evidence_window_id=window_id, ocr_name=name, ticker=code,
+                            canonical_display=f"{name}（{code}）" if name and code else (name or code),
+                            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id,
+                            timestamp_ms=frame.timestamp_ms, image_hash=frame.image_hash,
+                            bbox=list(ocr.bbox or ()), ocr_artifact_id=ocr.artifact_id,
+                            vision_artifact_id=vision.artifact_id if vision else "",
+                            ocr_confidence_score=ocr.confidence_score,
+                        )
+                        displayed.append(SecurityEntityAlignmentRecord(
+                            **common, record_type="DISPLAYED_TARGET_CANDIDATE",
+                            correction_trace=(
+                                ({"type": "UNPAIRED_DISPLAYED_CODE", "status": "PENDING"},)
+                                if not name and ambiguous else
+                                (({"type": "AMBIGUOUS_DISPLAYED_TARGETS", "status": "PENDING"},)
+                                 if ambiguous else ())
+                            ),
+                        ))
+                        for segment in scoped_segments:
+                            sealed_segment_ids = scoped_crosscheck_segments.get((frame.frame_id, window_id)) or set()
+                            if segment.segment_id not in sealed_segment_ids:
+                                continue
+                            raw_names, _ = _security_tokens(segment.raw_text or segment.text)
+                            normal_names, asr_codes = _security_tokens(segment.normalized_text or segment.text)
+                            matched = next(
+                                (value for value in normal_names if name and _entity_edit_distance(value, name) <= 1),
+                                None,
+                            )
+                            if matched is None:
+                                continue
+                            exact = matched == name and not ambiguous and bool(code)
+                            confidence = ocr.confidence_score or 0.0
+                            supported = exact and confidence >= self._min_ocr_confidence and (
+                                not asr_codes or asr_codes == [code]
+                            )
+                            relation = "SUPPORTS_DISPLAYED_MENTION" if supported else "ENTITY_CORRECTION_PENDING"
+                            # Fuzzy name is deliberately not resolved to an
+                            # OCR-only security code or canonical company.
+                            observed_code = code if supported else (asr_codes[0] if len(asr_codes) == 1 else "")
+                            trace = tuple(segment.correction_records) + ({
+                                "type": "ASR_OCR_ENTITY_ALIGNMENT", "before": matched, "after": name,
+                                "ocr_ticker": code, "relation": relation,
+                            },)
+                            mentions.append(SecurityEntityAlignmentRecord(
+                                **{**common, "ticker": observed_code,
+                                   "canonical_display": (f"{name}（{observed_code}）" if supported else matched)},
+                                asr_original_name=raw_names[0] if raw_names else matched,
+                                asr_normalized_name=matched, raw_asr_text=segment.raw_text or segment.text,
+                                asr_ticker=asr_codes[0] if len(asr_codes) == 1 else "",
+                                source_artifact_id=segment.source_artifact_id or transcript.artifact_id,
+                                asr_segment_id=segment.segment_id, asr_start_ms=segment.start_ms,
+                                asr_end_ms=segment.end_ms, relation=relation,
+                                relation_strength="HIGH" if supported else "LOW",
+                                correction_trace=trace, record_type="ALIGNED_MENTION",
+                            ))
+                # Model-observed entities remain a separate, lower-trust
+                # visual trace. They are not silently paired with OCR codes.
+                if vision and window_id in vision.evidence_window_ids and vision.frame_artifact_id == frame.artifact_id:
+                    observed_names = vision.payload.get("observed_entities") or []
+                    observed_codes = vision.payload.get("observed_tickers") or []
+                    if not isinstance(observed_names, list) or not isinstance(observed_codes, list):
+                        raise ValueError("vision security observations must be lists")
+                    if any(not isinstance(value, str) or not value.strip() for value in observed_names):
+                        raise ValueError("invalid vision observed entity")
+                    if any(not isinstance(value, str) or not re.fullmatch(r"\d{6}", value) for value in observed_codes):
+                        raise ValueError("invalid vision observed ticker")
+                    for name in sorted(set(observed_names)):
+                        displayed.append(SecurityEntityAlignmentRecord(
+                            evidence_window_id=window_id, ocr_name=name, canonical_display=name,
+                            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id,
+                            timestamp_ms=frame.timestamp_ms, image_hash=frame.image_hash,
+                            vision_artifact_id=vision.artifact_id,
+                            correction_trace=({"type": "VISION_OBSERVED_ENTITY", "status": "PENDING"},),
+                            record_type="VISION_DISPLAYED_TARGET_CANDIDATE",
+                        ))
+                    for code in sorted(set(observed_codes)):
+                        displayed.append(SecurityEntityAlignmentRecord(
+                            evidence_window_id=window_id, ticker=code, canonical_display=code,
+                            frame_id=frame.frame_id, frame_artifact_id=frame.artifact_id,
+                            timestamp_ms=frame.timestamp_ms, image_hash=frame.image_hash,
+                            vision_artifact_id=vision.artifact_id,
+                            correction_trace=({"type": "VISION_OBSERVED_TICKER", "status": "PENDING"},),
+                            record_type="VISION_DISPLAYED_TARGET_CANDIDATE",
+                        ))
+        artifact = SecurityEntityAlignmentArtifact(
+            artifact_id="security-entity-alignment-pending", artifact_type="security_entity_alignment",
+            producer_stage=self.name, producer_version=self._version,
+            transcript_artifact_id=transcript.artifact_id, crosscheck_artifact_id=crosscheck.artifact_id,
+            security_mentions=tuple(mentions), displayed_target_candidates=tuple(displayed),
+            alignment_version=self._version,
+            parent_artifact_ids=tuple(sorted({
+                transcript.artifact_id, crosscheck.artifact_id,
+                *(item.artifact_id for item in context.artifacts.frames),
+                *(item.artifact_id for item in context.artifacts.ocr),
+                *(item.artifact_id for item in context.artifacts.vision),
+            })),
+        )
+        artifact = SecurityEntityAlignmentArtifact(**{**artifact.__dict__, "artifact_id": artifact_id_of(artifact)})
+        context.artifacts.set("security_entity_alignment", artifact)
+        context.state.security_mentions = list(artifact.to_dict()["security_mentions"])
+        context.state.displayed_target_candidates = list(artifact.to_dict()["displayed_target_candidates"])
+        return _stage_result(context, "security_entity_alignment")
+
+
 def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[str, str]:
     """Return only replay-relevant, non-secret visual component identities."""
     config = dict(context.options.get("pipeline_config") or {})
@@ -1533,10 +1799,10 @@ def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[
     identity = {
         "crosscheck_version": str(crosscheck_version),
         "knowledge_evidence_window_planner_version": str(
-            config.get("knowledge_evidence_window_planner_version") or "knowledge-evidence-window.v1"
+            config.get("knowledge_evidence_window_planner_version") or "knowledge-evidence-window.v2"
         ),
         "knowledge_frame_planner_version": ",".join(
-            planner_versions or [str(config.get("knowledge_frame_planner_version") or "knowledge-frame-plan.v1")]
+            planner_versions or [str(config.get("knowledge_frame_planner_version") or "knowledge-frame-plan.v3")]
         ),
         "ocr_engine_versions": ",".join(
             ocr_versions or [f"{config.get('ocr_engine') or 'paddleocr'}@{config.get('ocr_engine_version') or '3'}"]
@@ -1551,9 +1817,9 @@ def _visual_identity(context: PipelineContext, crosscheck_version: str) -> dict[
         "vision_prompt_version": str(
             config.get("vision_prompt_version")
             or context.options.get("vision_prompt_version")
-            or "vision-context.prompt.v1"
+            or "vision-context.prompt.v2"
         ),
-        "vision_adapter_version": str(config.get("vision_adapter_version") or "http-vision-adapter.v1"),
+        "vision_adapter_version": str(config.get("vision_adapter_version") or "http-vision-adapter.v2"),
     }
     fixture = context.options.get("vision_fixture_identity")
     if isinstance(fixture, dict):
@@ -1767,8 +2033,9 @@ class KnowledgeDirectedFrameExtractionStage:
         )
         context.state.knowledge_evidence_windows = list(windows)
         draft_window_ids: dict[int, tuple[str, ...]] = {}
+        available_segment_indices = {item.segment_index for item in transcript.segments}
         for index, draft in enumerate(drafts):
-            indices = tuple(sorted({int(value) for value in draft.evidence_segment_indices}))
+            indices = evidence_segment_indices_for_draft(draft, available_segment_indices)
             matching = [
                 window
                 for window in windows
@@ -1885,6 +2152,39 @@ class SemanticContextStage:
         return _stage_result(context)
 
 
+class ChapterThesisIdentificationStage:
+    """Identify chapter-level parent theses before atomic claim extraction."""
+
+    name = "chapter_thesis_identification"
+    required_inputs = ("transcript", "semantic_segments")
+    output_types = ()
+
+    def __init__(self, identifier: ChapterThesisIdentifier | None = None, model_gateway=None) -> None:
+        self._identifier = identifier or ChapterThesisIdentifier(model_gateway)
+
+    def execute(self, context: PipelineContext) -> PipelineContext:
+        transcript = context.artifacts.transcript
+        if transcript is None:
+            raise ValueError("chapter thesis identification requires transcript")
+        fixture = context.options.get("chapter_theses")
+        theses = self._identifier.identify(
+            transcript,
+            context.state.get("semantic_segments") or (),
+            context.state.get("chapters") or (),
+            metadata=context.state.get("metadata") or {},
+            fixture_theses=fixture,
+            offline_fixture=bool(
+                context.options.get("offline_fixture")
+                or "transcript" in context.options
+                or "segments" in context.options
+            ),
+        )
+        context.state["chapter_theses"] = theses
+        context.state["knowledge_hierarchy"] = [item.to_dict() for item in theses]
+        context.runtime.metrics["chapter_thesis_count"] = float(len(theses))
+        return _stage_result(context)
+
+
 class ClaimVisualBindingStage:
     """Bind only cross-check-admitted targeted visual artifacts to each draft.
 
@@ -1899,34 +2199,15 @@ class ClaimVisualBindingStage:
     output_types = ()
 
     def execute(self, context: PipelineContext) -> PipelineContext:
-        admitted = {
-            str(item.get("frame_id") or "")
-            for item in context.state.get("transcript_visual_crosschecks") or ()
-            if item.get("relation") in {"SUPPORTS", "CONTRADICTS"}
-        }
-        frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in admitted}
-        displayed_secondary = {
-            str(item.get("frame_id") or "")
-            for item in context.state.get("transcript_visual_crosschecks") or ()
-            if item.get("relation") == "SUPPORTS_DISPLAYED_SECONDARY"
-        }
-        # Keep this material separate from normally admitted multimodal
-        # evidence.  It is evidence that a secondary page was displayed, not
-        # independent confirmation of its policy or macro assertion.
-        frames.update(
-            {
-                item.frame_id: item
-                for item in context.artifacts.frames
-                if item.frame_id in displayed_secondary
-            }
-        )
+        checks = _visual_crosschecks(context)
+        frames = {item.frame_id: item for item in context.artifacts.frames}
         ocr_by_frame: dict[str, list[OCRArtifact]] = {}
         for item in context.artifacts.ocr:
-            if item.frame_id in frames and item.text:
+            if item.text:
                 ocr_by_frame.setdefault(item.frame_id, []).append(item)
         vision_by_frame: dict[str, list[VisionArtifact]] = {}
         for item in context.artifacts.vision:
-            if item.frame_id in frames and (item.label or item.labels):
+            if item.label or item.labels:
                 vision_by_frame.setdefault(item.frame_id, []).append(item)
         bound: list[ClaimOccurrenceDraft] = []
         for index, draft in enumerate(context.state.get("claim_drafts") or ()):
@@ -1934,9 +2215,13 @@ class ClaimVisualBindingStage:
             permit_displayed_secondary = _is_attributed_displayed_secondary_report(draft)
             anchors: list[VisualEvidenceAnchor] = []
             for frame in sorted(frames.values(), key=lambda item: (item.timestamp_ms, item.frame_id)):
-                if not window_ids.intersection(frame.evidence_window_ids):
-                    continue
-                if frame.frame_id in displayed_secondary and not permit_displayed_secondary:
+                if _admitted_scoped_visual_relation(
+                    checks,
+                    frame_id=frame.frame_id,
+                    window_ids=window_ids,
+                    semantic_segment_id=draft.semantic_segment_id,
+                    permit_displayed_secondary=permit_displayed_secondary,
+                ) is None:
                     continue
                 ocr = next(iter(ocr_by_frame.get(frame.frame_id, ())), None)
                 if ocr is not None:
@@ -1970,6 +2255,61 @@ class ClaimVisualBindingStage:
             bound.append(draft.model_copy(update={"visual_anchors": anchors}))
         context.state.claim_drafts = bound
         return _stage_result(context)
+
+
+def _visual_crosschecks(context: PipelineContext) -> list[dict[str, Any]]:
+    checks = [dict(item) for item in context.state.get("transcript_visual_crosschecks") or () if isinstance(item, dict)]
+    if checks or context.artifacts.transcript_visual_crosscheck is None:
+        return checks
+    return [
+        {
+            "frame_id": item.frame_id,
+            "frame_artifact_id": item.frame_artifact_id,
+            "timestamp_ms": item.timestamp_ms,
+            "semantic_segment_ids": list(item.semantic_segment_ids),
+            "evidence_window_ids": list(item.evidence_window_ids),
+            "relation": item.relation,
+            "mismatches": dict(item.mismatches),
+        }
+        for item in context.artifacts.transcript_visual_crosscheck.relations
+    ]
+
+
+def _admitted_scoped_visual_relation(
+    checks: list[dict[str, Any]],
+    *,
+    frame_id: str,
+    window_ids: set[str],
+    semantic_segment_id: str,
+    permit_displayed_secondary: bool,
+) -> str | None:
+    """Return one exact frame/window/semantic admission relation, if any.
+
+    A physical image can serve multiple windows.  Plural scope is ambiguous,
+    so a relation must be singleton-scoped before it can enter an occurrence.
+    """
+    matching = [
+        item
+        for item in checks
+        if str(item.get("frame_id") or "") == frame_id
+        and tuple(str(value) for value in item.get("semantic_segment_ids") or ()) == (semantic_segment_id,)
+        and tuple(str(value) for value in item.get("evidence_window_ids") or ()) in {
+            (window_id,) for window_id in window_ids
+        }
+    ]
+    if not matching:
+        return None
+    scopes = [tuple(str(value) for value in item.get("evidence_window_ids") or ()) for item in matching]
+    # A frame may have one singleton relation per owned window.  Repeated
+    # records for the *same* triple are not deterministic authority.
+    if len(scopes) != len(set(scopes)):
+        return None
+    relations = {str(item.get("relation") or "") for item in matching}
+    if relations <= {"SUPPORTS", "CONTRADICTS"}:
+        return "CONTRADICTS" if "CONTRADICTS" in relations else "SUPPORTS"
+    if relations == {"SUPPORTS_DISPLAYED_SECONDARY"} and permit_displayed_secondary:
+        return "SUPPORTS_DISPLAYED_SECONDARY"
+    return None
 
 
 def _is_attributed_displayed_secondary_report(draft: ClaimOccurrenceDraft) -> bool:
@@ -2009,10 +2349,18 @@ class AtomicClaimExtractionStage:
             value = item if isinstance(item, dict) else item.model_dump(mode="json")
             fixture_by_segment.setdefault(str(value.get("semantic_segment_id") or ""), []).append(value)
         for semantic_context in context.state.get("semantic_contexts") or ():
+            metadata = dict(context.state.get("metadata") or {})
+            matched_theses = [
+                item.to_dict()
+                for item in context.state.get("chapter_theses") or ()
+                if semantic_context.semantic_segment_id in item.semantic_segment_ids
+            ]
+            if matched_theses:
+                metadata["chapter_theses"] = matched_theses
             drafts.extend(
                 self._extractor.extract(
                     semantic_context,
-                    metadata=context.state.get("metadata") or {},
+                    metadata=metadata,
                     fixture_drafts=fixture_by_segment.get(semantic_context.semantic_segment_id)
                     if fixture is not None
                     else None,
@@ -2023,6 +2371,11 @@ class AtomicClaimExtractionStage:
                     ),
                 )
             )
+        theses = list(context.state.get("chapter_theses") or ())
+        drafts = [
+            *materialize_thesis_claim_drafts(theses),
+            *attach_thesis_hierarchy(drafts, theses),
+        ]
         context.state["claim_drafts"] = drafts
         context.runtime.metrics["claim_count"] = float(len(drafts))
         context.runtime.metrics["zero_claim_context_count"] = float(
@@ -2256,8 +2609,8 @@ class EvidenceGroundingStage:
         context.runtime.metrics["claim_grounding_reject_rate"] = rejected / max(1.0, float(len(drafts)))
         context.runtime.metrics["temporal_expression_grounding_reject_rate"] = 0.0
         enriched = []
-        for item in grounded:
-            visual_items = _occurrence_visual_evidence(context, item.draft)
+        for draft_index, item in enumerate(grounded):
+            visual_items = _occurrence_visual_evidence(context, item.draft, draft_index)
             if visual_items:
                 item = replace(
                     item,
@@ -2276,11 +2629,35 @@ class EvidenceGroundingStage:
             producer_stage=self.name,
             transcript_artifact_id=transcript.artifact_id,
             evidences=list(unique.values()),
-            source_artifact_ids=(transcript.artifact_id,),
+            source_artifact_ids=tuple(
+                sorted(
+                    {
+                        transcript.artifact_id,
+                        *(
+                            item.source_artifact_id
+                            for item in unique.values()
+                            if item.source_type in {"FRAME", "OCR", "VISION"} and item.source_artifact_id
+                        ),
+                    }
+                )
+            ),
             # Semantic segmentation is the authoritative boundary producer;
             # transcript remains an explicit compatibility reference.
             parent_artifact_ids=tuple(
-                item.artifact_id for item in (context.artifacts.semantic_segments, transcript) if item is not None
+                sorted(
+                    {
+                        *(
+                            item.artifact_id
+                            for item in (context.artifacts.semantic_segments, transcript)
+                            if item is not None
+                        ),
+                        *(
+                            item.source_artifact_id
+                            for item in unique.values()
+                            if item.source_type in {"FRAME", "OCR", "VISION"} and item.source_artifact_id
+                        ),
+                    }
+                )
             ),
         )
         context.artifacts.evidence = EvidenceArtifact(
@@ -2316,7 +2693,9 @@ def _evidence_item_for_visual(*, artifact, source_type: str, frame_id: str, time
     )
 
 
-def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrenceDraft) -> list[EvidenceItem]:
+def _occurrence_visual_evidence(
+    context: PipelineContext, draft: ClaimOccurrenceDraft, draft_index: int
+) -> list[EvidenceItem]:
     """Materialise only model-selected, crosscheck-admitted visual evidence.
 
     Evidence IDs are occurrence-owned through the later SECONDARY relation;
@@ -2324,21 +2703,9 @@ def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrence
     """
     if not draft.visual_anchors:
         return []
-    eligible = _eligible_visual_ids(context)
-    if _is_attributed_displayed_secondary_report(draft):
-        # Displayed secondary pages are deliberately excluded from the normal
-        # SUPPORTS/CONTRADICTS admission set because they do not independently
-        # verify an investment fact.  They are nevertheless valid direct
-        # evidence for the narrower proposition "the displayed page reports
-        # X" (for example KU11/KU12).  ClaimVisualBindingStage already limits
-        # these anchors to that attributed-report claim shape; mirror the same
-        # rule here so persistence cannot reject its own admitted anchors.
-        eligible.update(
-            str(item.get("frame_id") or "")
-            for item in context.state.get("transcript_visual_crosschecks") or ()
-            if item.get("relation") == "SUPPORTS_DISPLAYED_SECONDARY"
-        )
-    frames = {item.frame_id: item for item in context.artifacts.frames if item.frame_id in eligible}
+    window_ids = set(context.state.claim_evidence_window_ids.get(draft_index, ()))
+    checks = _visual_crosschecks(context)
+    frames = {item.frame_id: item for item in context.artifacts.frames}
     ocr_by_frame: dict[str, list[Any]] = {}
     vision_by_frame: dict[str, list[Any]] = {}
     for item in context.artifacts.ocr:
@@ -2347,6 +2714,14 @@ def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrence
         vision_by_frame.setdefault(item.frame_id, []).append(item)
     selected: dict[str, EvidenceItem] = {}
     for anchor in draft.visual_anchors:
+        if _admitted_scoped_visual_relation(
+            checks,
+            frame_id=anchor.frame_id,
+            window_ids=window_ids,
+            semantic_segment_id=draft.semantic_segment_id,
+            permit_displayed_secondary=_is_attributed_displayed_secondary_report(draft),
+        ) is None:
+            raise ValueError("VISUAL_ANCHOR_ARTIFACT_MISSING_OR_NOT_ADMITTED")
         frame = frames.get(anchor.frame_id)
         if frame is None:
             raise ValueError("VISUAL_ANCHOR_ARTIFACT_MISSING_OR_NOT_ADMITTED")
@@ -2404,22 +2779,21 @@ def _occurrence_visual_evidence(context: PipelineContext, draft: ClaimOccurrence
     return list(selected.values())
 
 
-def _occurrence_review_reason_codes(context: PipelineContext, draft: ClaimOccurrenceDraft) -> list[str]:
+def _occurrence_review_reason_codes(
+    context: PipelineContext, draft: ClaimOccurrenceDraft, draft_index: int | None = None
+) -> list[str]:
     reasons: set[str] = set()
-    checks = list(context.state.get("transcript_visual_crosschecks") or ())
-    if not checks and context.artifacts.transcript_visual_crosscheck is not None:
-        checks = [
-            {
-                "relation": item.relation,
-                "semantic_segment_ids": list(item.semantic_segment_ids),
-                "mismatches": dict(item.mismatches),
-            }
-            for item in context.artifacts.transcript_visual_crosscheck.relations
-        ]
+    checks = _visual_crosschecks(context)
+    owned_windows = set(
+        context.state.get("claim_evidence_window_ids", {}).get(draft_index, ()) if draft_index is not None else ()
+    )
     for check in checks:
         if not isinstance(check, dict) or check.get("relation") != "CONTRADICTS":
             continue
-        if draft.semantic_segment_id not in set(check.get("semantic_segment_ids") or []):
+        check_windows = tuple(str(value) for value in check.get("evidence_window_ids") or ())
+        if check_windows not in {(window_id,) for window_id in owned_windows}:
+            continue
+        if tuple(str(value) for value in check.get("semantic_segment_ids") or ()) != (draft.semantic_segment_id,):
             continue
         mismatches = dict(check.get("mismatches") or {})
         if "NUMBER" in mismatches:
@@ -2427,6 +2801,136 @@ def _occurrence_review_reason_codes(context: PipelineContext, draft: ClaimOccurr
         else:
             reasons.add("ASR_VISUAL_CONFLICT")
     return sorted(reasons)
+
+
+def _trusted_verification_for_draft(
+    context: PipelineContext, draft_index: int, *, claim_id: str | None = None
+) -> TrustedExternalVerification | None:
+    """Read only the typed pipeline seam, never model-supplied JSON."""
+    supplied = context.state.get("trusted_external_verifications") or {}
+    value = supplied.get(draft_index) if isinstance(supplied, dict) else None
+    if not isinstance(value, TrustedExternalVerification):
+        return None
+    # The typed seam is still occurrence-local authority.  It must name the
+    # already-canonical claim before it can affect occurrence semantics.
+    return value if claim_id is None or value.claim_id == claim_id else None
+
+
+def _occurrence_visual_evidence_packet(
+    context: PipelineContext,
+    draft: ClaimOccurrenceDraft,
+    draft_index: int,
+    *,
+    knowledge_id: str,
+) -> dict[str, Any]:
+    """Seal an occurrence-local visual decision from immutable artifacts only."""
+    window_ids = tuple(sorted(context.state.get("claim_evidence_window_ids", {}).get(draft_index, ())))
+    frames_by_window: dict[str, list[FrameArtifact]] = {window_id: [] for window_id in window_ids}
+    for frame in context.artifacts.frames:
+        for window_id in set(frame.evidence_window_ids).intersection(window_ids):
+            frames_by_window[window_id].append(frame)
+    checks = [
+        dict(item)
+        for item in context.state.get("transcript_visual_crosschecks") or ()
+        if isinstance(item, dict)
+    ]
+    if not checks and context.artifacts.transcript_visual_crosscheck is not None:
+        checks = [
+            {
+                "frame_id": item.frame_id,
+                "frame_artifact_id": item.frame_artifact_id,
+                "timestamp_ms": item.timestamp_ms,
+                "semantic_segment_ids": list(item.semantic_segment_ids),
+                "evidence_window_ids": list(item.evidence_window_ids),
+                "relation": item.relation,
+                "mismatches": dict(item.mismatches),
+            }
+            for item in context.artifacts.transcript_visual_crosscheck.relations
+        ]
+    ocr_by_frame: dict[str, list[OCRArtifact]] = {}
+    vision_by_frame: dict[str, list[VisionArtifact]] = {}
+    for artifact in context.artifacts.ocr:
+        ocr_by_frame.setdefault(artifact.frame_id, []).append(artifact)
+    for artifact in context.artifacts.vision:
+        vision_by_frame.setdefault(artifact.frame_id, []).append(artifact)
+    windows: list[dict[str, Any]] = []
+    statuses: list[str] = []
+    permit_displayed_secondary = _is_attributed_displayed_secondary_report(draft)
+    for window_id in window_ids:
+        candidates = sorted(frames_by_window.get(window_id, ()), key=lambda item: (item.timestamp_ms, item.frame_id))
+        if not candidates:
+            windows.append({"evidence_window_id": window_id, "status": "GAP", "reason": "FRAME_MISSING", "frames": []})
+            statuses.append("GAP")
+            continue
+        frame_entries: list[dict[str, Any]] = []
+        supported = contradicted = has_crosscheck = scope_ambiguous = False
+        for frame in candidates:
+            scoped = [
+                check for check in checks
+                if str(check.get("frame_id") or "") == frame.frame_id
+                and tuple(str(value) for value in check.get("evidence_window_ids") or ()) == (window_id,)
+                and tuple(str(value) for value in check.get("semantic_segment_ids") or ()) == (
+                    draft.semantic_segment_id,
+                )
+            ]
+            frame_checks = [check for check in checks if str(check.get("frame_id") or "") == frame.frame_id]
+            check = scoped[0] if len(scoped) == 1 else None
+            scope_ambiguous = scope_ambiguous or len(scoped) > 1 or (bool(frame_checks) and not scoped)
+            relation = str((check or {}).get("relation") or "UNKNOWN")
+            has_crosscheck = has_crosscheck or check is not None
+            ocr = [
+                {"artifact_id": item.artifact_id, "artifact_hash": f"sha256:{item.content_hash}", "summary": item.text,
+                 "confidence": item.confidence_score, "model": {
+                     "name": item.engine, "version": item.engine_version, "confidence": item.confidence_score,
+                 }}
+                for item in sorted(ocr_by_frame.get(frame.frame_id, ()), key=lambda item: item.artifact_id) if item.text
+            ]
+            vision = [
+                {"artifact_id": item.artifact_id, "artifact_hash": f"sha256:{item.content_hash}",
+                 "summary": item.label or " ".join(item.labels), "confidence": item.confidence_score,
+                 "model": {
+                     "name": item.model_name, "version": item.model_version, "confidence": item.confidence_score,
+                 }}
+                for item in sorted(vision_by_frame.get(frame.frame_id, ()), key=lambda item: item.artifact_id)
+                if item.label or item.labels
+            ]
+            frame_entries.append({
+                "frame_id": frame.frame_id, "frame_artifact_id": frame.artifact_id,
+                "frame_artifact_hash": f"sha256:{frame.content_hash}", "timestamp_ms": frame.timestamp_ms,
+                "image_hash": frame.image_hash, "relation": relation, "ocr": ocr, "vision": vision,
+            })
+            contradicted = contradicted or relation == "CONTRADICTS"
+            supported = supported or (
+                (relation == "SUPPORTS" or (
+                    relation == "SUPPORTS_DISPLAYED_SECONDARY" and permit_displayed_secondary
+                )) and bool(ocr or vision)
+            )
+        if contradicted:
+            status, reason = "HUMAN_REVIEW_REQUIRED", "CROSSCHECK_CONTRADICTS"
+        elif supported:
+            status, reason = "AVAILABLE", None
+        elif not has_crosscheck:
+            status, reason = "GAP", "CROSSCHECK_SCOPE_AMBIGUOUS" if scope_ambiguous else "CROSSCHECK_MISSING"
+        elif any(entry["relation"] in {"UNKNOWN", "UNRELATED"} for entry in frame_entries):
+            status, reason = "GAP", "CROSSCHECK_UNKNOWN_OR_UNRELATED"
+        elif any(entry["relation"] == "SUPPORTS_DISPLAYED_SECONDARY" for entry in frame_entries):
+            status, reason = "GAP", "DISPLAYED_SECONDARY_NOT_ATTRIBUTED"
+        else:
+            status, reason = "GAP", "OCR_AND_VISION_MISSING"
+        windows.append({"evidence_window_id": window_id, "status": status, "reason": reason, "frames": frame_entries})
+        statuses.append(status)
+    if not windows:
+        overall_status, reason = "GAP", "EVIDENCE_WINDOW_MISSING"
+    elif "HUMAN_REVIEW_REQUIRED" in statuses:
+        overall_status, reason = "HUMAN_REVIEW_REQUIRED", "CROSSCHECK_CONTRADICTS"
+    elif all(status == "AVAILABLE" for status in statuses):
+        overall_status, reason = "AVAILABLE", None
+    else:
+        overall_status, reason = "GAP", next(
+            str(item.get("reason") or "VISUAL_EVIDENCE_GAP") for item in windows if item["status"] == "GAP"
+        )
+    return {"knowledge_id": knowledge_id, "occurrence_id": knowledge_id, "status": overall_status,
+            "reason": reason, "windows": windows}
 
 
 class TemporalNormalizationStage:
@@ -2716,7 +3220,7 @@ def _stage_timestamp(context: PipelineContext) -> datetime:
 class ClaimOccurrencePersistenceStage:
     name = "claim_occurrence_persistence"
     required_inputs = ("semantic_segments", "evidence", "claims")
-    output_types = ("occurrences", "claims")
+    output_types = ("occurrences", "claims", "knowledge_visual_evidence")
 
     def __init__(self, repository=None) -> None:
         self._repository = repository
@@ -2791,16 +3295,18 @@ class ClaimOccurrencePersistenceStage:
                 snapshot_committed_at=candidate,
                 available_from=candidate,
             )
-            review_codes = _occurrence_review_reason_codes(context, draft)
+            review_codes = _occurrence_review_reason_codes(context, draft, draft_index)
             semantic_envelope = bundle_v2_semantics(
                 statement=claim.normalized_statement or draft.conclusion,
                 claim_type=claim.claim_type,
                 supplied={**dict(claim.bundle_v2), **dict(draft.bundle_v2)},
                 temporal_expressions=[item.model_dump(mode="json") for item in draft.temporal_expressions],
                 review_reason_codes=review_codes,
+                trusted_verification=_trusted_verification_for_draft(
+                    context, draft_index, claim_id=claim.claim_id
+                ),
             )
-            occurrences.append(
-                ClaimOccurrence(
+            occurrence = ClaimOccurrence(
                     claim_id=claim.claim_id,
                     source_artifact_id=(
                         context.artifacts.source.artifact_id if context.artifacts.source else transcript.artifact_id
@@ -2849,7 +3355,39 @@ class ClaimOccurrencePersistenceStage:
                     claim_schema_version=draft.claim_schema_version,
                     legacy_grounding_incomplete=draft.legacy_grounding_incomplete,
                 )
-            )
+            occurrence = occurrence.model_copy(update={"provenance": {
+                **occurrence.provenance,
+                "visual_evidence": _occurrence_visual_evidence_packet(
+                    context, draft, draft_index, knowledge_id=occurrence.occurrence_id
+                ),
+            }})
+            occurrences.append(occurrence)
+        visual_packets = [dict(item.provenance.get("visual_evidence") or {}) for item in occurrences]
+        visual_artifact = KnowledgeVisualEvidenceArtifact(
+            artifact_id="knowledge-visual-evidence-pending",
+            artifact_type="knowledge_visual_evidence",
+            producer_stage=self.name,
+            occurrence_packets=visual_packets,
+            parent_artifact_ids=tuple(
+                sorted(
+                    {
+                        *(item.artifact_id for item in context.artifacts.frames),
+                        *(item.artifact_id for item in context.artifacts.ocr),
+                        *(item.artifact_id for item in context.artifacts.vision),
+                        *(
+                            (context.artifacts.transcript_visual_crosscheck.artifact_id,)
+                            if context.artifacts.transcript_visual_crosscheck is not None else ()
+                        ),
+                    }
+                )
+            ),
+        )
+        context.artifacts.set(
+            "knowledge_visual_evidence",
+            KnowledgeVisualEvidenceArtifact(
+                **{**visual_artifact.__dict__, "artifact_id": artifact_id_of(visual_artifact)}
+            ),
+        )
         occurrence_artifact = ClaimOccurrenceArtifact(
             artifact_id="occurrences-pending",
             artifact_type="occurrences",
@@ -2858,7 +3396,14 @@ class ClaimOccurrencePersistenceStage:
             evidence_artifact_id=evidence_artifact.artifact_id if evidence_artifact else "",
             occurrence_ids=[item.occurrence_id for item in occurrences],
             parent_artifact_ids=tuple(
-                item.artifact_id for item in (semantic_artifact, evidence_artifact) if item is not None
+                item.artifact_id
+                for item in (
+                    semantic_artifact,
+                    evidence_artifact,
+                    context.artifacts.transcript_visual_crosscheck,
+                    context.artifacts.knowledge_visual_evidence,
+                )
+                if item is not None
             ),
         )
         context.artifacts.occurrences = ClaimOccurrenceArtifact(
@@ -2889,7 +3434,7 @@ class ClaimOccurrencePersistenceStage:
             0.0,
             (candidate - min(ingested, extracted)).total_seconds() * 1000.0,
         )
-        return _stage_result(context, "occurrences", "claims")
+        return _stage_result(context, "occurrences", "claims", "knowledge_visual_evidence")
 
 
 class LifecycleProjectionStage:
@@ -4549,7 +5094,7 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     prompts.setdefault(
         "vision",
         context.options.get("vision_prompt_version")
-        or pipeline_config.get("vision_prompt_version", "vision-context.prompt.v1"),
+        or pipeline_config.get("vision_prompt_version", "vision-context.prompt.v2"),
     )
     manifest["prompts"] = prompts
     configs = dict(manifest.get("configs") or {})
@@ -4564,18 +5109,18 @@ def _producer_manifest(context: PipelineContext) -> dict[str, Any]:
     configs.setdefault("entity_alias_version", context.options.get("entity_alias_version", "entity_alias.v1"))
     configs.setdefault(
         "knowledge_frame_planner_version",
-        pipeline_config.get("knowledge_frame_planner_version", "knowledge-frame-plan.v1"),
+        pipeline_config.get("knowledge_frame_planner_version", "knowledge-frame-plan.v3"),
     )
     configs.setdefault(
         "knowledge_evidence_window_planner_version",
-        pipeline_config.get("knowledge_evidence_window_planner_version", "knowledge-evidence-window.v1"),
+        pipeline_config.get("knowledge_evidence_window_planner_version", "knowledge-evidence-window.v2"),
     )
     configs.setdefault(
         "transcript_visual_crosscheck_version",
-        pipeline_config.get("transcript_visual_crosscheck_version", "transcript-visual-crosscheck.v1"),
+        pipeline_config.get("transcript_visual_crosscheck_version", "transcript-visual-crosscheck.v3"),
     )
     configs.setdefault(
-        "vision_adapter_version", pipeline_config.get("vision_adapter_version", "http-vision-adapter.v1")
+        "vision_adapter_version", pipeline_config.get("vision_adapter_version", "http-vision-adapter.v2")
     )
     manifest["configs"] = configs
     return manifest

@@ -30,7 +30,7 @@ from stock_content.ports.repositories import IdempotencyConflict
 
 NOW = datetime(2026, 9, 6, tzinfo=UTC)
 CHECKSUM = "sha256:EBFD13B78622C3846890438A4FB3CB858278F571FDAB247CDD72EF18CA211621"
-V2_CHECKSUM = "sha256:23C1D9C6BE131CBA8F270F01F7F45EB5D3148EE219EDF43D689F1C5707115800"
+V2_CHECKSUM = "sha256:6E2487B527B6B374C510C798A2F3EF26ABD2477B5F0437137A439A0095204D1F"
 
 
 def _request(**changes):
@@ -127,7 +127,7 @@ def _v2_service(authority=None):
 def _v2_item(identifier="co_1", *, review=False, nature="METHOD"):
     item = _item(identifier)
     item.update({
-        "statement": "课程提出三层资金池分别承担压舱、核心和卫星风险",
+        "statement": "课程提出：三层资金池分别承担压舱、核心和卫星风险",
         "subject": {"type": "TOPIC", "key": "capital_allocation"},
         "primary_domain": "PORTFOLIO_RISK_MANAGEMENT",
         "claim_nature": nature,
@@ -468,6 +468,23 @@ def test_immutable_migration_declares_update_rejection():
 
 def test_v2_bundle_keeps_v1_replay_locked_and_exposes_reviewed_multitopic_semantics():
     first, conflict = _v2_item("co_1"), _v2_item("co_2", review=True)
+    first["visual_evidence"] = {
+        "knowledge_id": "co_1", "occurrence_id": "co_1", "status": "AVAILABLE", "reason": None,
+        "windows": [{
+            "evidence_window_id": "kew_1", "status": "AVAILABLE", "reason": None,
+            "frames": [{
+                "frame_id": "frame_1", "frame_artifact_id": "frame-artifact-1",
+                "frame_artifact_hash": "sha256:" + "b" * 64, "timestamp_ms": 1_000,
+                "image_hash": "image-hash-1", "relation": "SUPPORTS",
+                "ocr": [{
+                    "artifact_id": "ocr-artifact-1", "artifact_hash": "sha256:" + "c" * 64,
+                    "summary": "三层资金池", "confidence": 0.9,
+                    "model": {"name": "paddleocr", "version": "3.7", "confidence": 0.9},
+                }],
+                "vision": [],
+            }],
+        }],
+    }
     conflict["lifecycle_status"] = "EXTRACTED"
     authority = Authority([first, conflict])
     request = _request(symbol="UNSPECIFIED", contract_version=V2_CONTRACT)
@@ -479,6 +496,7 @@ def test_v2_bundle_keeps_v1_replay_locked_and_exposes_reviewed_multitopic_semant
     assert bundle["request"]["subject_scope"] == "ALL_SUBJECTS"
     assert bundle["scope"] == {"subject_scope": "ALL_SUBJECTS", "requested_subject": None}
     assert bundle["items"][0]["statement"] == "三层资金池分别承担压舱、核心和卫星风险"
+    assert bundle["items"][0]["visual_evidence"]["status"] == "AVAILABLE"
     assert bundle["quality"]["candidate_count"] == 2
     assert bundle["quality"]["knowledge_count"] == 1
     assert bundle["quality"]["eligible_candidate_count"] == 1
@@ -491,6 +509,30 @@ def test_v2_bundle_keeps_v1_replay_locked_and_exposes_reviewed_multitopic_semant
     assert "HUMAN_REVIEW_REQUIRED_ITEMS_EXCLUDED" in bundle["quality"]["warnings"]
     # Contract selection never mutates v1's canonical request/hash path.
     assert _service(Authority([_item()])).create(_request())["contract"] == "content-knowledge-bundle.v1"
+
+
+def test_sql_projection_resolves_internal_thesis_node_to_public_parent_and_children():
+    from stock_content.adapters.postgres.repositories.knowledge_bundle_repository import (
+        _resolve_hierarchy_links,
+    )
+
+    items = [
+        {"knowledge_id": "occ-parent", "knowledge_role": "THESIS"},
+        {
+            "knowledge_id": "occ-mechanism",
+            "knowledge_role": "MECHANISM",
+            "parent_knowledge_id": "thesis-node",
+        },
+        {
+            "knowledge_id": "occ-evidence",
+            "knowledge_role": "EVIDENCE",
+            "parent_knowledge_id": "thesis-node",
+        },
+    ]
+    _resolve_hierarchy_links(items, {"thesis-node": "occ-parent"})
+
+    assert items[0]["child_knowledge_ids"] == ["occ-evidence", "occ-mechanism"]
+    assert {item["parent_knowledge_id"] for item in items[1:]} == {"occ-parent"}
 
 
 def test_v2_requires_attribution_for_source_forecasts_and_explicit_unknown_time():

@@ -17,7 +17,7 @@ from .knowledge_evidence_window import (
     KnowledgeEvidenceWindow,
 )
 
-KNOWLEDGE_FRAME_PLANNER_VERSION = "knowledge-frame-plan.v1"
+KNOWLEDGE_FRAME_PLANNER_VERSION = "knowledge-frame-plan.v3"
 
 KNOWLEDGE_CENTER = "KNOWLEDGE_CENTER"
 KNOWLEDGE_NEARBY = "KNOWLEDGE_NEARBY"
@@ -43,11 +43,13 @@ def evidence_window_id(window: KnowledgeEvidenceWindow) -> str:
         "end_ms": window.end_ms,
         "center_ms": window.center_ms,
         "transcript_segment_ids": window.transcript_segment_ids,
+        "transcript_anchor_ms": window.transcript_anchor_ms,
         "high_signals": [
-            (item.kind, item.reason, item.transcript_segment_ids) for item in window.high_signals
+            (item.kind, item.reason, item.transcript_segment_ids, item.anchor_ms) for item in window.high_signals
         ],
         "planner_version": window.planner_version,
         "knowledge_identity": window.knowledge_identity,
+        "sampling_strategy": window.sampling_strategy,
     }
     return "kew_" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:57]
 
@@ -84,21 +86,43 @@ class KnowledgeFramePlanner:
         if media_duration_ms < 0:
             raise ValueError("media_duration_ms must be non-negative")
         candidates: list[tuple[int, int, str, str, str]] = []
-        # priority preserves the centre if a cap or timestamp collision occurs.
+        high_signal_window_ids: set[str] = set()
+        # C4 mandatory transcript anchors and +/-3s high-signal offsets win
+        # over the historical soft 7/window and 120/media ordinary-frame
+        # budgets. Never silently discard accepted evidence anchors.
         priority = {KNOWLEDGE_CENTER: 0, HIGH_SIGNAL: 1, KNOWLEDGE_NEARBY: 2}
         ordered = sorted(windows, key=lambda item: (item.start_ms, item.end_ms, item.semantic_segment_id))
         for window in ordered:
             window_id = evidence_window_id(window)
-            offsets = self._high_signal_offsets_ms if window.high_signals else self._nearby_offsets_ms
-            local = [(window.center_ms, KNOWLEDGE_CENTER)] + [
-                (window.center_ms + offset, HIGH_SIGNAL if window.high_signals else KNOWLEDGE_NEARBY)
-                for offset in offsets
-            ]
-            # Normalise a boundary-clamped window before applying its local cap.
+            if window.high_signals:
+                high_signal_window_ids.add(window_id)
+            anchors = window.transcript_anchor_ms or (window.center_ms,)
+            local = [(anchor, KNOWLEDGE_CENTER) for anchor in anchors]
+            if window.sampling_strategy == "THESIS_PHASES":
+                # Transcript coverage stays complete in the evidence window;
+                # visual coverage spans proposal, argument and conclusion.
+                pass
+            elif window.high_signals:
+                for signal in window.high_signals:
+                    for anchor in signal.anchor_ms or anchors:
+                        local.extend(
+                            (anchor + offset, HIGH_SIGNAL)
+                            for offset in (0, *self._high_signal_offsets_ms)
+                        )
+            else:
+                local.extend(
+                    (anchor + offset, KNOWLEDGE_NEARBY)
+                    for anchor in anchors
+                    for offset in self._nearby_offsets_ms
+                )
+            # Normalise boundary clamping and preserve all mandatory anchors.
             local = sorted(
                 {(min(max(0, timestamp), media_duration_ms), reason) for timestamp, reason in local},
                 key=lambda item: (priority[item[1]], item[0], item[1]),
-            )[: self._max_frames_per_window]
+            )
+            mandatory_local = [item for item in local if item[1] in {KNOWLEDGE_CENTER, HIGH_SIGNAL}]
+            ordinary_local = [item for item in local if item[1] == KNOWLEDGE_NEARBY]
+            local = mandatory_local + ordinary_local[: max(0, self._max_frames_per_window - len(mandatory_local))]
             candidates.extend(
                 (timestamp, priority[reason], reason, window.semantic_segment_id, window_id)
                 for timestamp, reason in local
@@ -123,10 +147,24 @@ class KnowledgeFramePlanner:
             )
         # Preserve every centre before lower-priority nearby samples when a
         # global cap is reached, then restore chronological extraction order.
-        selected = sorted(
-            output,
-            key=lambda item: (priority[item.extraction_reason], item.timestamp_ms, item.semantic_segment_ids),
-        )[: self._max_frames_per_media]
+        # The global budget controls ordinary nearby samples only.  Accepted
+        # centres and the full +/-3 second high-signal pattern are mandatory;
+        # otherwise 121 centres could consume the historic 120-frame budget
+        # and silently erase the numerically relevant visual checks.
+        mandatory = [
+            item
+            for item in output
+            if item.extraction_reason in {KNOWLEDGE_CENTER, HIGH_SIGNAL}
+            or set(item.evidence_window_ids).intersection(high_signal_window_ids)
+        ]
+        ordinary = [item for item in output if item not in mandatory]
+        selected = [
+            *mandatory,
+            *sorted(
+                ordinary,
+                key=lambda item: (priority[item.extraction_reason], item.timestamp_ms, item.semantic_segment_ids),
+            )[: max(0, self._max_frames_per_media - len(mandatory))],
+        ]
         return tuple(sorted(selected, key=lambda item: (item.timestamp_ms, item.extraction_reason)))
 
 

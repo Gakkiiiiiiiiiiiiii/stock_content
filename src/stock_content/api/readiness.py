@@ -172,7 +172,7 @@ def _video_components(dependencies: ReadinessDependencies, application: object |
     heartbeat_path = os.getenv("CONTENT_VIDEO_WORKER_HEARTBEAT_FILE", "")
     heartbeat_ok, heartbeat_payload = _video_worker_heartbeat(heartbeat_path)
     raw_dir = os.getenv("CONTENT_RAW_STORAGE_DIR", "")
-    raw_ok = bool(raw_dir and Path(raw_dir).is_dir() and os.access(raw_dir, os.R_OK | os.W_OK))
+    raw_ok = bool(raw_dir and Path(raw_dir).is_dir() and os.access(raw_dir, os.R_OK | os.X_OK))
     model_ok = bool(os.getenv("CONTENT_MODEL_URL", "") and os.getenv("CONTENT_MODEL_NAME", ""))
     vision_ok = bool(os.getenv("CONTENT_VISION_URL", "") and os.getenv("CONTENT_VISION_MODEL", ""))
     asr_ok = importlib.util.find_spec("faster_whisper") is not None

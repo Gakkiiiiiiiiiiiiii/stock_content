@@ -13,6 +13,7 @@ from stock_content.adapters.media import (
     PaddleOcrEngine,
     PyannoteDiarizer,
 )
+from stock_content.adapters.media.transcript_converter import OpenCCTranscriptConverter
 from stock_content.adapters.media.vision import CodexCliVisionAnalyzer
 from stock_content.adapters.postgres import Database
 from stock_content.adapters.postgres.repositories import (
@@ -62,6 +63,7 @@ from stock_content.application.stages import (
     AudioStage,
     BuildVideoStage,
     ChapterStage,
+    ChapterThesisIdentificationStage,
     ClaimCanonicalizationStage,
     ClaimOccurrencePersistenceStage,
     ClaimPersistenceStage,
@@ -78,6 +80,7 @@ from stock_content.application.stages import (
     OCRStage,
     PersistStage,
     ResolveSourceStage,
+    SecurityEntityAlignmentStage,
     SemanticContextStage,
     SemanticSegmentationStage,
     SnapshotRecordingStage,
@@ -103,6 +106,7 @@ from stock_content.domain.knowledge_evidence_window import (
     KnowledgeEvidenceWindowPlanner,
 )
 from stock_content.domain.knowledge_frame_plan import KNOWLEDGE_FRAME_PLANNER_VERSION, KnowledgeFramePlanner
+from stock_content.domain.knowledge_hierarchy import ChapterThesisIdentifier
 from stock_content.domain.lineage import default_code_sha
 from stock_content.domain.multimodal_context_builder import MultimodalContextBuilder
 from stock_content.domain.retention import RetentionPolicy
@@ -125,7 +129,7 @@ STAGE_VERSIONS: dict[str, str] = {
     "frame": "2.0.0",
     "frame_fixture": "2.0.0",
     "audio": "1.0.0",
-    "asr": "1.0.0",
+    "asr": "2.0.0",
     # Coverage policy changed from 95% with a max-gap gate to 90% without
     # that gate.  All three transcript decision stages must reject old
     # checkpoints rather than resume under the changed semantics.
@@ -133,7 +137,7 @@ STAGE_VERSIONS: dict[str, str] = {
     "transcript_selection": "2.0.0",
     "transcript_quality": "2.0.0",
     "diarization": "1.0.0",
-    "transcript_postprocess": "1.0.0",
+    "transcript_postprocess": "2.0.0",
     # C4 plans frames from accepted transcript-grounded atomic drafts.  Every
     # affected visual checkpoint is invalidated rather than treating a former
     # semantic-wide sample as claim-directed visual provenance.
@@ -142,20 +146,22 @@ STAGE_VERSIONS: dict[str, str] = {
     # GPU runtime/device identity is now a checkpoint input. Pre-isolation
     # (including CPU) OCR results cannot resume into a required-GPU task.
     "ocr": "6.0.0",
-    "vision": "5.0.0",
-    "transcript_visual_crosscheck": "4.0.0",
+    "vision": "6.0.0",
+    "transcript_visual_crosscheck": "6.0.0",
+    "security_entity_alignment": "2.0.0",
     "claim_visual_binding": "1.0.0",
     "multimodal_context": "6.0.0",
     "transcript": "1.0.0",  # BuildVideoStage.name == "transcript"
     "semantic_segmentation": "1.0.0",
-    "knowledge_frame": "4.0.0",
+    "knowledge_frame": "7.0.0",
     "visual_evidence_policy": "1.0.0",
     "semantic_context": "5.0.0",
-    "atomic_claim_extraction": "2.0.0",
-    "atomic_claim_validation": "2.0.0",
-    "evidence_grounding": "1.0.0",
+    "chapter_thesis_identification": "2.0.0",
+    "atomic_claim_extraction": "3.0.0",
+    "atomic_claim_validation": "3.0.0",
+    "evidence_grounding": "2.0.0",
     "temporal_normalization": "final.1.0",
-    "claim_canonicalization": "1.0.0",
+    "claim_canonicalization": "2.0.0",
     "claim_occurrence_persistence": "1.0.0",
     "lifecycle_projection": "1.0.0",
     "chapter": "1.0.0",
@@ -203,6 +209,9 @@ def pipeline_config_from_env() -> dict[str, object]:
             "CONTENT_EXTRACTION_PROMPT_VERSION",
             "atomic-claim-extraction.prompt.v2.codex-cli" if codex_backend else "atomic-claim-extraction.prompt.v1",
         ),
+        "chapter_thesis_prompt_version": os.getenv(
+            "CONTENT_CHAPTER_THESIS_PROMPT_VERSION", "chapter-thesis.v1"
+        ),
         "temporal_normalization_version": os.getenv(
             "CONTENT_TEMPORAL_NORMALIZATION_VERSION", "temporal-normalization.final.v1"
         ),
@@ -225,7 +234,10 @@ def pipeline_config_from_env() -> dict[str, object]:
             "CONTENT_KNOWLEDGE_FRAME_PLANNER_VERSION", KNOWLEDGE_FRAME_PLANNER_VERSION
         ),
         "transcript_visual_crosscheck_version": os.getenv(
-            "CONTENT_TRANSCRIPT_VISUAL_CROSSCHECK_VERSION", "transcript-visual-crosscheck.v1"
+            "CONTENT_TRANSCRIPT_VISUAL_CROSSCHECK_VERSION", "transcript-visual-crosscheck.v3"
+        ),
+        "security_entity_alignment_version": os.getenv(
+            "CONTENT_SECURITY_ENTITY_ALIGNMENT_VERSION", "security-entity-alignment.v2"
         ),
         "ocr_engine": os.getenv("CONTENT_OCR_ENGINE", "paddleocr"),
         "ocr_engine_version": os.getenv("CONTENT_OCR_ENGINE_VERSION", "3"),
@@ -501,6 +513,11 @@ def build_application(
         allow_offline_fixture=False,
         require_model_identity=True,
     )
+    chapter_thesis_identifier = ChapterThesisIdentifier(
+        extraction_client,
+        model_id=str(config["extraction_model"]),
+        prompt_version=str(config["chapter_thesis_prompt_version"]),
+    )
     semantic_enabled = bool(config["semantic_segmentation_enabled"])
     legacy_enabled = bool(config["legacy_chapter_extraction_enabled"]) or not semantic_enabled
     # Atomic extraction/validation is deliberately text-first.  It supplies
@@ -509,6 +526,7 @@ def build_application(
     claim_planning_stages = (
         [
             SemanticContextStage(padding_ms=int(config["semantic_padding_ms"])),
+            ChapterThesisIdentificationStage(identifier=chapter_thesis_identifier),
             AtomicClaimExtractionStage(extractor=atomic_extractor),
             AtomicClaimValidationStage(),
         ]
@@ -557,7 +575,7 @@ def build_application(
         TranscriptSelectionStage(),
         TranscriptQualityStage(),
         SpeakerDiarizationStage(PyannoteDiarizer()),
-        TranscriptPostprocessStage(TranscriptPostprocessor()),
+        TranscriptPostprocessStage(TranscriptPostprocessor(OpenCCTranscriptConverter())),
         # Video identity is required by semantic segment persistence; visual
         # analysis follows semantic planning and receives targeted frames only.
         BuildVideoStage(),
@@ -570,6 +588,7 @@ def build_application(
         TranscriptVisualCrosscheckStage(
             TranscriptVisualCrossChecker(version=str(config["transcript_visual_crosscheck_version"]))
         ),
+        SecurityEntityAlignmentStage(version=str(config["security_entity_alignment_version"])),
         ClaimVisualBindingStage(),
         MultimodalContextStage(MultimodalContextBuilder()),
         TemporalWindowStage(TemporalWindowBuilder()),

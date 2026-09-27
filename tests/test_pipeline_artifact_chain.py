@@ -78,6 +78,7 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
         "evidence",
         "claims",
         "verification",
+        "knowledge_visual_evidence",
         "knowledge",
         "summary",
     } <= types
@@ -97,6 +98,7 @@ def test_production_fixture_persists_complete_artifact_claim_dag(tmp_path):
     assert active["transcript"].artifact_id in active["semantic_segments"].parent_artifact_ids
     assert active["semantic_segments"].artifact_id in active["evidence"].parent_artifact_ids
     assert active["evidence"].artifact_id in active["occurrences"].parent_artifact_ids
+    assert active["knowledge_visual_evidence"].artifact_id in active["occurrences"].parent_artifact_ids
     assert active["occurrences"].artifact_id in active["claims"].parent_artifact_ids
     assert active["claims"].artifact_id in active["verification"].parent_artifact_ids
     assert active["verification"].artifact_id in active["lifecycle"].parent_artifact_ids
@@ -560,6 +562,7 @@ def test_resume_checkpoint_integrity_rejects_tamper_missing_and_version_drift(tm
 
     mutations = (
         ("tamper", ArtifactIntegrityError),
+        ("visual_packet_tamper", ArtifactIntegrityError),
         ("missing", ArtifactIntegrityError),
         ("version", CheckpointValidationError),
     )
@@ -571,6 +574,13 @@ def test_resume_checkpoint_integrity_rejects_tamper_missing_and_version_drift(tm
             if mutation == "tamper":
                 row = session.scalar(select(ContentArtifactRow).where(ContentArtifactRow.artifact_type == "source"))
                 row.payload = {**row.payload, "raw_content_hash": "tampered"}
+            elif mutation == "visual_packet_tamper":
+                row = session.scalar(
+                    select(ContentArtifactRow).where(ContentArtifactRow.artifact_type == "knowledge_visual_evidence")
+                )
+                packets = list(row.payload["occurrence_packets"])
+                packets[0] = {**packets[0], "reason": "TAMPERED_WINDOW_MAPPING"}
+                row.payload = {**row.payload, "occurrence_packets": packets}
             elif mutation == "missing":
                 row = session.scalar(select(ContentArtifactRow).where(ContentArtifactRow.artifact_type == "source"))
                 session.delete(row)
