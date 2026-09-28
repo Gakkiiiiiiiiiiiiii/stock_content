@@ -19,9 +19,17 @@ from build_local_coherent_knowledge_preview import (
     validate_topic_map,
     write_new,
 )
-from build_local_coherent_knowledge_preview_v2 import CARD_FIELDS, audit_prompt, card_prompt, normalize_card
+from build_local_coherent_knowledge_preview_v2 import (
+    CARD_FIELDS,
+    audit_prompt,
+    card_prompt,
+    normalize_card,
+    reviewed_equities,
+    topic_stages,
+)
 
 from stock_content.adapters.codex_cli import CodexCliRunner
+from stock_content.domain.knowledge_equity_links import link_equity_mentions
 
 
 def repair_prompt(card: dict, issue: str, packet: dict) -> str:
@@ -63,6 +71,7 @@ def main() -> None:
     parser.add_argument("--corrected-transcript-output", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--opencc-package-dir", type=Path, required=True)
+    parser.add_argument("--equity-review", type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.opencc_package_dir))
     from opencc import OpenCC  # noqa: PLC0415 - operator-only dependency
@@ -81,7 +90,8 @@ def main() -> None:
     repairs = repair_spec.get("repairs", [])
     splits = repair_spec.get("splits", [])
     insert_groups = repair_spec.get("insert_groups", [])
-    if not isinstance(repairs, list) or not isinstance(splits, list) or not isinstance(insert_groups, list):
+    merges = repair_spec.get("merges", [])
+    if any(not isinstance(value, list) for value in (repairs, splits, insert_groups, merges)):
         raise ValueError("Repair spec actions must be arrays")
     seen = set()
     for repair in repairs:
@@ -125,7 +135,23 @@ def main() -> None:
         ):
             raise ValueError("Split groups do not partition original card topics")
         split_positions.add(position)
-    if not repairs and not splits and not drop_positions and not insert_groups:
+    merge_positions: set[int] = set()
+    for merge in merges:
+        positions = merge.get("card_positions")
+        if (
+            not isinstance(positions, list) or len(positions) < 2
+            or positions != sorted(set(positions))
+            or any(not isinstance(position, int) or position < 1 or position > len(candidate["knowledge"])
+                   for position in positions)
+            or not isinstance(merge.get("focus"), str) or not merge["focus"].strip()
+            or merge_positions.intersection(positions)
+            or set(positions).intersection(drop_positions)
+        ):
+            raise ValueError("Merge card positions invalid or overlapping")
+        merge_positions.update(positions)
+    if merges and (repairs or splits or insert_groups):
+        raise ValueError("Merge repair must be a separate targeted pass")
+    if not repairs and not splits and not drop_positions and not insert_groups and not merges:
         raise ValueError("Repair spec has no actions")
 
     result = copy.deepcopy(candidate)
@@ -179,6 +205,40 @@ def main() -> None:
             set(result["excluded_topic_indices"]) | set(dropped["topic_indices"])
         )
         print(f"Excluded unsupported brief card {position}", flush=True)
+
+    if merges:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            for merge in merges:
+                indices = sorted({
+                    index for position in merge["card_positions"]
+                    for index in candidate["knowledge"][position - 1]["topic_indices"]
+                })
+                group = {"topic_indices": indices, "focus": merge["focus"]}
+                future = executor.submit(
+                    runner.run,
+                    system="You extract one precise, source-grounded knowledge card. Return JSON only; use no tools.",
+                    prompt=card_prompt(group, packet),
+                )
+                futures[future] = group
+            merged_cards = []
+            for future in concurrent.futures.as_completed(futures):
+                group = futures[future]
+                card = normalize_card(future.result()["raw_response"], converter)
+                if card.get("topic_indices") != group["topic_indices"]:
+                    raise ValueError("Merged card changed topic coordinates")
+                merged_cards.append(card)
+        for position in sorted(merge_positions, reverse=True):
+            adjusted = position - sum(dropped < position for dropped in drop_positions)
+            result["knowledge"].pop(adjusted - 1)
+        for card in sorted(merged_cards, key=lambda item: item["topic_indices"][0]):
+            insertion = next(
+                (index for index, existing in enumerate(result["knowledge"])
+                 if existing["topic_indices"][0] > card["topic_indices"][0]),
+                len(result["knowledge"]),
+            )
+            result["knowledge"].insert(insertion, card)
+            print(f"Merged card for topics {card['topic_indices']}", flush=True)
 
     split_cards: dict[int, list[dict]] = {}
     if splits:
@@ -290,6 +350,21 @@ def main() -> None:
         _, corrected_hash = read_json(args.corrected_transcript_output)
         if args.corrected_transcript_output.read_bytes() != json_bytes(transcript):
             raise ValueError("Existing corrected transcript differs")
+    projected = project_cards(knowledge, topic_map, transcript, converter, map_hash, source_hash, media_hash)
+    equity_hash = None
+    equity_link_audit = None
+    if args.equity_review:
+        mentions, equity_hash = reviewed_equities(
+            args.equity_review, map_hash=map_hash, source_hash=source_hash,
+            media_hash=media_hash, audio_review_hash=review_hash,
+        )
+        projected, equity_link_audit = link_equity_mentions(
+            projected, topic_stages(topic_map, transcript), transcript["segments"], mentions
+        )
+        for card in projected:
+            if card["equity_mentions"]:
+                card["visual_review_status"] = "TARGETED_EQUITY_FRAME_REVIEW_ONLY"
+                card["reason_codes"].append("TARGETED_EQUITY_REVIEW")
     output = {
         "schema_version": "local-coherent-knowledge.v1",
         "status": "LOCAL_REVIEW_ONLY_NOT_SEALED_OR_PERSISTED",
@@ -305,13 +380,17 @@ def main() -> None:
         "source_draft_sha256": draft_hash,
         "repair_spec_sha256": repair_spec_hash,
         "external_fact_verification": "NOT_PERFORMED",
-        "visual_review_status": "NOT_RECHECKED_THIS_REVISION",
+        "visual_review_status": (
+            "TARGETED_EQUITY_FRAME_REVIEW_ONLY" if args.equity_review else "NOT_RECHECKED_THIS_REVISION"
+        ),
+        "equity_review_sha256": equity_hash,
+        "equity_link_audit": equity_link_audit,
         "source_topic_count": len(topic_map["segments"]),
         "excluded_topic_indices": result["excluded_topic_indices"],
         "excluded_topic_notes": result["excluded_topic_notes"],
         "knowledge_count": len(knowledge),
         "citation_repairs": result.get("citation_repairs", []),
-        "knowledge": project_cards(knowledge, topic_map, transcript, converter, map_hash, source_hash, media_hash),
+        "knowledge": projected,
         "audit": {"passed": True, "method": "independent GPT-6 Sol transcript/coherence audit", "issues": []},
     }
     output_hash = write_new(args.output, output)

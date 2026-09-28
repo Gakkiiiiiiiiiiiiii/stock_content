@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -10,7 +12,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from build_local_coherent_knowledge_preview import corrected_transcript, validate_extraction  # noqa: E402
-from build_local_coherent_knowledge_preview_v2 import validate_group_plan  # noqa: E402
+from build_local_coherent_knowledge_preview_v2 import (  # noqa: E402
+    previously_reviewed_plan,
+    reviewed_equities,
+    validate_group_plan,
+)
 
 
 def test_audio_correction_requires_matching_source_and_media() -> None:
@@ -104,3 +110,51 @@ def test_unspoken_stock_code_fails_closed() -> None:
     }
     with pytest.raises(ValueError, match="Unspoken stock code"):
         validate_extraction({"knowledge": [card], "excluded_topic_indices": []}, packet, transcript)
+
+
+def test_reviewed_equity_requires_same_source_and_untampered_frame(tmp_path: Path) -> None:
+    frame = tmp_path / "frame.jpg"
+    frame.write_bytes(b"reviewed chart")
+    frame_hash = hashlib.sha256(frame.read_bytes()).hexdigest()
+    review = {
+        "schema_version": "local-equity-frame-review.v1",
+        "status": "LOCAL_REVIEW_ONLY_NOT_SEALED_OR_PERSISTED",
+        "requested_model": "gpt-6-sol", "audit": {"passed": True},
+        "topic_map_sha256": "map", "source_transcript_sha256": "source",
+        "media_sha256": "media", "audio_review_sha256": "audio",
+        "mentions": [{"visual_evidence": [{"relative_path": "frame.jpg", "image_sha256": frame_hash}]}],
+    }
+    path = tmp_path / "review.json"
+    path.write_text(json.dumps(review), encoding="utf-8")
+    loaded, _ = reviewed_equities(
+        path, map_hash="map", source_hash="source", media_hash="media", audio_review_hash="audio"
+    )
+    assert len(loaded) == 1
+    with pytest.raises(ValueError, match="provenance"):
+        reviewed_equities(
+            path, map_hash="other", source_hash="source", media_hash="media", audio_review_hash="audio"
+        )
+    frame.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        reviewed_equities(
+            path, map_hash="map", source_hash="source", media_hash="media", audio_review_hash="audio"
+        )
+
+
+def test_reused_grouping_requires_audited_matching_source(tmp_path: Path) -> None:
+    prior = {
+        "schema_version": "local-coherent-knowledge.v1", "audit": {"passed": True},
+        "topic_map_sha256": "map", "source_transcript_sha256": "source", "media_sha256": "media",
+        "knowledge": [{"topic_indices": [0], "knowledge_title": "一条完整观点"}],
+        "excluded_topic_indices": [1],
+    }
+    path = tmp_path / "prior.json"
+    path.write_text(json.dumps(prior), encoding="utf-8")
+    plan, _ = previously_reviewed_plan(
+        path, map_hash="map", source_hash="source", media_hash="media", topic_count=2
+    )
+    assert plan["groups"][0]["topic_indices"] == [0]
+    with pytest.raises(ValueError, match="provenance"):
+        previously_reviewed_plan(
+            path, map_hash="map", source_hash="other", media_hash="media", topic_count=2
+        )
