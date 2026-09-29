@@ -13,12 +13,31 @@ from typing import Any
 class CodexCliRunner:
     """Run a single model-only Codex turn without an HTTP model endpoint."""
 
-    def __init__(self, executable: str | None = None, model: str = "gpt-6-sol", timeout_seconds: int = 180) -> None:
+    def __init__(
+        self,
+        executable: str | None = None,
+        model: str = "gpt-6-sol",
+        timeout_seconds: int = 180,
+        max_attempts: int = 3,
+    ) -> None:
         self.executable = executable or os.getenv("CONTENT_CODEX_CLI", "codex")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        if not 1 <= max_attempts <= 3:
+            raise ValueError("Codex CLI max_attempts must be between 1 and 3")
+        self.max_attempts = max_attempts
 
     def run(self, *, system: str, prompt: str, image_path: str | None = None) -> dict[str, Any]:
+        last_error: RuntimeError | None = None
+        for _ in range(self.max_attempts):
+            try:
+                return self._run_once(system=system, prompt=prompt, image_path=image_path)
+            except RuntimeError as exc:
+                last_error = exc
+        assert last_error is not None
+        raise last_error
+
+    def _run_once(self, *, system: str, prompt: str, image_path: str | None = None) -> dict[str, Any]:
         if self.model != "gpt-6-sol":
             raise ValueError("Codex local parsing requires exact model gpt-6-sol")
         with tempfile.TemporaryDirectory(prefix="content-codex-") as workdir:

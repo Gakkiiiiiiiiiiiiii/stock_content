@@ -112,6 +112,43 @@ def test_unspoken_stock_code_fails_closed() -> None:
         validate_extraction({"knowledge": [card], "excluded_topic_indices": []}, packet, transcript)
 
 
+def test_structured_time_conflicts_and_unresolved_items_are_coordinate_checked() -> None:
+    packet = {
+        "topics": [{"start_segment_index": 0, "end_segment_index": 1}],
+        "unresolved_entity_windows": [],
+    }
+    transcript = {"segments": [{"text": "预计十月底完成"}, {"text": "金额单位没有说清楚"}]}
+    card = {
+        "topic_indices": [0], "knowledge_title": "时间与单位待核",
+        "atomic_statement": "预计十月底完成，但金额单位未明确。",
+        "detailed_explanation": "时间是预测节点，金额口径仍待确认。", "primary_domain": "项目",
+        "subject": "进度", "claim_nature": "FORECAST",
+        "evidence": [{"segment_index": 0, "quote": "预计十月底完成"}],
+        "applicability": None, "risks": None, "invalidation_conditions": None,
+        "business_time": {
+            "as_of": None, "precision": "MONTH", "kind": "FORECAST",
+            "expressions": [{
+                "raw_text": "十月底", "normalized": None, "role": "FORECAST_END", "segment_indices": [0],
+            }],
+            "note": "年份未给出",
+        },
+        "conflicts": [],
+        "unresolved_items": [{
+            "kind": "UNIT", "raw_text": "金额单位", "segment_indices": [1],
+            "reason": "口播未给出币种或量级", "status": "UNRESOLVED", "resolution": None,
+        }],
+        "spoken_stock_names": [], "spoken_stock_codes": [],
+    }
+    assert validate_extraction(
+        {"knowledge": [card], "excluded_topic_indices": []}, packet, transcript, structured=True
+    ) == [card]
+    card["unresolved_items"][0]["segment_indices"] = [2]
+    with pytest.raises(ValueError, match="unresolved item"):
+        validate_extraction(
+            {"knowledge": [card], "excluded_topic_indices": []}, packet, transcript, structured=True
+        )
+
+
 def test_reviewed_equity_requires_same_source_and_untampered_frame(tmp_path: Path) -> None:
     frame = tmp_path / "frame.jpg"
     frame.write_bytes(b"reviewed chart")

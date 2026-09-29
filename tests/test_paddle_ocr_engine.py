@@ -245,6 +245,14 @@ def test_worker_environment_does_not_forward_service_secrets(monkeypatch):
     assert os.environ["CONTENT_BILIBILI_COOKIE"] not in json.dumps(environment)
 
 
+def test_worker_environment_accepts_only_explicit_application_module_path(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "host-secret-module-path")
+    monkeypatch.setenv("CONTENT_OCR_MODULE_PATH", os.pathsep.join(("C:/app/src", "C:/app/vendor")))
+    environment = _ocr_worker_environment("C:/ocr/python.exe", "gpu:0", True)
+    assert environment["PYTHONPATH"] == os.pathsep.join(("C:/app/src", "C:/app/vendor"))
+    assert "host-secret-module-path" not in json.dumps(environment)
+
+
 def test_worker_environment_uses_explicit_ocr_cache_without_profile_or_credentials(monkeypatch, tmp_path):
     monkeypatch.delenv("USERPROFILE", raising=False)
     monkeypatch.delenv("LOCALAPPDATA", raising=False)

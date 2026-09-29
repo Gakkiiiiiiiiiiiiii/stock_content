@@ -216,6 +216,14 @@ def _ocr_worker_environment(python_path: str, device: str, require_gpu: bool) ->
         "CONTENT_OCR_REQUIRE_GPU": "true" if require_gpu else "false",
         "PYTHONUNBUFFERED": "1",
     }
+    # Local operator runs may use an isolated GPU Python that intentionally
+    # contains Paddle only. Admit the application module path solely through
+    # this explicit non-secret setting; never inherit the parent's PYTHONPATH.
+    module_paths = [
+        part for part in os.getenv("CONTENT_OCR_MODULE_PATH", "").split(os.pathsep) if part
+    ]
+    if module_paths:
+        environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(module_paths))
     # The parent service deliberately does not inherit LD_LIBRARY_PATH. Pass
     # only an explicit OCR-native lookup list so Paddle can locate CUDA and
     # cuDNN under Linux without admitting Torch libraries from the video/ASR
