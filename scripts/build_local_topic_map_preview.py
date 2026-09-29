@@ -72,7 +72,10 @@ def unresolved_entity_windows(legacy: dict | None, rows: list[dict], converter) 
                 "start_segment_index": start,
                 "end_segment_index": end,
                 "raw_text": raw_text,
-                "reason": "FIX01 ASR/visual entity alignment remained pending; do not infer a canonical name or code from this window.",
+                "reason": (
+                    "FIX01 ASR/visual entity alignment remained pending; "
+                    "do not infer a canonical name or code from this window."
+                ),
                 "status": "UNRESOLVED",
             }
         )
@@ -97,6 +100,7 @@ def main() -> None:
     sys.path.insert(0, str((args.repo / "src").resolve(strict=True)))
     sys.path.insert(0, str(args.opencc_package_dir.resolve(strict=True)))
     from opencc import OpenCC  # noqa: PLC0415 - operator-only dependency
+
     from stock_content.adapters.http.model_client import ContentModelClient  # noqa: PLC0415
     from stock_content.domain.artifacts import TranscriptArtifact, TranscriptSegmentItem  # noqa: PLC0415
     from stock_content.domain.semantic_segmenter import SemanticSegmenter  # noqa: PLC0415
