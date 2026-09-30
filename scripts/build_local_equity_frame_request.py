@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from stock_content.adapters.media.frame import FfmpegFrameExtractor
-from stock_content.domain.ambiguity_resolution import granular_unresolved_items
+from stock_content.domain.ambiguity_resolution import ambiguity_item_id, granular_unresolved_items
 
 DEICTIC_ENTITY_REFERENCES = {
     "这个", "那个", "这两个", "那两个", "这几个", "那几个", "它", "它们", "他们", "她们",
@@ -32,20 +32,97 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _copy_reviewed_frames(
+    *, review_path: Path, review: dict, output: Path, rows: list[dict], topics: list[dict]
+) -> tuple[list[dict], set[str]]:
+    """Copy previously accepted evidence into a fresh, hash-checked request."""
+
+    root = review_path.resolve(strict=True).parent
+    destination = output.parent / "reviewed-equity-frames"
+    destination.mkdir(parents=True, exist_ok=True)
+    frames: list[dict] = []
+    copied_hashes: set[str] = set()
+    for mention_index, mention in enumerate(review.get("mentions") or [], start=1):
+        evidence_indices = sorted({
+            item["segment_index"] for item in mention.get("transcript_evidence") or []
+            if isinstance(item.get("segment_index"), int)
+        })
+        stage_topic_indices = sorted({
+            int(stage_id[1:]) - 1 for stage_id in mention.get("stage_ids") or []
+            if isinstance(stage_id, str) and re.fullmatch(r"T\d+", stage_id)
+        })
+        fallback_indices = [
+            index
+            for topic_index in stage_topic_indices
+            if 0 <= topic_index < len(topics)
+            for index in range(topics[topic_index]["start"], topics[topic_index]["end"] + 1)
+        ]
+        source_indices = evidence_indices or fallback_indices
+        for frame_index, frame in enumerate(mention.get("visual_evidence") or [], start=1):
+            relative_path = frame.get("relative_path")
+            image_hash = frame.get("image_sha256")
+            if not isinstance(relative_path, str) or not isinstance(image_hash, str):
+                raise ValueError("Reviewed frame is missing its relative path or hash")
+            source_path = (root / relative_path).resolve(strict=True)
+            if not source_path.is_relative_to(root) or sha256(source_path) != image_hash:
+                raise ValueError(f"Reviewed frame path or hash mismatch: {source_path}")
+            if image_hash in copied_hashes:
+                continue
+            target_path = destination / (
+                f"{mention_index:02d}_{frame_index:02d}_{int(frame['timestamp_ms'])}_"
+                f"{image_hash[:12]}{source_path.suffix.lower() or '.jpg'}"
+            )
+            shutil.copy2(source_path, target_path)
+            timestamp_seconds = int(frame["timestamp_ms"]) / 1000
+            nearby = source_indices or [
+                index for index, row in enumerate(rows)
+                if float(row["end_seconds"]) >= timestamp_seconds - 20
+                and float(row["start_seconds"]) <= timestamp_seconds + 20
+            ]
+            if not nearby:
+                raise ValueError("Reviewed frame has no transcript scope")
+            focused = str(mention.get("evidence_tier") or "").startswith("FOCUSED_CHART")
+            frames.append({
+                "relative_path": target_path.relative_to(output.parent).as_posix(),
+                "image_sha256": image_hash,
+                "timestamp_ms": int(frame["timestamp_ms"]),
+                "transcript_segment_range": [max(0, min(nearby) - 3), min(len(rows) - 1, max(nearby) + 3)],
+                "candidate_name": mention.get("name"),
+                "candidate_code": mention.get("code"),
+                "candidate_market": mention.get("market"),
+                "review_target_kind": "FOCUSED_CHART_SECURITY" if focused else "UNRESOLVED_ENTITY_WINDOW",
+                "candidate_source": "PRIOR_HASH_VERIFIED_VISUAL_EVIDENCE_REVIEWED_FRESH",
+                "knowledge_id": None,
+                "raw_entity_text": mention.get("raw_entity_text"),
+                "source_segment_indices": source_indices,
+                "topic_indices": stage_topic_indices,
+                "evidence_window_id": f"reviewed-{mention.get('entity_id') or mention_index}",
+            })
+            copied_hashes.add(image_hash)
+    return frames, copied_hashes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--legacy-knowledge", type=Path)
     parser.add_argument("--targeted-frames", type=Path)
     parser.add_argument("--ocr", type=Path)
     parser.add_argument("--base-request", type=Path)
+    parser.add_argument("--base-review", type=Path)
+    parser.add_argument("--ambiguity-triage", type=Path)
+    parser.add_argument("--audio-review", type=Path)
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--knowledge", type=Path)
     parser.add_argument("--topic-map", type=Path)
     parser.add_argument("--media", type=Path)
-    parser.add_argument("--target-knowledge-id")
+    parser.add_argument("--target-knowledge-id", action="append")
+    parser.add_argument("--entity-frame-offset-ms", type=int, action="append")
     parser.add_argument("--skip-legacy-candidates", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    entity_offsets = args.entity_frame_offset_ms or [-1000, 0, 1000]
+    if not entity_offsets or len(entity_offsets) > 3 or len(set(entity_offsets)) != len(entity_offsets):
+        raise ValueError("Entity frame offsets must contain one to three unique values")
 
     transcript = read_json(args.transcript)
     rows = transcript["segments"]
@@ -53,6 +130,9 @@ def main() -> None:
     targeted = read_json(args.targeted_frames) if args.targeted_frames else {"frames": []}
     ocr = read_json(args.ocr) if args.ocr else {"frames": []}
     base_request = read_json(args.base_request) if args.base_request else {}
+    base_review = read_json(args.base_review) if args.base_review else {}
+    triage = read_json(args.ambiguity_triage) if args.ambiguity_triage else {}
+    audio_review = read_json(args.audio_review) if args.audio_review else {}
     if not args.skip_legacy_candidates and not all(
         (args.legacy_knowledge, args.targeted_frames, args.ocr)
     ):
@@ -94,6 +174,19 @@ def main() -> None:
             copied["relative_path"] = target_path.relative_to(args.output.parent).as_posix()
             frames.append(copied)
             copied_hashes.add(image_hash)
+
+    if args.base_review:
+        if not args.topic_map:
+            raise ValueError("--topic-map is required with --base-review")
+        reviewed_frames, reviewed_hashes = _copy_reviewed_frames(
+            review_path=args.base_review,
+            review=base_review,
+            output=args.output,
+            rows=rows,
+            topics=read_json(args.topic_map).get("segments") or [],
+        )
+        frames.extend(frame for frame in reviewed_frames if frame["image_sha256"] not in copied_hashes)
+        copied_hashes.update(reviewed_hashes)
 
     destination = args.output.parent / "equity-candidate-frames"
     destination.mkdir(parents=True, exist_ok=True)
@@ -162,13 +255,26 @@ def main() -> None:
     if all(optional_entity_inputs):
         knowledge = read_json(args.knowledge)
         topic_map = read_json(args.topic_map)
+        if args.ambiguity_triage:
+            if (
+                triage.get("schema_version") != "local-ambiguity-triage.v1"
+                or triage.get("audit", {}).get("passed") is not True
+                or triage.get("source_knowledge_sha256") != sha256(args.knowledge)
+            ):
+                raise ValueError("Ambiguity triage provenance mismatch")
+        triage_by_id = {
+            item["item_id"]: item for item in triage.get("decisions") or []
+        }
+        audio_by_id = {
+            item["item_id"]: item for item in audio_review.get("ambiguity_item_decisions") or []
+        }
         topics = topic_map.get("segments") or []
         cards = knowledge.get("knowledge") or []
         requests = []
         request_meta = []
         for card in cards:
             knowledge_id = str(card.get("knowledge_id") or "")
-            if args.target_knowledge_id and knowledge_id != args.target_knowledge_id:
+            if args.target_knowledge_id and knowledge_id not in set(args.target_knowledge_id):
                 continue
             topic_indices = card.get("topic_indices") or []
             if any(not isinstance(index, int) or not 0 <= index < len(topics) for index in topic_indices):
@@ -178,6 +284,45 @@ def main() -> None:
             )
             for unresolved_index, item in enumerate(entity_items):
                 raw_entity_text = str(item.get("raw_text") or "").strip()
+                item_id = ambiguity_item_id(knowledge_id, item)
+                decision = triage_by_id.get(item_id)
+                audio_decision = audio_by_id.get(item_id)
+                if decision and decision.get("review_text"):
+                    raw_entity_text = decision["review_text"]
+                if args.ambiguity_triage:
+                    if decision is None:
+                        unresolved_coverage.append({
+                            "knowledge_id": knowledge_id,
+                            "item_id": item_id,
+                            "raw_text": raw_entity_text,
+                            "status": "SKIPPED_NO_TRIAGE_DECISION",
+                        })
+                        continue
+                    effective_kind = decision.get("corrected_kind") or item.get("kind")
+                    entity_type = decision.get("entity_type")
+                    should_extract = (
+                        effective_kind == "ENTITY"
+                        and entity_type == "EQUITY"
+                        and (
+                            decision.get("action") == "VISUAL_REVIEW_REQUIRED"
+                            or decision.get("action") == "AUDIO_REVIEW_REQUIRED"
+                            and audio_decision is not None
+                            and audio_decision.get("decision") == "AUDIO_CANDIDATE_VISUAL_REQUIRED"
+                        )
+                    )
+                    if not should_extract:
+                        unresolved_coverage.append({
+                            "knowledge_id": knowledge_id,
+                            "item_id": item_id,
+                            "raw_text": raw_entity_text,
+                            "entity_type": entity_type,
+                            "triage_action": decision.get("action"),
+                            "audio_decision": (
+                                audio_decision.get("decision") if audio_decision else None
+                            ),
+                            "status": "CLASSIFIED_NO_FRAME_REQUIRED",
+                        })
+                        continue
                 if raw_entity_text in DEICTIC_ENTITY_REFERENCES:
                     unresolved_coverage.append({
                         "knowledge_id": knowledge_id,
@@ -197,7 +342,7 @@ def main() -> None:
                 end_ms = round(float(rows[indices[-1]]["end_seconds"]) * 1000)
                 center_ms = (start_ms + end_ms) // 2
                 window_id = f"entity-{knowledge_id}-{unresolved_index + 1}"
-                for offset_ms in (-1000, 0, 1000):
+                for offset_ms in entity_offsets:
                     timestamp_ms = max(0, center_ms + offset_ms)
                     requests.append(SimpleNamespace(
                         timestamp_ms=timestamp_ms,
@@ -207,6 +352,7 @@ def main() -> None:
                         planner_version="local-entity-frame-plan.v3",
                     ))
                     request_meta.append({
+                        "item_id": item_id,
                         "knowledge_id": knowledge_id,
                         "raw_entity_text": raw_entity_text,
                         "source_segment_indices": indices,
@@ -216,6 +362,7 @@ def main() -> None:
                     })
                 unresolved_coverage.append({
                     "knowledge_id": knowledge_id,
+                    "item_id": item_id,
                     "raw_text": item.get("raw_text"),
                     "segment_indices": indices,
                     "status": "TARGETED_FRAME_REQUESTED",
@@ -255,6 +402,7 @@ def main() -> None:
                     "review_target_kind": "UNRESOLVED_ENTITY_WINDOW",
                     "candidate_source": "CURRENT_KNOWLEDGE_UNRESOLVED_ENTITY",
                     "knowledge_id": meta["knowledge_id"],
+                    "ambiguity_item_id": meta["item_id"],
                     "raw_entity_text": meta["raw_entity_text"],
                     "source_segment_indices": meta["source_segment_indices"],
                     "topic_indices": meta["topic_indices"],
@@ -273,6 +421,9 @@ def main() -> None:
         "frames": frames,
         "skipped_candidates": skipped,
         "unresolved_entity_coverage": unresolved_coverage,
+        "ambiguity_triage_sha256": sha256(args.ambiguity_triage) if args.ambiguity_triage else None,
+        "audio_review_sha256": sha256(args.audio_review) if args.audio_review else None,
+        "base_review_sha256": sha256(args.base_review) if args.base_review else None,
     }
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"frames": len(frames), "skipped": len(skipped)}, ensure_ascii=False))

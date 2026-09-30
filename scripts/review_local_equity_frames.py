@@ -60,6 +60,27 @@ def vision_prompt(frame: dict, rows: list[dict], ocr_blocks: list[dict]) -> str:
 
 
 def audit_prompt(records: list[dict]) -> str:
+    compact_records = []
+    for record in records:
+        frames = []
+        for frame in record.get("visual_evidence") or []:
+            ocr_blocks = frame.get("ocr_blocks") or frame.get("ocr_top_blocks") or []
+            ocr_texts = list(dict.fromkeys(
+                str(block.get("text") or "").strip()
+                for block in ocr_blocks
+                if str(block.get("text") or "").strip()
+            ))
+            frames.append({
+                "timestamp_ms": frame.get("timestamp_ms"),
+                "image_sha256": frame.get("image_sha256"),
+                "visual_context": frame.get("visual_context"),
+                "observed_text": frame.get("observed_text"),
+                "vision_header_text": frame.get("vision_header_text"),
+                "high_confidence_ocr_texts": ocr_texts,
+            })
+        compact_records.append({
+            key: value for key, value in record.items() if key != "visual_evidence"
+        } | {"visual_evidence": frames})
     return (
         "Independently audit these cross-modal entity extractions. Check that every displayed name and any "
         "reported code/market are literally present in the retained high-confidence OCR, that transcript "
@@ -71,7 +92,7 @@ def audit_prompt(records: list[dict]) -> str:
         "to literally contain the canonical characters. Preserve the raw words separately instead. "
         "This is a local video-identification review, not external fact validation or "
         "investment advice. Return only {\"pass\":true,\"issues\":[]} or a concrete issues array.\n"
-        + json.dumps(records, ensure_ascii=False)
+        + json.dumps(compact_records, ensure_ascii=False)
     )
 
 
@@ -484,6 +505,42 @@ def main() -> None:
                 prompt=audit_prompt(records),
             )["raw_response"]
             write_new(args.output.with_name(args.output.stem + ".audit-recheck-2.json"), audit)
+    if audit.get("pass") is not True and records:
+        repaired = []
+        for issue in audit.get("issues") or []:
+            if not isinstance(issue, dict):
+                repaired = []
+                break
+            record = next(
+                (item for item in records if item["entity_id"] == issue.get("entity_id")),
+                None,
+            )
+            if record is None:
+                repaired = []
+                break
+            message = str(issue.get("issue") or "").lower()
+            if "market" in message or "市场" in message:
+                record["market"] = None
+                repaired.append(record["entity_id"])
+            elif "code" in message and any(
+                marker in message for marker in ("unsupported", "invent", "unconfirmed")
+            ):
+                record["code"] = None
+                record["code_status"] = "NOT_VISIBLE_IN_VIDEO"
+                repaired.append(record["entity_id"])
+            else:
+                repaired = []
+                break
+        if repaired:
+            print(f"Removed unsupported market/code qualifiers: {', '.join(repaired)}", flush=True)
+            audit = runner.run(
+                system=(
+                    "You independently audit source-grounded Chinese visual entity records. "
+                    "Return JSON only; use no tools."
+                ),
+                prompt=audit_prompt(records),
+            )["raw_response"]
+            write_new(args.output.with_name(args.output.stem + ".audit-recheck-3.json"), audit)
     if audit.get("pass") is not True or audit.get("issues") != []:
         raise RuntimeError(f"Equity frame audit failed: {len(audit.get('issues', []))} issues")
 

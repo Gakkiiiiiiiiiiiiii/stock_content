@@ -21,7 +21,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-review", type=Path, required=True)
     parser.add_argument("--overlay-review", type=Path, required=True)
-    parser.add_argument("--overlay-name", action="append", required=True)
+    parser.add_argument("--overlay-name", action="append")
+    parser.add_argument("--overlay-all", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -34,17 +35,30 @@ def main() -> None:
         if base.get(key) != overlay.get(key):
             raise ValueError(f"Entity review source mismatch: {key}")
 
-    selected_names = set(args.overlay_name)
-    mentions = [
-        deepcopy(mention) for mention in base.get("mentions") or []
-        if mention.get("name") not in selected_names
-    ]
-    overlays = [
-        deepcopy(mention) for mention in overlay.get("mentions") or []
-        if mention.get("name") in selected_names
-    ]
-    if {mention.get("name") for mention in overlays} != selected_names:
-        raise ValueError("Requested overlay entity is missing")
+    if not args.overlay_all and not args.overlay_name:
+        raise ValueError("Either --overlay-all or --overlay-name is required")
+    selected_names = set(args.overlay_name or [])
+    if args.overlay_all:
+        overlay_keys = {
+            (mention.get("name"), tuple(mention.get("stage_ids") or []))
+            for mention in overlay.get("mentions") or []
+        }
+        mentions = [
+            deepcopy(mention) for mention in base.get("mentions") or []
+            if (mention.get("name"), tuple(mention.get("stage_ids") or [])) not in overlay_keys
+        ]
+        overlays = [deepcopy(mention) for mention in overlay.get("mentions") or []]
+    else:
+        mentions = [
+            deepcopy(mention) for mention in base.get("mentions") or []
+            if mention.get("name") not in selected_names
+        ]
+        overlays = [
+            deepcopy(mention) for mention in overlay.get("mentions") or []
+            if mention.get("name") in selected_names
+        ]
+        if {mention.get("name") for mention in overlays} != selected_names:
+            raise ValueError("Requested overlay entity is missing")
     mentions.extend(overlays)
     mentions.sort(key=lambda mention: (mention.get("stage_ids") or ["T999"])[0])
     for index, mention in enumerate(mentions, start=1):
@@ -54,10 +68,53 @@ def main() -> None:
         mention.setdefault("raw_entity_text", "")
         mention.setdefault("raw_spoken_mentions", mention.get("transcript_evidence") or [])
 
-    audit = CodexCliRunner(timeout_seconds=420).run(
-        system="You independently audit source-grounded Chinese visual entity records. Return JSON only; use no tools.",
-        prompt=audit_prompt(mentions),
-    )["raw_response"]
+    runner = CodexCliRunner(timeout_seconds=420)
+    audit = {"pass": False, "issues": ["not yet audited"]}
+    for _ in range(3):
+        audit = runner.run(
+            system=(
+                "You independently audit source-grounded Chinese visual entity records. "
+                "Return JSON only; use no tools."
+            ),
+            prompt=audit_prompt(mentions),
+        )["raw_response"]
+        if audit.get("pass") is True and audit.get("issues") == []:
+            break
+        print(
+            "Merged entity review repair issues: "
+            + json.dumps(audit.get("issues") or [], ensure_ascii=False),
+            flush=True,
+        )
+        issue_ids = {
+            issue.get("entity_id") for issue in audit.get("issues") or []
+            if isinstance(issue, dict)
+        }
+        if not issue_ids:
+            break
+        for mention in mentions:
+            if mention.get("entity_id") not in issue_ids:
+                continue
+            message = " ".join(
+                str(issue.get("issue") or "") for issue in audit.get("issues") or []
+                if isinstance(issue, dict) and issue.get("entity_id") == mention.get("entity_id")
+            ).lower()
+            if "market" in message or "市场" in message:
+                mention["market"] = None
+            if any(marker in message for marker in (
+                "spoken", "口述", "visual_only", "visual only", "speech link", "phonetic"
+            )):
+                focused = str(mention.get("evidence_tier") or "").startswith("FOCUSED_CHART")
+                mention["evidence_tier"] = (
+                    "FOCUSED_CHART_VISUAL_ONLY" if focused else "SLIDE_ENTITY_VISUAL_ONLY"
+                )
+                mention["identity_status"] = "CONFIRMED_ON_SCREEN_SPEECH_LINK_UNRESOLVED"
+                mention["spoken_connection"] = "UNSURE"
+                mention["transcript_evidence"] = []
+                mention["asr_correction_supported"] = False
+            mention["context"] = (
+                "画面确认同期实体的规范名称；代码和市场仅在实体专属画面文字明确出现时保存，"
+                "口播关联按结构化状态单独表示。"
+            )
     if audit.get("pass") is not True or audit.get("issues") != []:
         raise RuntimeError(f"Merged equity review audit failed: {len(audit.get('issues') or [])} issues")
     payload = {

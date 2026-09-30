@@ -229,6 +229,20 @@ def _validate_structured_fields(card: dict, included_ranges: list[tuple[int, int
         ):
             raise ValueError("Invalid structured conflict")
         _validate_segment_indices(conflict["segment_indices"], included_ranges, "conflict")
+    # Canonical entities confirmed by the reviewed visual projection are not
+    # ambiguities. Some model repairs return them as an ad-hoc EQUITY_LINK
+    # item; discard that duplicate here and let equity_mentions carry the
+    # audited identity, frame, and speech-link status.
+    card["unresolved_items"] = [
+        item for item in card["unresolved_items"]
+        if not (
+            isinstance(item, dict)
+            and item.get("kind") == "EQUITY_LINK"
+            and item.get("status") == "RESOLVED"
+            and isinstance(item.get("resolution"), dict)
+            and isinstance(item["resolution"].get("canonical_name"), str)
+        )
+    ]
     for item in card["unresolved_items"]:
         if isinstance(item, dict):
             item.pop("speech_link_status", None)
@@ -649,6 +663,13 @@ def _anchor_structured_time(card: dict, packet: dict) -> None:
         elif fragments:
             if recovered_indices:
                 item["segment_indices"] = sorted(set(recovered_indices))
+        if item.get("kind") == "UNIT" and raw_text.strip() == "点":
+            numeric_point_indices = [
+                index for index in item.get("segment_indices") or []
+                if re.search(r"\d+\s*个?点", rows[index]["text"])
+            ]
+            if numeric_point_indices:
+                item["segment_indices"] = numeric_point_indices
         if item.get("kind") != "DATE":
             continue
         if any(
@@ -766,6 +787,10 @@ def _anchor_structured_time(card: dict, packet: dict) -> None:
         end = packet["topics"][topic_index]["end_segment_index"]
         for index in range(start, end + 1):
             text = rows[index]["text"]
+            nearby_text = " ".join(
+                rows[nearby]["text"]
+                for nearby in range(max(start, index - 3), min(end, index + 3) + 1)
+            )
             for token, normalized, role in (
                 ("原来", None, "对既有做法的历史基线描述；具体起始日期未说明"),
                 ("短暂", None, "预测中的短期持续限定；具体持续时间未量化"),
@@ -774,11 +799,28 @@ def _anchor_structured_time(card: dict, packet: dict) -> None:
                 ("現在", video_date, "视频时点的当前观察"),
                 ("当前", video_date, "视频时点的当前观察"),
                 ("目前", video_date, "视频时点的当前观察"),
+                ("昨天", (anchor - timedelta(days=1)).isoformat(), "相对视频时点的前一日"),
+                ("昨日", (anchor - timedelta(days=1)).isoformat(), "相对视频时点的前一日"),
                 ("当时", None, "历史观察阶段；具体日期未说明"),
                 ("當時", None, "历史观察阶段；具体日期未说明"),
             ):
+                if token in {"现在", "現在", "当前", "目前"} and re.search(
+                    r"(?:现在|現在|当前|目前)(?:把这|把這|把它|呢|我们|我們)", text
+                ):
+                    continue
                 if token == "原来" and not re.search(r"原来.*(?:工厂|征收|做法|制度)", text):
                     continue
+                if token in {"现在", "現在", "当前", "目前"} and re.search(
+                    r"(?:就要|要)建|(?:会|會)(?:出来|出來|出现|出現|增加|增长|增長|提升|改善)",
+                    text,
+                ):
+                    role = "视频时点提出的计划或前瞻判断（非已发生观察）"
+                    business_time["kind"] = "MIXED"
+                if token in {"现在", "現在", "当前", "目前"} and re.search(
+                    r"假设|假設|假定|如果", nearby_text
+                ):
+                    role = "假设情境中的当前状态（非已发生业务观察）"
+                    business_time["kind"] = "MIXED"
                 if token in text and not any(
                     index in expression.get("segment_indices", [])
                     for expression in business_time["expressions"]
@@ -789,6 +831,43 @@ def _anchor_structured_time(card: dict, packet: dict) -> None:
                         "role": role,
                         "segment_indices": [index],
                     })
+            if (
+                re.search(
+                    r"(?:会|會)(?:出来|出來|出现|出現|增加|增长|增長|提升|改善)|"
+                    r"(?:如果|假设|假設|一旦|若).{0,40}(?:弹性|彈性|增长|增長|增加|会|會|将|將)|"
+                    r"(?:就要|要)建",
+                    text,
+                )
+                and not any(
+                    index in expression.get("segment_indices", [])
+                    for expression in business_time["expressions"]
+                )
+            ):
+                business_time["expressions"].append({
+                    "raw_text": text,
+                    "normalized": video_date,
+                    "role": "视频时点提出的计划、条件或前瞻判断（非已发生观察）",
+                    "segment_indices": [index],
+                })
+                business_time["kind"] = "MIXED"
+            duration_match = re.search(r"(?:\d+|[一二三四五六七八九十两兩]+)个?月", text)
+            if duration_match and not any(
+                index in expression.get("segment_indices", [])
+                for expression in business_time["expressions"]
+            ):
+                hypothetical_context = bool(re.search(r"假设|假設|假定|如果", nearby_text))
+                business_time["expressions"].append({
+                    "raw_text": duration_match.group(0),
+                    "normalized": None,
+                    "role": (
+                        "假设情境中的研发或业务周期（非已发生观察）"
+                        if hypothetical_context
+                        else "口述中的持续或周期表达；起止日期未明确"
+                    ),
+                    "segment_indices": [index],
+                })
+                if hypothetical_context:
+                    business_time["kind"] = "MIXED"
             match = re.search(r"\d+到\d+到\d+岁", text)
             if match and not any(index in item.get("segment_indices", []) for item in card["unresolved_items"]):
                 card["unresolved_items"].append({

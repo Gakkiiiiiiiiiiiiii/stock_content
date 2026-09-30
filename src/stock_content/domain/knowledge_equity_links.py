@@ -6,10 +6,32 @@ This module does not infer a security from a company name or a nearby topic.
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 
 SPOKEN_TIERS = {"FOCUSED_CHART_SPOKEN", "SLIDE_ENTITY_SPOKEN"}
 VISUAL_ONLY_TIERS = {"FOCUSED_CHART_VISUAL_ONLY", "SLIDE_ENTITY_VISUAL_ONLY"}
+VISUAL_ONLY_CORROBORATION_GRACE_MS = 15_000
+PROSE_FIELDS = (
+    "knowledge_title",
+    "atomic_statement",
+    "detailed_explanation",
+    "subject",
+    "applicability",
+    "risks",
+    "invalidation_conditions",
+)
+RESOLVED_VISUAL_ENTITY_STATUSES = {"RESOLVED_BY_VISUAL", "RESOLVED_BY_CROSS_MODAL"}
+IDENTITY_UNCERTAINTY_RE = re.compile(
+    r"身份(?:未核实|未确认|尚未确认|无法确认|未经确认|未获核实)"
+    r"|(?:无法|不能|不足以)确认(?:其对应股票|公司身份|具体公司|具体标的|股票代码)"
+    r"|不能据此确认为(?:某家)?上市公司"
+    r"|(?:转录|转写|口播)?名称(?:未确认|尚未确认)"
+)
+GENERIC_IDENTITY_PLACEHOLDER_RE = re.compile(
+    r"(?:该)?身份(?:未核实|未确认|尚未确认)(?:的)?标的"
+    r"|(?:转录|转写|口播)名称(?:未确认|尚未确认)的[^，。；！？]{0,16}标的"
+)
 
 
 def _canonical_label(name: str, code: str | None, market: str | None) -> str:
@@ -36,12 +58,20 @@ def _reproject_resolved_entity(
 ) -> None:
     """Resolve only entity ambiguities whose audio coordinates were visually corroborated."""
     speech_indices = {item["segment_index"] for item in speech}
+    normalized_raw_entity = (raw_entity_text or "").strip()
     for item in card.get("unresolved_items") or []:
+        item_raw_text = str(item.get("raw_text") or "").strip()
+        raw_text_matches = (
+            not normalized_raw_entity
+            or item_raw_text == normalized_raw_entity
+            or normalized_raw_entity in item_raw_text
+            or item_raw_text in normalized_raw_entity
+        )
         if (
             item.get("kind") == "ENTITY"
             and speech_indices.intersection(item.get("segment_indices") or [])
             and not protected_indices.intersection(item.get("segment_indices") or [])
-            and (not raw_entity_text or item.get("raw_text") == raw_entity_text)
+            and raw_text_matches
         ):
             canonical = _canonical_label(name, code, market)
             if item.get("status") == "UNRESOLVED":
@@ -75,6 +105,275 @@ def _scope_visual_identity_without_resolving_speech(
                 "该原始口播与画面标的的关联仍未确认。"
             )
             item["resolution"] = f"画面规范身份：{_canonical_label(name, code, market)}；口播关联未决"
+
+
+def _short_raw_entity(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 32 or re.search(r"[，。；！？\n]", raw):
+        return None
+    return raw
+
+
+def _confirmed_prose_targets(card: dict) -> list[dict]:
+    """Return visually resolved entities whose exact spoken coordinates match the card review."""
+    targets: list[dict] = []
+    seen: set[tuple[str, tuple[int, ...]]] = set()
+    for mention in card.get("equity_mentions") or []:
+        if mention.get("speech_link_status") != "SPOKEN_AND_DISPLAYED_CONFIRMED":
+            continue
+        speech_indices = {
+            item.get("segment_index")
+            for item in mention.get("raw_spoken_mentions") or []
+            if isinstance(item.get("segment_index"), int)
+        }
+        if not speech_indices:
+            continue
+        identity = mention.get("canonical_identity") or {}
+        name = str(identity.get("name") or mention.get("name") or "").strip()
+        if not name:
+            continue
+        label = _canonical_label(
+            name,
+            identity.get("code", mention.get("code")),
+            identity.get("market", mention.get("market")),
+        )
+        for item in card.get("unresolved_items") or []:
+            item_indices = {
+                index for index in item.get("segment_indices") or [] if isinstance(index, int)
+            }
+            resolution = str(item.get("resolution") or "")
+            if (
+                item.get("kind") != "ENTITY"
+                or item.get("status") not in RESOLVED_VISUAL_ENTITY_STATUSES
+                or not speech_indices.intersection(item_indices)
+                or name not in resolution
+            ):
+                continue
+            key = (str(mention.get("entity_id") or name), tuple(sorted(speech_indices)))
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append({
+                "entity_id": mention.get("entity_id"),
+                "name": name,
+                "label": label,
+                "code": identity.get("code", mention.get("code")),
+                "raw_text": _short_raw_entity(item.get("raw_text")),
+                "segment_indices": sorted(speech_indices.intersection(item_indices)),
+            })
+    return targets
+
+
+def _identity_confirmation_sentence(target: dict) -> str:
+    raw = target.get("raw_text")
+    raw_prefix = f"本卡原始口播为“{raw}”，" if raw else ""
+    code_note = "" if target.get("code") else "；视频画面未显示股票代码"
+    return f"{raw_prefix}同期画面确认其对应{target['label']}{code_note}"
+
+
+def _rewrite_entity_identity_prose(
+    text: str,
+    target: dict,
+    *,
+    allow_generic: bool,
+    allow_scoped_pronoun: bool,
+) -> str:
+    raw = target.get("raw_text")
+    label = target["label"]
+    result = text
+    if raw:
+        raw_sentinel = "\x00RAW_SPOKEN_ENTITY\x00"
+        scoped_parenthetical = re.compile(
+            rf"(?:转录|转写)作[“\"]{re.escape(raw)}[”\"]的标的"
+            r"[（(](?:公司)?身份(?:未核实|未确认|尚未确认)[）)]"
+        )
+        result = scoped_parenthetical.sub(label, result)
+        leading_descriptor = re.compile(
+            rf"身份(?:未核实|未确认|尚未确认)[、，]"
+            rf"名称(?:转录|转写)为[“\"]{re.escape(raw)}[”\"]的"
+        )
+        result = leading_descriptor.sub(f"{label}的", result)
+        trailing_descriptor = re.compile(
+            rf"(?:转录|转写)中的[“\"]{re.escape(raw)}[”\"]"
+            r"身份(?:未核实|未确认|尚未确认)"
+        )
+        result = trailing_descriptor.sub(
+            f"同期画面已确认其规范身份为{label}", result
+        )
+        identity_descriptor = re.compile(
+            rf"(?:口播|转录|转写)名称为[“\"]{re.escape(raw)}[”\"]"
+            r"[、，]身份(?:未核实|未确认|尚未确认)(?:的)?标的"
+        )
+        result = identity_descriptor.sub(label, result)
+        spoken_placeholder = re.compile(
+            rf"(?:名称)?转录(?:为|作)[“\"]{re.escape(raw)}[”\"]的标的"
+        )
+        result = spoken_placeholder.sub(label, result)
+        result = result.replace(f"一个{label}", label)
+        scoped_placeholder = re.compile(
+            rf"(?:某)?(?:名称)?(?:转录|转写)为[“\"]{re.escape(raw)}[”\"]"
+            r"[、，]?(?:具体)?身份(?:未核实|未确认|尚未确认|无法确认|未经确认)的?标的"
+        )
+        result = scoped_placeholder.sub(label, result)
+        identity_only_sentence = re.compile(
+            rf"(?:本卡|原始)?口播(?:名称)?(?:为|是)?[“\"]?{re.escape(raw)}[”\"]?"
+            r"[^。！？]*(?:无法|不能|未能)[^。！？]*(?:身份|公司|股票|标的)[^。！？]*"
+        )
+        protected_target = {**target, "raw_text": raw_sentinel}
+        result = identity_only_sentence.sub(
+            _identity_confirmation_sentence(protected_target), result
+        )
+        result = result.replace(raw, target["name"])
+        result = result.replace(raw_sentinel, raw)
+    if allow_scoped_pronoun:
+        confirmation = f"同期画面已确认其规范身份为{label}"
+        result = re.sub(r"该名称(?:仍)?不足以确认公司身份", confirmation, result)
+        result = re.sub(
+            r"该标的身份及([^。；]+)未获核实",
+            r"该标的身份已由同期画面确认，\1仍未获核实",
+            result,
+        )
+        result = re.sub(
+            rf"[“\"]?{re.escape(target['name'])}[”\"]?也?不能据此确认为(?:某家)?上市公司",
+            confirmation,
+            result,
+        )
+        result = result.replace(
+            "两个身份未确认的标的",
+            f"{label}与另一个身份未确认的标的",
+        )
+        result = result.replace(
+            "标的及术语得到进一步核实",
+            "相关术语得到进一步核实",
+        )
+        result = result.replace(
+            "具体证券身份和压力位未确认",
+            "具体证券身份已由同期画面确认，压力位仍未确认",
+        )
+    if allow_generic:
+        result = GENERIC_IDENTITY_PLACEHOLDER_RE.sub(label, result)
+        result = re.sub(
+            r"其(?:公司|标的)?身份(?:尚)?(?:无法|未能|未|未经)(?:得到)?确认",
+            f"其规范身份经同期画面确认为{label}",
+            result,
+        )
+        result = re.sub(
+            r"(?:仅凭本卡内容)?(?:无法|不能)确认公司身份或股票代码",
+            f"同期画面已确认其规范身份为{label}"
+            + ("" if target.get("code") else "，但视频画面未显示股票代码"),
+            result,
+        )
+    return result
+
+
+def _identity_uncertainty_near(text: str, value: str, *, distance: int = 24) -> bool:
+    if not value:
+        return False
+    occurrences = [match.span() for match in re.finditer(re.escape(value), text)]
+    for uncertainty in IDENTITY_UNCERTAINTY_RE.finditer(text):
+        for start, end in occurrences:
+            if end >= uncertainty.start() - distance and start <= uncertainty.end() + distance:
+                return True
+    return False
+
+
+def validate_confirmed_entity_prose_consistency(cards: list[dict]) -> None:
+    """Fail closed when a coordinate-matched confirmed entity still has stale identity prose."""
+    issues: list[str] = []
+    for card in cards:
+        targets = _confirmed_prose_targets(card)
+        unresolved_entities = any(
+            item.get("kind") == "ENTITY" and item.get("status") == "UNRESOLVED"
+            for item in card.get("unresolved_items") or []
+        )
+        allow_generic = len(targets) == 1 and not unresolved_entities
+        for target in targets:
+            raw = target.get("raw_text")
+            for field in PROSE_FIELDS:
+                text = card.get(field)
+                if not isinstance(text, str) or not IDENTITY_UNCERTAINTY_RE.search(text):
+                    continue
+                field_allows_generic = allow_generic or (
+                    field == "knowledge_title"
+                    and len(targets) == 1
+                    and not re.search(r"多个|两个|若干|部分标的", text)
+                )
+                comparison = text.replace(
+                    f"{target['label']}与另一个身份未确认的标的",
+                    f"{target['label']}与另一待核标的",
+                )
+                sentences = re.split(r"(?<=[。！？；])", comparison)
+                stale = any(
+                    IDENTITY_UNCERTAINTY_RE.search(sentence)
+                    and (
+                        _identity_uncertainty_near(sentence, target["name"])
+                        or bool(raw and _identity_uncertainty_near(sentence, raw))
+                        or bool(
+                            field_allows_generic
+                            and GENERIC_IDENTITY_PLACEHOLDER_RE.search(sentence)
+                        )
+                    )
+                    for sentence in sentences
+                )
+                if stale:
+                    issues.append(
+                        f"{card.get('knowledge_id', '<unknown>')}:{field}:{target['name']}"
+                    )
+    if issues:
+        raise ValueError(
+            "Confirmed entity identity remains unresolved in prose: " + ", ".join(issues)
+        )
+
+
+def reconcile_confirmed_entity_prose(cards: list[dict]) -> list[dict]:
+    """Narrowly rewrite stale identity placeholders after visual entity projection.
+
+    This never changes transcript evidence or ``raw_spoken_mentions`` and only
+    acts on entities whose resolved ambiguity item shares an exact spoken
+    segment with a ``SPOKEN_AND_DISPLAYED_CONFIRMED`` mention.
+    """
+    for card in cards:
+        targets = _confirmed_prose_targets(card)
+        unresolved_entities = any(
+            item.get("kind") == "ENTITY" and item.get("status") == "UNRESOLVED"
+            for item in card.get("unresolved_items") or []
+        )
+        allow_generic = len(targets) == 1 and not unresolved_entities
+        allow_scoped_pronoun = len(targets) == 1
+        reconciliation: list[dict] = []
+        for target in targets:
+            changed_fields: list[str] = []
+            for field in PROSE_FIELDS:
+                before = card.get(field)
+                if not isinstance(before, str):
+                    continue
+                field_allows_generic = allow_generic or (
+                    field == "knowledge_title"
+                    and len(targets) == 1
+                    and not re.search(r"多个|两个|若干|部分标的", before)
+                )
+                after = _rewrite_entity_identity_prose(
+                    before,
+                    target,
+                    allow_generic=field_allows_generic,
+                    allow_scoped_pronoun=allow_scoped_pronoun,
+                )
+                if after != before:
+                    card[field] = after
+                    changed_fields.append(field)
+            if changed_fields:
+                reconciliation.append({
+                    "entity_id": target.get("entity_id"),
+                    "canonical_name": target["name"],
+                    "raw_spoken_text": target.get("raw_text"),
+                    "segment_indices": target["segment_indices"],
+                    "changed_fields": changed_fields,
+                    "policy": "EXACT_SPOKEN_COORDINATE_AND_CONFIRMED_DISPLAY_ONLY",
+                })
+        if reconciliation:
+            card["entity_prose_reconciliation"] = reconciliation
+    validate_confirmed_entity_prose_consistency(cards)
+    return cards
 
 
 def link_equity_mentions(
@@ -167,8 +466,9 @@ def link_equity_mentions(
             frame_in_stage = any(
                 stage["start_ms"] <= frame["timestamp_ms"] <= stage["end_ms"]
                 or (
-                    spoken_in_stage
-                    and stage["end_ms"] < frame["timestamp_ms"] <= stage["end_ms"] + 3000
+                    not speech_conflicts_with_stage
+                    and stage["end_ms"] < frame["timestamp_ms"]
+                    <= stage["end_ms"] + VISUAL_ONLY_CORROBORATION_GRACE_MS
                 )
                 for frame in frames
             )
@@ -242,7 +542,7 @@ def link_equity_mentions(
                         )
                         for stage_id in declared
                         if stage_by_id[stage_id]["start_ms"] - 3000 <= frame["timestamp_ms"]
-                        <= stage_by_id[stage_id]["end_ms"] + 3000
+                        <= stage_by_id[stage_id]["end_ms"] + VISUAL_ONLY_CORROBORATION_GRACE_MS
                     ),
                 }
                 for frame in frames
@@ -265,6 +565,7 @@ def link_equity_mentions(
                 ),
             )
         linked_count += 1
+    reconcile_confirmed_entity_prose(linked_cards)
     return linked_cards, {
         "reviewed_mention_count": len(mentions),
         "linked_mention_count": linked_count,

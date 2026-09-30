@@ -11,7 +11,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from build_local_coherent_knowledge_preview import corrected_transcript, validate_extraction  # noqa: E402
+from build_local_coherent_knowledge_preview import (  # noqa: E402
+    _anchor_structured_time,
+    corrected_transcript,
+    validate_extraction,
+)
 from build_local_coherent_knowledge_preview_v2 import (  # noqa: E402
     previously_reviewed_plan,
     reviewed_equities,
@@ -147,6 +151,41 @@ def test_structured_time_conflicts_and_unresolved_items_are_coordinate_checked()
         validate_extraction(
             {"knowledge": [card], "excluded_topic_indices": []}, packet, transcript, structured=True
         )
+
+
+def test_structured_time_distinguishes_hypothesis_duration_relative_day_and_forecast() -> None:
+    rows = [
+        {"text": "假设需要八根，那现在不行"},
+        {"text": "每六个月研发一个新版本"},
+        {"text": "昨天才刚刚跟大家讲过"},
+        {"text": "它有一些新的东西会出来"},
+    ]
+    packet = {
+        "video_context": {"date": "2026-09-17"},
+        "transcript_rows": rows,
+        "topics": [{"start_segment_index": 0, "end_segment_index": 3}],
+    }
+    card = {
+        "topic_indices": [0],
+        "business_time": {
+            "as_of": None, "precision": "UNKNOWN", "kind": "OBSERVATION",
+            "expressions": [], "note": None,
+        },
+        "conflicts": [],
+        "unresolved_items": [],
+        "detailed_explanation": "假设、周期、昨日和预测分开记录。",
+        "applicability": None,
+        "risks": None,
+        "invalidation_conditions": None,
+    }
+
+    _anchor_structured_time(card, packet)
+
+    expressions = card["business_time"]["expressions"]
+    assert any("假设情境" in item["role"] and item["segment_indices"] == [0] for item in expressions)
+    assert any(item["raw_text"] == "六个月" and "假设情境" in item["role"] for item in expressions)
+    assert any(item["raw_text"] == "昨天" and item["normalized"] == "2026-09-16" for item in expressions)
+    assert any("前瞻判断" in item["role"] and item["segment_indices"] == [3] for item in expressions)
 
 
 def test_reviewed_equity_requires_same_source_and_untampered_frame(tmp_path: Path) -> None:

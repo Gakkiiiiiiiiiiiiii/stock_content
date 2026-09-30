@@ -96,6 +96,8 @@ def repair_prompt(card: dict, issue: str, packet: dict) -> str:
         "METHOD, or FACT_REPORT. Return one JSON object with exactly these keys: " + CARD_FIELDS + ". "
         "spoken_stock_names and spoken_stock_codes must remain arrays of strings only; an ASR-corrected "
         "canonical identity belongs in reviewed_equities/equity links rather than as an object in either array. "
+        "Do not put a confirmed reviewed equity into unresolved_items and never emit an EQUITY_LINK item; "
+        "the deterministic projection layer adds confirmed canonical identities after this repair. "
         "Each evidence entry is {segment_index,quote}, with an exact substring from that row. "
         "Use null for conditions or risks absent from the source.\n" + json.dumps(source, ensure_ascii=False)
     )
@@ -429,6 +431,16 @@ def main() -> None:
                 card["reason_codes"] = [
                     code for code in card["reason_codes"] if code != "VISUAL_RECHECK_PENDING"
                 ] + ["TARGETED_ENTITY_REVIEW"]
+    projected_path = args.output.with_name(args.output.stem + ".projected.json")
+    write_new(
+        projected_path,
+        {
+            "schema_version": "local-coherent-knowledge.projected-candidate.v1",
+            "knowledge": projected,
+            "excluded_topic_indices": result["excluded_topic_indices"],
+            "equity_link_audit": equity_link_audit,
+        },
+    )
     audit_knowledge = projected
     audit_packet_source = packet
     if audit_topic_indices is not None:
